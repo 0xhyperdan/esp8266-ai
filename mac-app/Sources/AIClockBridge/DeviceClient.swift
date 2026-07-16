@@ -1,8 +1,7 @@
 import Foundation
 
-// Talks to the ESP8266 clock over HTTP. Lightweight controls can fall back to
-// the wired serial command channel; file transfer and administration remain
-// HTTP-only. Device address persists in defaults.
+// Talks to the ESP8266 clock over HTTP, with USB serial fallbacks for device
+// information, controls, and pet uploads. Device address persists in defaults.
 
 struct DeviceInfo {
     var ip = ""
@@ -14,10 +13,73 @@ struct DeviceInfo {
     var lastUpdateS = -1    // seconds since the device last got /status data, -1 = never
     var spriteRev = 0       // bumped by the device on animation change
     var brightness = 100    // backlight 0-100 (0 = off)
+    var firmwareVersion = ""
+    var otaAvailable = false
+    var spriteUploadState = ""
+    var spriteUploadSlot = ""
+    var spriteUploadError = ""
     var claudeCustomSprite = false
     var codexCustomSprite = false
     var claudeW = 111, claudeH = 120
     var codexW = 120, codexH = 120
+}
+
+struct OTACredentials: Codable, Equatable {
+    let username: String
+    let password: String
+}
+
+enum FirmwareUpdateProgress {
+    case uploading(Double)
+    case restarting
+}
+
+final class FirmwareUploadTask: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate,
+    @unchecked Sendable {
+    typealias Completion = (Error?) -> Void
+
+    private let progress: (Double) -> Void
+    private let completion: Completion
+    private var responseData = Data()
+    private var session: URLSession?
+
+    init(progress: @escaping (Double) -> Void, completion: @escaping Completion) {
+        self.progress = progress
+        self.completion = completion
+    }
+
+    func start(request: URLRequest, body: Data) {
+        let configuration = URLSessionConfiguration.ephemeral
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        self.session = session
+        session.uploadTask(with: request, from: body).resume()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
+                    totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        guard totalBytesExpectedToSend > 0 else { return }
+        let fraction = min(1, Double(totalBytesSent) / Double(totalBytesExpectedToSend))
+        DispatchQueue.main.async { self.progress(fraction) }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        responseData.append(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        var result = error
+        if result == nil, let response = task.response as? HTTPURLResponse,
+           !(200...299).contains(response.statusCode) {
+            let message = String(decoding: responseData, as: UTF8.self)
+            result = NSError(domain: "DeviceClient", code: response.statusCode,
+                             userInfo: [NSLocalizedDescriptionKey:
+                                "Device returned HTTP \(response.statusCode): \(message)"])
+        }
+        session.finishTasksAndInvalidate()
+        self.session = nil
+        DispatchQueue.main.async { self.completion(result) }
+    }
 }
 
 final class DeviceClient {
@@ -26,6 +88,8 @@ final class DeviceClient {
 
     static var wiredCommandHandler: (([String: Any]) -> Bool)?
     static var wiredInfoProvider: (() -> DeviceInfo?)?
+    static var wiredPetUploadHandler: ((Data, String, @escaping (Error?) -> Void) -> Bool)?
+    private static var activeFirmwareUploads: [UUID: FirmwareUploadTask] = [:]
 
     static var host: String {
         get { UserDefaults.standard.string(forKey: hostKey) ?? "" }
@@ -50,6 +114,11 @@ final class DeviceClient {
             DispatchQueue.main.async { completion(.success(info)) }
             return
         }
+        fetchLANInfo(completion: completion)
+    }
+
+    /// GET /api/info over LAN even when a USB device is linked.
+    static func fetchLANInfo(completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
         guard let base = baseURL else {
             completion(.failure(Self.noHostError))
             return
@@ -60,32 +129,44 @@ final class DeviceClient {
             var result: Result<DeviceInfo, Error>
             if let error = error {
                 result = .failure(error)
-            } else if let data = data,
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                var info = DeviceInfo()
-                info.ip = obj["ip"] as? String ?? ""
-                info.ssid = obj["ssid"] as? String ?? ""
-                info.bridge = obj["bridge"] as? String ?? ""
-                info.mode = obj["mode"] as? String ?? "auto"
-                info.effective = obj["effective"] as? String ?? info.mode
-                info.showing = obj["showing"] as? String ?? ""
-                info.lastUpdateS = (obj["last_update_s"] as? NSNumber)?.intValue ?? -1
-                info.spriteRev = (obj["sprite_rev"] as? NSNumber)?.intValue ?? 0
-                info.brightness = (obj["brightness"] as? NSNumber)?.intValue ?? 100
-                let claude = obj["claude"] as? [String: Any]
-                let codex = obj["codex"] as? [String: Any]
-                info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false
-                info.codexCustomSprite = codex?["custom_sprite"] as? Bool ?? false
-                info.claudeW = (claude?["w"] as? NSNumber)?.intValue ?? 111
-                info.claudeH = (claude?["h"] as? NSNumber)?.intValue ?? 120
-                info.codexW = (codex?["w"] as? NSNumber)?.intValue ?? 120
-                info.codexH = (codex?["h"] as? NSNumber)?.intValue ?? 120
+            } else if let data = data, let info = decodeInfo(data) {
                 result = .success(info)
             } else {
                 result = .failure(Self.badResponseError)
             }
             DispatchQueue.main.async { completion(result) }
         }.resume()
+    }
+
+    static func decodeInfo(_ data: Data) -> DeviceInfo? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        var info = DeviceInfo()
+        info.ip = obj["ip"] as? String ?? ""
+        info.ssid = obj["ssid"] as? String ?? ""
+        info.bridge = obj["bridge"] as? String ?? ""
+        info.mode = obj["mode"] as? String ?? "auto"
+        info.effective = obj["effective"] as? String ?? info.mode
+        info.showing = obj["showing"] as? String ?? ""
+        info.lastUpdateS = (obj["last_update_s"] as? NSNumber)?.intValue ?? -1
+        info.spriteRev = (obj["sprite_rev"] as? NSNumber)?.intValue ?? 0
+        info.brightness = (obj["brightness"] as? NSNumber)?.intValue ?? 100
+        info.firmwareVersion = obj["fw"] as? String ?? ""
+        info.otaAvailable = obj["ota"] as? Bool ?? false
+        let upload = obj["sprite_upload"] as? [String: Any]
+        info.spriteUploadState = upload?["state"] as? String ?? ""
+        info.spriteUploadSlot = upload?["slot"] as? String ?? ""
+        info.spriteUploadError = upload?["error"] as? String ?? ""
+        let claude = obj["claude"] as? [String: Any]
+        let codex = obj["codex"] as? [String: Any]
+        info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false
+        info.codexCustomSprite = codex?["custom_sprite"] as? Bool ?? false
+        info.claudeW = (claude?["w"] as? NSNumber)?.intValue ?? 111
+        info.claudeH = (claude?["h"] as? NSNumber)?.intValue ?? 120
+        info.codexW = (codex?["w"] as? NSNumber)?.intValue ?? 120
+        info.codexH = (codex?["h"] as? NSNumber)?.intValue ?? 120
+        return info
     }
 
     /// POST /api/display  mode=auto|claude|codex|net|music
@@ -111,9 +192,12 @@ final class DeviceClient {
         postForm(path: "api/brightness", fields: ["level": String(level)], completion: completion)
     }
 
-    /// POST /sprite/{claude|codex}  multipart GIF upload — the device decodes
-    /// and rescales the GIF on-board, then swaps the animation immediately.
+    /// POST /sprite/{claude|codex} multipart GIF upload. WiFi firmware decodes
+    /// after releasing HTTP memory; USB reports completion after direct decode.
     static func uploadGif(_ gif: Data, slot: String, completion: @escaping (Error?) -> Void) {
+        if wiredPetUploadHandler?(gif, slot, completion) == true {
+            return
+        }
         guard let base = baseURL else {
             completion(Self.noHostError)
             return
@@ -130,7 +214,94 @@ final class DeviceClient {
         body.append(gif)
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
         req.httpBody = body
-        run(req, completion: completion)
+        run(req) { error in
+            guard error == nil else {
+                completion(error)
+                return
+            }
+            waitForSpriteUpload(slot: slot, deadline: Date().addingTimeInterval(90),
+                                completion: completion)
+        }
+    }
+
+    /// Uploads an ESP8266 firmware image over the authenticated Web OTA route,
+    /// then waits for the device to restart and answer /api/info again.
+    static func uploadFirmware(_ firmware: Data, credentials: OTACredentials,
+                               progress: @escaping (FirmwareUpdateProgress) -> Void,
+                               completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
+        guard let base = baseURL else {
+            completion(.failure(Self.noHostError))
+            return
+        }
+        guard isValidFirmwareImage(firmware) else {
+            completion(.failure(NSError(domain: "DeviceClient", code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "The selected file is not an ESP8266 firmware image."])))
+            return
+        }
+
+        let boundary = "aiclock-ota-\(UUID().uuidString)"
+        var request = URLRequest(url: base.appendingPathComponent("update"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 120
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue(basicAuthorizationHeader(credentials), forHTTPHeaderField: "Authorization")
+        let body = firmwareMultipartBody(firmware, boundary: boundary)
+        let identifier = UUID()
+        let uploader = FirmwareUploadTask(progress: { fraction in
+            progress(.uploading(fraction))
+        }, completion: { error in
+            activeFirmwareUploads.removeValue(forKey: identifier)
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+            progress(.restarting)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                pollAfterFirmwareUpdate(base: base, attemptsRemaining: 45, completion: completion)
+            }
+        })
+        activeFirmwareUploads[identifier] = uploader
+        uploader.start(request: request, body: body)
+    }
+
+    static func isValidFirmwareImage(_ data: Data) -> Bool {
+        data.count >= 4096 && data.first == 0xE9
+    }
+
+    static func basicAuthorizationHeader(_ credentials: OTACredentials) -> String {
+        let token = Data("\(credentials.username):\(credentials.password)".utf8).base64EncodedString()
+        return "Basic \(token)"
+    }
+
+    static func firmwareMultipartBody(_ firmware: Data, boundary: String) -> Data {
+        var body = Data()
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"firmware\"; filename=\"firmware.bin\"\r\n".utf8))
+        body.append(Data("Content-Type: application/octet-stream\r\n\r\n".utf8))
+        body.append(firmware)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        return body
+    }
+
+    private static func pollAfterFirmwareUpdate(base: URL, attemptsRemaining: Int,
+                                                completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
+        guard attemptsRemaining > 0 else {
+            completion(.failure(NSError(domain: "DeviceClient", code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "The device did not return after the firmware update."])))
+            return
+        }
+        var request = URLRequest(url: base.appendingPathComponent("api/info"))
+        request.timeoutInterval = 1
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            if let data = data, let info = decodeInfo(data) {
+                DispatchQueue.main.async { completion(.success(info)) }
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    pollAfterFirmwareUpdate(base: base, attemptsRemaining: attemptsRemaining - 1,
+                                            completion: completion)
+                }
+            }
+        }.resume()
     }
 
     /// POST /sprite/{claude|codex}/reset — back to the compiled-in animation.
@@ -189,6 +360,38 @@ final class DeviceClient {
             }
             DispatchQueue.main.async { completion(err) }
         }.resume()
+    }
+
+    private static func waitForSpriteUpload(slot: String, deadline: Date,
+                                            completion: @escaping (Error?) -> Void) {
+        guard Date() < deadline else {
+            completion(NSError(domain: "DeviceClient", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "The device did not finish decoding the pet in time."]))
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+            fetchLANInfo { result in
+                switch result {
+                case let .success(info):
+                    // Firmware before 0.5.3 completed decoding inside the upload request.
+                    if info.spriteUploadState.isEmpty {
+                        completion(nil)
+                    } else if info.spriteUploadSlot == slot, info.spriteUploadState == "succeeded" {
+                        completion(nil)
+                    } else if info.spriteUploadSlot == slot, info.spriteUploadState == "failed" {
+                        let reason = info.spriteUploadError.isEmpty ? "unknown decode error" : info.spriteUploadError
+                        completion(NSError(domain: "DeviceClient", code: 13,
+                            userInfo: [NSLocalizedDescriptionKey: "The device could not decode the pet: \(reason)"]))
+                    } else {
+                        waitForSpriteUpload(slot: slot, deadline: deadline, completion: completion)
+                    }
+                case .failure:
+                    // The single-core ESP8266 cannot answer HTTP while decoding. Retry until it is free.
+                    waitForSpriteUpload(slot: slot, deadline: deadline, completion: completion)
+                }
+            }
+        }
     }
 
     private static var noHostError: NSError {

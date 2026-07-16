@@ -25,7 +25,7 @@ sealed class MirrorControl : Control
     public bool NeedsInput; // shown app waiting on approval -> red border flash
     public bool FlashOn;
     public string Line1 = "5h -";
-    public string Line2 = "Weekly -";
+    public string Line2 = "\u5468\u989D\u5EA6 -";
     public bool ShowingClaude = true;
     public bool DeviceOK;
     // net-mode mirror: same scrolling area-chart model as the firmware —
@@ -123,8 +123,8 @@ sealed class MirrorControl : Control
             return;
         }
 
-        // square quota ring: margin 4, thickness 10, clockwise from top-left
-        const float m = 4, t = 10;
+        // square quota ring: margin 4, thickness 2, clockwise from top-left
+        const float m = 4, t = 2;
         const float side = 240 - 2 * m;
         using (var ring = new SolidBrush(DeviceOK ? Green : Color.FromArgb(90, 90, 90)))
         {
@@ -143,19 +143,22 @@ sealed class MirrorControl : Control
             if (seg > 0) g.FillRectangle(ring, x0, 240 - m - seg, t, seg);         // left
         }
 
-        // sprite, centered, pixel-crisp
+        // sprite, 10% larger and anchored above the quota labels
         if (Frames.Count > 0)
         {
             var img = Frames[Math.Min(FrameIdx, Frames.Count - 1)];
+            var displayW = (int)Math.Round(SpriteW * 1.1);
+            var displayH = (int)Math.Round(SpriteH * 1.1);
             var state = g.Save();
             g.InterpolationMode = InterpolationMode.NearestNeighbor;
             g.PixelOffsetMode = PixelOffsetMode.Half;
-            g.DrawImage(img, new Rectangle(120 - SpriteW / 2, 120 - SpriteH / 2, SpriteW, SpriteH));
+            g.DrawImage(img, new Rectangle(120 - displayW / 2, 180 - displayH,
+                                           displayW, displayH));
             g.Restore(state);
         }
 
-        // app logo, top-left inside the ring (firmware draws it at 14,18 @40px)
-        g.DrawImage(ShowingClaude ? ClaudeLogo : CodexLogo, new Rectangle(14, 18, 40, 40));
+        // app logo, top-left inside the ring (firmware draws it at 14,18 @30px)
+        g.DrawImage(ShowingClaude ? ClaudeLogo : CodexLogo, new Rectangle(14, 18, 30, 30));
 
         // quota text
         using (var font = new Font("Consolas", 13, FontStyle.Bold, GraphicsUnit.Pixel))
@@ -325,12 +328,13 @@ sealed class MirrorControl : Control
         }
     }
 
-    // Stock watchlist, same 54px rows as the firmware: grey code (the mirror
-    // can render the CJK name next to it), big white price, colored change.
+    // Stock watchlist, same 54px rows as the firmware: grey name on the left,
+    // code on the right, big white price, and colored change.
     void DrawStockScene(Graphics g)
     {
         using var greyBrush = new SolidBrush(Color.FromArgb(140, 140, 140));
-        using var codeFont = new Font("Microsoft YaHei UI", 7.5f);
+        using var nameFont = new Font("Microsoft YaHei UI", 10f);
+        using var codeFont = new Font("Consolas", 8.5f, FontStyle.Bold);
         using var valueFont = new Font("Consolas", 13f, FontStyle.Bold);
         using var labelFont = new Font("Consolas", 6.5f);
         if (StockRows.Length == 0)
@@ -345,16 +349,22 @@ sealed class MirrorControl : Control
         {
             var row = StockRows[i];
             float y0 = 10 + i * 54;
-            var label = row.Name.Length == 0 ? row.Code : $"{row.Code}  {row.Name}";
-            g.DrawString(label, codeFont, greyBrush, 14, y0);
-            g.DrawString(row.Price, valueFont, Brushes.White, 12, y0 + 16);
+            using var nameFormat = new StringFormat
+            {
+                Trimming = StringTrimming.EllipsisCharacter,
+                FormatFlags = StringFormatFlags.NoWrap,
+            };
+            g.DrawString(row.Name, nameFont, greyBrush, new RectangleF(14, y0, 156, 17), nameFormat);
+            using var codeFormat = new StringFormat { Alignment = StringAlignment.Far };
+            g.DrawString(row.Code, codeFont, greyBrush, new RectangleF(174, y0, 52, 17), codeFormat);
+            g.DrawString(row.Price, valueFont, Brushes.White, 12, y0 + 18);
             using var pctBrush = new SolidBrush(row.Up > 0 ? Color.FromArgb(255, 59, 48)
                 : (row.Up < 0 ? Green : Color.LightGray));
             using var right = new StringFormat { Alignment = StringAlignment.Far };
-            g.DrawString(row.Pct, valueFont, pctBrush, new RectangleF(120, y0 + 16, 106, 22), right);
+            g.DrawString(row.Pct, valueFont, pctBrush, new RectangleF(120, y0 + 18, 106, 22), right);
         }
         using var center = new StringFormat { Alignment = StringAlignment.Center };
-        g.DrawString("STOCKS", labelFont, greyBrush, new RectangleF(0, 226, 240, 12), center);
+        g.DrawString("\u80A1\u7968", labelFont, greyBrush, new RectangleF(0, 226, 240, 12), center);
     }
 
     /// Same compact unit strings the firmware prints ("2.3M", "480K").
@@ -648,7 +658,7 @@ sealed class MirrorForm : Form
                     ? 100.0 * snap.Claude.SessionMin / snap.Claude.SessionWindowMin : 0);
             _mirror.RingPct = pct;
             _mirror.Line1 = "5h " + PctText(pct);
-            _mirror.Line2 = "Weekly " + PctText(snap.Claude.SevenDayPct);
+            _mirror.Line2 = "\u5468\u989D\u5EA6 " + PctText(snap.Claude.SevenDayPct);
             _mirror.NeedsInput = snap.Claude.NeedsInput;
         }
         else
@@ -658,13 +668,13 @@ sealed class MirrorForm : Form
             _mirror.RingPct = snap.Codex.PrimaryPct ?? snap.Codex.WeeklyPct ?? 0;
             if (!snap.Codex.PrimaryPct.HasValue && snap.Codex.WeeklyPct.HasValue)
             {
-                _mirror.Line1 = "Weekly " + PctText(snap.Codex.WeeklyPct);
+                _mirror.Line1 = "\u5468\u989D\u5EA6 " + PctText(snap.Codex.WeeklyPct);
                 _mirror.Line2 = "";
             }
             else
             {
                 _mirror.Line1 = "5h " + PctText(snap.Codex.PrimaryPct);
-                _mirror.Line2 = "Weekly " + PctText(snap.Codex.WeeklyPct);
+                _mirror.Line2 = "\u5468\u989D\u5EA6 " + PctText(snap.Codex.WeeklyPct);
             }
             _mirror.NeedsInput = snap.Codex.NeedsInput;
         }

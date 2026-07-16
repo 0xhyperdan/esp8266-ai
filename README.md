@@ -91,8 +91,18 @@ cd firmware && pio run -e fubotv-usb -t upload
 cd ../mac-app && AICLOCK_SERIAL_PORT=/dev/cu.usbserial-XXXX swift run
 ```
 
-重启电脑后需要后台启动时，可直接运行 `mac-app/start-aiclock.sh`；日志写入
-`~/Library/Logs/AIClockBridge/bridge.log`，不依赖固定的用户名或项目路径。
+需要登录后自动启动和异常退出自动恢复时，运行 `mac-app/install-launch-agent.sh`。
+脚本会构建 release 版本并安装为用户级 LaunchAgent；日志写入
+`~/Library/Logs/AIClockBridge/`。更新源码后重新运行安装脚本即可部署新版本。
+
+纯 USB 模式也支持菜单栏里的「更换桌宠动画…」。选择宠物和目标槽位后，Mac 会自动通过
+串口分块上传，设备校验并解码后立即应用；动画保存在 LittleFS 中，重启后仍然有效。
+
+混合版首次通过 USB 刷入支持 Web OTA 的固件后，后续可打开
+`http://<设备IP>/update`，使用本机 `firmware/include/ota_secrets.h` 中的独立凭据登录并
+上传 `firmware.bin`。OTA 只更新程序分区，不会清除 Wi-Fi 设置、亮度或 LittleFS 桌宠数据。
+macOS 菜单栏也提供「Wi-Fi 更新固件…」入口：选择 `.bin` 后首次输入凭据，密码保存在
+macOS Keychain；上传期间显示进度，完成后自动等待设备重启并核对设备重新上线。
 
 硬件引脚表、屏幕驱动的坑、设备 HTTP API、GIF 板上解码架构等细节见 **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**。
 

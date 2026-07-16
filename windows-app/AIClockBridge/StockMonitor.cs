@@ -8,8 +8,8 @@ namespace AIClockBridge;
 // supports sh/sz/hk/us prefixes in one batch request, GBK-encoded response):
 //   http://qt.gtimg.cn/q=sh600519,hk00700,usAAPL
 // Polled every 5s; the device and the mirror both render the pre-formatted
-// strings so the firmware stays dumb (and ASCII-only: it shows the code, the
-// CJK company name is only used by the mirror window).
+// strings so the firmware stays dumb. The ASCII-only firmware draws the code
+// itself and receives each CJK company name as an RGB565 strip from the PC.
 sealed class StockMonitor
 {
     public record Row(string Code, string Name, string Price, string Pct, int Up);
@@ -62,6 +62,7 @@ sealed class StockMonitor
     public const int NameW = 156, NameH = 16;
     int _namesRev;
     byte[] _namesData = { 0 };
+    byte[] _namesV2Data = { 0 };
     string _lastNamesKey = "";
 
     public void Start()
@@ -97,38 +98,51 @@ sealed class StockMonitor
         get { lock (_lock) return _namesData; }
     }
 
+    /// Name-left layout used by firmware 0.4.9 and later.
+    public byte[] NamesV2Rgb565
+    {
+        get { lock (_lock) return _namesV2Data; }
+    }
+
     void RenderNamesIfNeeded(Row[] parsed)
     {
         var top = parsed.Take(4).ToArray();
         var key = string.Join("\n", top.Select(r => r.Name));
         lock (_lock) if (key == _lastNamesKey) return;
         using var ms = new MemoryStream();
+        using var v2 = new MemoryStream();
         ms.WriteByte((byte)top.Length);
+        v2.WriteByte((byte)top.Length);
         foreach (var row in top)
         {
-            using var bmp = new Bitmap(NameW, NameH);
-            using (var g = Graphics.FromImage(bmp))
-            {
-                g.Clear(Color.Black);
-                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-                using var font = new Font("Microsoft YaHei UI", 9f);
-                using var brush = new SolidBrush(Color.FromArgb(184, 184, 184));
-                using var right = new StringFormat
-                {
-                    Alignment = StringAlignment.Far,
-                    Trimming = StringTrimming.EllipsisCharacter,
-                    FormatFlags = StringFormatFlags.NoWrap,
-                };
-                g.DrawString(row.Name, font, brush, new RectangleF(0, 0, NameW, NameH), right);
-            }
-            ms.Write(Rgb565.Encode(bmp));
+            ms.Write(RenderNameStrip(row.Name, StringAlignment.Far, 9f));
+            v2.Write(RenderNameStrip(row.Name, StringAlignment.Near, 10f));
         }
         lock (_lock)
         {
             _lastNamesKey = key;
             _namesData = ms.ToArray();
+            _namesV2Data = v2.ToArray();
             _namesRev++;
         }
+    }
+
+    static byte[] RenderNameStrip(string name, StringAlignment alignment, float fontSize)
+    {
+        using var bmp = new Bitmap(NameW, NameH);
+        using var g = Graphics.FromImage(bmp);
+        g.Clear(Color.Black);
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        using var font = new Font("Microsoft YaHei UI", fontSize);
+        using var brush = new SolidBrush(Color.FromArgb(184, 184, 184));
+        using var format = new StringFormat
+        {
+            Alignment = alignment,
+            Trimming = StringTrimming.EllipsisCharacter,
+            FormatFlags = StringFormatFlags.NoWrap,
+        };
+        g.DrawString(name, font, brush, new RectangleF(0, 0, NameW, NameH), format);
+        return Rgb565.Encode(bmp);
     }
 
     async Task Fetch()

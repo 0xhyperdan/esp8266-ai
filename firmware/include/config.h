@@ -6,7 +6,21 @@
 #endif
 
 // ---- Firmware version (shown on the first-time WiFi setup screen & /api/info) ----
-#define FW_VERSION "0.4.8"
+#define FW_VERSION "0.5.5"
+
+// ---- Web OTA ----
+// Copy ota_secrets.example.h to ota_secrets.h and set unique credentials.
+// The local secrets file is ignored by Git. Builds without it keep OTA disabled.
+#if __has_include("ota_secrets.h")
+#include "ota_secrets.h"
+#define AICLOCK_OTA_ENABLED 1
+#else
+#define AICLOCK_OTA_ENABLED 0
+#define OTA_USERNAME ""
+#define OTA_PASSWORD ""
+#endif
+
+#define AICLOCK_OTA_AVAILABLE (AICLOCK_OTA_ENABLED && !AICLOCK_WIRED_ONLY)
 
 // ---- Bridge polling ----
 #define BRIDGE_DEFAULT_PORT 8765

@@ -15,12 +15,14 @@
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include <AnimatedGIF.h>
+#include <Updater.h>
 
 #include "config.h"
 #include "img/claude_sprite.h"
 #include "img/codex_sprite.h"
 #include "img/claude_logo.h"
 #include "img/codex_logo.h"
+#include "img/ui_labels_zh.h"
 
 TFT_eSPI tft = TFT_eSPI();
 ESP8266WebServer webServer(80);
@@ -38,6 +40,10 @@ ESP8266WebServer webServer(80);
 // compiled-in defaults and custom uploads share one draw path.
 const char *CLAUDE_SPRITE_FILE = "/c.bin";
 const char *CODEX_SPRITE_FILE = "/x.bin";
+const char *CLAUDE_SPRITE_TEMP_FILE = "/c.tmp";
+const char *CODEX_SPRITE_TEMP_FILE = "/x.tmp";
+const char *CLAUDE_SPRITE_BACKUP_FILE = "/c.bak";
+const char *CODEX_SPRITE_BACKUP_FILE = "/x.bak";
 const char *CLAUDE_GIF_FILE = "/c.gif"; // raw upload, decoded then removed
 const char *CODEX_GIF_FILE = "/x.gif";
 const int MAX_CUSTOM_FRAMES = 8;
@@ -57,10 +63,24 @@ int claudeCustomFrames = 0;
 bool codexCustom = false;
 int codexCustomFrames = 0;
 uint32_t spriteRev = 0; // bumped on upload/reset so the Mac mirror re-fetches
+bool fileSystemReady = false;
+const char *lastGifDecodeError = "none";
+
+enum SpriteUploadState {
+  SPRITE_UPLOAD_IDLE,
+  SPRITE_UPLOAD_PENDING,
+  SPRITE_UPLOAD_PROCESSING,
+  SPRITE_UPLOAD_SUCCEEDED,
+  SPRITE_UPLOAD_FAILED
+};
+SpriteUploadState spriteUploadState = SPRITE_UPLOAD_IDLE;
+unsigned long spriteUploadReadyMs = 0;
 
 const int SCREEN_CX = 120, SCREEN_CY = 120;
+const int SPRITE_SCALE_NUM = 11, SPRITE_SCALE_DEN = 10;
+const int SPRITE_BOTTOM_Y = 180;
 const int RING_MARGIN = 4;      // inset from screen edge
-const int RING_THICKNESS = 10;  // ring bar thickness
+const int RING_THICKNESS = 2;   // ring bar thickness
 const unsigned long ANIM_INTERVAL_MS = 120;  // sprite frame advance
 const unsigned long FLASH_INTERVAL_MS = 400; // "urgent" flash speed
 const unsigned long SWITCH_BOTH_MS = 2000;   // both apps working: alternate fast
@@ -68,6 +88,7 @@ const unsigned long SWITCH_IDLE_MS = 6000;   // neither working: alternate slow
 
 enum ActiveApp { APP_CLAUDE, APP_CODEX };
 ActiveApp currentApp = APP_CLAUDE;
+ActiveApp spriteUploadSlot = APP_CLAUDE;
 unsigned long lastSwitchMs = 0;
 
 // Display override, settable from the Mac app via POST /api/display:
@@ -132,10 +153,10 @@ int stockCount = 0;
 bool stockEverLoaded = false;
 bool stockDirty = false;
 bool stockChromeDrawn = false;
-String stockLastCode[MAX_STOCKS]; // top line (code + CJK name strip)
+String stockLastCode[MAX_STOCKS]; // top line (CJK name strip + code)
 String stockLastVal[MAX_STOCKS];  // value line (price + pct)
 unsigned long lastStockPollMs = 0;
-// CJK names come as Mac-rendered RGB565 strips (GET /stock/names.raw, one
+// CJK names come as bridge-rendered RGB565 strips (GET /stock/names-v2.raw, one
 // 156x16 strip per row) - names_rev says when to re-fetch. -1 = not drawn.
 const int STOCK_NAME_W = 156, STOCK_NAME_H = 16;
 int stockNamesRev = -1;
@@ -239,9 +260,35 @@ void saveBridgeHost(const String &host) {
 
 // ---------- custom sprite loading ----------
 
+void recoverSpriteSwap(const char *binPath, const char *tempPath, const char *backupPath) {
+  if (!LittleFS.exists(binPath) && LittleFS.exists(backupPath)) {
+    LittleFS.rename(backupPath, binPath);
+  } else {
+    LittleFS.remove(backupPath);
+  }
+  LittleFS.remove(tempPath);
+}
+
+bool ensureFileSystem(bool formatOnFailure) {
+  if (fileSystemReady) return true;
+  fileSystemReady = LittleFS.begin();
+  if (fileSystemReady || !formatOnFailure) return fileSystemReady;
+
+  Serial.println("[fs] mount failed; formatting after explicit upload request");
+  LittleFS.end();
+  if (!LittleFS.format()) return false;
+  fileSystemReady = LittleFS.begin();
+  return fileSystemReady;
+}
+
 // Checks LittleFS for a previously-uploaded custom sprite and validates its
 // size before trusting it (frame count byte + exact expected byte length).
 void loadCustomSpriteState() {
+  recoverSpriteSwap(CLAUDE_SPRITE_FILE, CLAUDE_SPRITE_TEMP_FILE, CLAUDE_SPRITE_BACKUP_FILE);
+  recoverSpriteSwap(CODEX_SPRITE_FILE, CODEX_SPRITE_TEMP_FILE, CODEX_SPRITE_BACKUP_FILE);
+  LittleFS.remove(CLAUDE_GIF_FILE);
+  LittleFS.remove(CODEX_GIF_FILE);
+
   claudeCustom = false;
   if (LittleFS.exists(CLAUDE_SPRITE_FILE)) {
     File f = LittleFS.open(CLAUDE_SPRITE_FILE, "r");
@@ -277,29 +324,40 @@ void loadCustomSpriteState() {
 int claudeFrameCount() { return claudeCustom ? claudeCustomFrames : CLAUDE_SPRITE_FRAMES; }
 int codexFrameCount() { return codexCustom ? codexCustomFrames : CODEX_SPRITE_FRAMES; }
 
-// Draws one sprite frame centered on screen, one row at a time so we never
-// need a full-frame buffer: each row comes either from the custom LittleFS
-// file (streamed) or the compiled-in PROGMEM default (copied row-by-row).
+// Draws one sprite frame 10% larger, anchored just above the quota labels.
+// Source rows still stream from LittleFS or PROGMEM, so scaling adds no full
+// frame buffer and keeps the stored custom-pet format backward compatible.
 void drawSpriteFrame(bool custom, const char *file, const uint16_t *const *progmemFrames, int frameIdx, int w,
                      int h, size_t frameBytes) {
-  int x0 = SCREEN_CX - w / 2, y0 = SCREEN_CY - h / 2;
+  int displayW = (w * SPRITE_SCALE_NUM + SPRITE_SCALE_DEN / 2) / SPRITE_SCALE_DEN;
+  int displayH = (h * SPRITE_SCALE_NUM + SPRITE_SCALE_DEN / 2) / SPRITE_SCALE_DEN;
+  int x0 = SCREEN_CX - displayW / 2, y0 = SPRITE_BOTTOM_Y - displayH;
   size_t rowBytes = (size_t)w * 2;
+  File f;
   if (custom) {
-    File f = LittleFS.open(file, "r");
+    f = LittleFS.open(file, "r");
     if (!f) return;
-    f.seek(1 + (size_t)frameIdx * frameBytes);
-    for (int r = 0; r < h; r++) {
-      f.read((uint8_t *)rowBuf, rowBytes);
-      tft.pushImage(x0, y0 + r, w, 1, rowBuf);
-    }
-    f.close();
-  } else {
-    const uint16_t *frame = progmemFrames[frameIdx];
-    for (int r = 0; r < h; r++) {
-      memcpy_P(rowBuf, frame + (size_t)r * w, rowBytes);
-      tft.pushImage(x0, y0 + r, w, 1, rowBuf);
-    }
   }
+  const uint16_t *frame = custom ? nullptr : progmemFrames[frameIdx];
+  int loadedSourceRow = -1;
+  for (int y = 0; y < displayH; y++) {
+    int sourceY = y * h / displayH;
+    if (sourceY != loadedSourceRow) {
+      if (custom) {
+        f.seek(1 + (size_t)frameIdx * frameBytes + (size_t)sourceY * rowBytes);
+        if (f.read((uint8_t *)prevRowBuf, rowBytes) != (int)rowBytes) break;
+      } else {
+        memcpy_P(prevRowBuf, frame + (size_t)sourceY * w, rowBytes);
+      }
+      loadedSourceRow = sourceY;
+    }
+    for (int x = 0; x < displayW; x++) {
+      rowBuf[x] = prevRowBuf[x * w / displayW];
+    }
+    tft.pushImage(x0, y0 + y, displayW, 1, rowBuf);
+    if ((y & 0x1F) == 0x1F) yield();
+  }
+  if (f) f.close();
 }
 
 // ---------- helpers ----------
@@ -438,6 +496,25 @@ void drawBoldString(const String &s, int x, int y, int font, uint16_t color) {
   tft.drawString(s, x + 1, y, font);
 }
 
+void drawCenteredMonoLabel(const uint8_t *bits, int width, int height, int centerX, int y,
+                           uint16_t color) {
+  int rowBytes = (width + 7) / 8;
+  int x0 = centerX - width / 2;
+  uint16_t packedColor = (uint16_t)((color << 8) | (color >> 8));
+  for (int row = 0; row < height; row++) {
+    for (int x = 0; x < width; x++) {
+      uint8_t packed = pgm_read_byte(bits + row * rowBytes + x / 8);
+      rowBuf[x] = (packed & (0x80 >> (x & 7))) ? packedColor : TFT_BLACK;
+    }
+    tft.pushImage(x0, y + row, width, 1, rowBuf);
+  }
+}
+
+void drawWeekQuotaLabel(int centerX, int y, uint16_t color) {
+  drawCenteredMonoLabel(week_quota_label_bits, WEEK_QUOTA_LABEL_W, WEEK_QUOTA_LABEL_H,
+                        centerX, y, color);
+}
+
 void drawQuotaText(float hourPct, float weekPct, bool force) {
   // Codex dropped the 5h window (2026-07): the bridge then sends
   // primary_pct=null, so collapse to a single centered "Wk" column.
@@ -450,7 +527,7 @@ void drawQuotaText(float hourPct, float weekPct, bool force) {
   }
   tft.setTextDatum(TC_DATUM);
   if (single) {
-    if (force) drawBoldString("Wk", 120, QUOTA_LABEL_Y, 2, TFT_LIGHTGREY);
+    if (force) drawWeekQuotaLabel(120, QUOTA_LABEL_Y, TFT_LIGHTGREY);
     String v = pctText(weekPct);
     if (force || v != lastQuotaWk) {
       lastQuotaWk = v;
@@ -462,7 +539,7 @@ void drawQuotaText(float hourPct, float weekPct, bool force) {
   }
   if (force) {
     drawBoldString("5h", QUOTA_COL1_X, QUOTA_LABEL_Y, 2, TFT_LIGHTGREY);
-    drawBoldString("Wk", QUOTA_COL2_X, QUOTA_LABEL_Y, 2, TFT_LIGHTGREY);
+    drawWeekQuotaLabel(QUOTA_COL2_X, QUOTA_LABEL_Y, TFT_LIGHTGREY);
   }
   String v1 = pctText(hourPct), v2 = pctText(weekPct);
   if (force || v1 != lastQuota5h) {
@@ -554,7 +631,10 @@ void drawCountdown(bool force) {
   tft.setTextDatum(TC_DATUM);
   if (force) {
     tft.fillRect(SCREEN_CX - 99, 66, 198, 84, TFT_BLACK);
-    drawBoldString(showingCd == CD_WEEK ? "Wk RESET IN" : "5h RESET IN", SCREEN_CX, 72, 2, TFT_LIGHTGREY);
+    if (showingCd == CD_WEEK)
+      drawWeekQuotaLabel(SCREEN_CX, 72, TFT_LIGHTGREY);
+    else
+      drawBoldString("5h RESET IN", SCREEN_CX, 72, 2, TFT_LIGHTGREY);
   }
   // Background-color draw overwrites glyphs in place (no clear-then-draw
   // flash between seconds).
@@ -565,15 +645,23 @@ void drawCountdown(bool force) {
 // App logo in the top-left corner (inside the quota ring) so a glance tells
 // which app the screen is currently showing. Drawn row-by-row from PROGMEM
 // through rowBuf, same as the sprite path.
-const int LOGO_X = 14, LOGO_Y = 18;
+const int LOGO_X = 14, LOGO_Y = 18, LOGO_DISPLAY_W = 30, LOGO_DISPLAY_H = 30;
 
 void drawAppLogo() {
   const uint16_t *logo = (currentApp == APP_CLAUDE) ? claude_logo_0 : codex_logo_0;
   int w = (currentApp == APP_CLAUDE) ? CLAUDE_LOGO_W : CODEX_LOGO_W;
   int h = (currentApp == APP_CLAUDE) ? CLAUDE_LOGO_H : CODEX_LOGO_H;
-  for (int r = 0; r < h; r++) {
-    memcpy_P(rowBuf, logo + (size_t)r * w, (size_t)w * 2);
-    tft.pushImage(LOGO_X, LOGO_Y + r, w, 1, rowBuf);
+  int loadedSourceRow = -1;
+  for (int y = 0; y < LOGO_DISPLAY_H; y++) {
+    int sourceY = y * h / LOGO_DISPLAY_H;
+    if (sourceY != loadedSourceRow) {
+      memcpy_P(prevRowBuf, logo + (size_t)sourceY * w, (size_t)w * 2);
+      loadedSourceRow = sourceY;
+    }
+    for (int x = 0; x < LOGO_DISPLAY_W; x++) {
+      rowBuf[x] = prevRowBuf[x * w / LOGO_DISPLAY_W];
+    }
+    tft.pushImage(LOGO_X, LOGO_Y + y, LOGO_DISPLAY_W, 1, rowBuf);
   }
 }
 
@@ -1113,13 +1201,13 @@ bool handleStockPayload(const String &payload) {
   return true;
 }
 
-// Streams the Mac-rendered name strips and blits one per row (top line,
-// right of the ASCII code). Wired-only mode has no HTTP: codes still show.
+// Streams the Mac-rendered name strips and blits one per row on the left side
+// of the top line. Wired-only mode has no HTTP: codes still show on the right.
 bool drawStockNames() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
   WiFiClient client;
   HTTPClient http;
-  String url = "http://" + bridgeHost + "/stock/names.raw";
+  String url = "http://" + bridgeHost + "/stock/names-v2.raw";
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
   if (!http.begin(client, url)) return false;
   int code = http.GET();
@@ -1142,7 +1230,7 @@ bool drawStockNames() {
         ok = false;
         break;
       }
-      if (i < stockCount) tft.pushImage(70, y0 + r, STOCK_NAME_W, 1, rowBuf);
+      if (i < stockCount) tft.pushImage(14, y0 + r, STOCK_NAME_W, 1, rowBuf);
       yield();
     }
   }
@@ -1162,8 +1250,9 @@ void pollStock() {
   http.end();
 }
 
-// 54px per row: small grey code on top, big font-4 price (white) on the left
-// and change% on the right - red rising / green falling (CN convention).
+// 54px per row: grey name on the top left, code on the top right, big font-4
+// price (white) on the left, and change% on the right - red rising / green
+// falling (CN convention).
 // Rows repaint only when their text changes, same trick as everywhere else.
 void drawStockScreen() {
   if (!stockChromeDrawn) {
@@ -1174,9 +1263,8 @@ void drawStockScreen() {
       stockLastVal[i] = "\x01";
     }
     stockNamesDrawnRev = -1;
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextColor(0x7BEF, TFT_BLACK);
-    tft.drawString("STOCKS", SCREEN_CX, 228, 1);
+    drawCenteredMonoLabel(stock_label_bits, STOCK_LABEL_W, STOCK_LABEL_H, SCREEN_CX, 225,
+                          0x7BEF);
   }
   stockDirty = false;
 
@@ -1198,7 +1286,7 @@ void drawStockScreen() {
   for (int i = 0; i < MAX_STOCKS; i++) {
     int y0 = 10 + i * 54;
     bool has = i < stockCount;
-    // top line (code + name strip) and value line refresh independently, so
+    // top line (name strip + code) and value line refresh independently, so
     // a price tick never wipes the name bitmap
     String codeKey = has ? stocks[i].code : "";
     if (codeKey != stockLastCode[i]) {
@@ -1206,9 +1294,9 @@ void drawStockScreen() {
       tft.fillRect(0, y0, SCREEN_W, 17, TFT_BLACK);
       stockNamesDrawnRev = -1; // strip area wiped: re-fetch names
       if (has) {
-        tft.setTextDatum(TL_DATUM);
+        tft.setTextDatum(TR_DATUM);
         tft.setTextColor(0x7BEF, TFT_BLACK);
-        tft.drawString(stocks[i].code, 14, y0, 2);
+        tft.drawString(stocks[i].code, 226, y0, 2);
       }
     }
     String valKey = has ? stocks[i].price + "|" + stocks[i].pct + "|" + String(stocks[i].up) : "";
@@ -1393,6 +1481,20 @@ bool wiredEverLinked = false;
 char serialLine[1600]; // biggest frame is #STATUS at ~600 bytes
 size_t serialLineLen = 0;
 
+const size_t SERIAL_PET_CHUNK_BYTES = 384;
+const size_t SERIAL_PET_MAX_BYTES = 384 * 1024;
+uint8_t serialPetChunk[SERIAL_PET_CHUNK_BYTES];
+File serialPetFile;
+bool serialPetActive = false;
+ActiveApp serialPetSlot = APP_CLAUDE;
+size_t serialPetExpectedSize = 0;
+size_t serialPetReceived = 0;
+uint32_t serialPetExpectedCrc = 0;
+uint32_t serialPetRunningCrc = 0xFFFFFFFFUL;
+unsigned long serialPetNextSequence = 0;
+
+bool applyUploadedGif(ActiveApp slot);
+
 bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 15000UL; }
 
 // First data over either transport replaces the boot/portal screen.
@@ -1404,12 +1506,196 @@ void showMainUiIfNeeded() {
   drawActiveApp();
 }
 
+const char *serialPetGifPath() {
+  return serialPetSlot == APP_CLAUDE ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
+}
+
+void clearSerialPetUpload(bool removeTemporaryFile) {
+  if (serialPetFile) serialPetFile.close();
+  if (removeTemporaryFile && fileSystemReady) LittleFS.remove(serialPetGifPath());
+  serialPetActive = false;
+  serialPetExpectedSize = 0;
+  serialPetReceived = 0;
+  serialPetExpectedCrc = 0;
+  serialPetRunningCrc = 0xFFFFFFFFUL;
+  serialPetNextSequence = 0;
+}
+
+uint32_t updateCrc32(uint32_t crc, const uint8_t *data, size_t length) {
+  while (length--) {
+    crc ^= *data++;
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320UL : 0);
+    }
+  }
+  return crc;
+}
+
+int base64Value(char ch) {
+  if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+  if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+  if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+  if (ch == '+') return 62;
+  if (ch == '/') return 63;
+  return -1;
+}
+
+bool decodeBase64Chunk(const char *input, size_t length, uint8_t *output, size_t capacity,
+                       size_t &outputLength) {
+  outputLength = 0;
+  if (length == 0 || length % 4 != 0) return false;
+  for (size_t i = 0; i < length; i += 4) {
+    int a = base64Value(input[i]);
+    int b = base64Value(input[i + 1]);
+    int c = input[i + 2] == '=' ? -2 : base64Value(input[i + 2]);
+    int d = input[i + 3] == '=' ? -2 : base64Value(input[i + 3]);
+    if (a < 0 || b < 0 || c == -1 || d == -1 || (c == -2 && d != -2) ||
+        ((c == -2 || d == -2) && i + 4 != length)) {
+      return false;
+    }
+
+    size_t bytes = c == -2 ? 1 : (d == -2 ? 2 : 3);
+    if (outputLength + bytes > capacity) return false;
+    uint32_t value = ((uint32_t)a << 18) | ((uint32_t)b << 12);
+    if (c >= 0) value |= (uint32_t)c << 6;
+    if (d >= 0) value |= (uint32_t)d;
+    output[outputLength++] = (uint8_t)(value >> 16);
+    if (bytes > 1) output[outputLength++] = (uint8_t)(value >> 8);
+    if (bytes > 2) output[outputLength++] = (uint8_t)value;
+  }
+  return true;
+}
+
+void handleSerialPetBegin(const char *payload) {
+  if (serialPetActive) {
+    Serial.println("#PET_ERR busy");
+    return;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) {
+    Serial.println("#PET_ERR invalid_metadata");
+    return;
+  }
+  const char *slot = doc["slot"] | (const char *)nullptr;
+  unsigned long size = doc["size"].as<unsigned long>();
+  uint32_t crc = doc["crc32"].as<uint32_t>();
+  if (!slot || (strcmp(slot, "claude") && strcmp(slot, "codex"))) {
+    Serial.println("#PET_ERR invalid_slot");
+    return;
+  }
+  if (size == 0 || size > SERIAL_PET_MAX_BYTES) {
+    Serial.println("#PET_ERR invalid_size");
+    return;
+  }
+  if (!ensureFileSystem(true)) {
+    Serial.println("#PET_ERR filesystem_unavailable");
+    return;
+  }
+
+  serialPetSlot = !strcmp(slot, "claude") ? APP_CLAUDE : APP_CODEX;
+  LittleFS.remove(serialPetGifPath());
+  serialPetFile = LittleFS.open(serialPetGifPath(), "w");
+  if (!serialPetFile) {
+    Serial.println("#PET_ERR file_open_failed");
+    return;
+  }
+  serialPetActive = true;
+  serialPetExpectedSize = size;
+  serialPetReceived = 0;
+  serialPetExpectedCrc = crc;
+  serialPetRunningCrc = 0xFFFFFFFFUL;
+  serialPetNextSequence = 0;
+  Serial.println("#PET_READY");
+}
+
+void handleSerialPetChunk(char *payload) {
+  if (!serialPetActive) {
+    Serial.println("#PET_ERR no_upload");
+    return;
+  }
+  char *separator = strchr(payload, ' ');
+  if (!separator) {
+    clearSerialPetUpload(true);
+    Serial.println("#PET_ERR invalid_chunk");
+    return;
+  }
+  *separator = 0;
+  char *end = nullptr;
+  unsigned long sequence = strtoul(payload, &end, 10);
+  if (!end || *end || sequence != serialPetNextSequence) {
+    clearSerialPetUpload(true);
+    Serial.println("#PET_ERR sequence_mismatch");
+    return;
+  }
+
+  size_t decodedLength = 0;
+  const char *encoded = separator + 1;
+  if (!decodeBase64Chunk(encoded, strlen(encoded), serialPetChunk, sizeof(serialPetChunk),
+                         decodedLength) ||
+      serialPetReceived + decodedLength > serialPetExpectedSize) {
+    clearSerialPetUpload(true);
+    Serial.println("#PET_ERR invalid_chunk_data");
+    return;
+  }
+  if (serialPetFile.write(serialPetChunk, decodedLength) != decodedLength) {
+    clearSerialPetUpload(true);
+    Serial.println("#PET_ERR file_write_failed");
+    return;
+  }
+  serialPetRunningCrc = updateCrc32(serialPetRunningCrc, serialPetChunk, decodedLength);
+  serialPetReceived += decodedLength;
+  serialPetNextSequence++;
+  Serial.printf("#PET_ACK %lu\n", sequence);
+  yield();
+}
+
+void handleSerialPetEnd() {
+  if (!serialPetActive) {
+    Serial.println("#PET_ERR no_upload");
+    return;
+  }
+  if (serialPetFile) {
+    serialPetFile.flush();
+    serialPetFile.close();
+  }
+  if (serialPetReceived != serialPetExpectedSize) {
+    clearSerialPetUpload(true);
+    Serial.println("#PET_ERR size_mismatch");
+    return;
+  }
+  if ((~serialPetRunningCrc) != serialPetExpectedCrc) {
+    clearSerialPetUpload(true);
+    Serial.println("#PET_ERR crc_mismatch");
+    return;
+  }
+
+  ActiveApp slot = serialPetSlot;
+  Serial.println("#PET_PROCESSING");
+  Serial.flush();
+  bool ok = applyUploadedGif(slot);
+  clearSerialPetUpload(false);
+  Serial.println(ok ? "#PET_DONE" : "#PET_ERR gif_decode_failed");
+}
+
 void handleSerialFrame(char *line) {
   lastSerialFrameMs = millis();
   wiredEverLinked = true;
   if (!strncmp(line, "#HELLO", 6)) {
     Serial.printf("#DEVICE {\"name\":\"aiclock\",\"fw\":\"%s\",\"transport\":\"%s\"}\n",
                   FW_VERSION, AICLOCK_WIRED_ONLY ? "usb" : "hybrid");
+    return;
+  }
+  if (!strncmp(line, "#PET_BEGIN ", 11)) {
+    handleSerialPetBegin(line + 11);
+    return;
+  }
+  if (!strncmp(line, "#PET_CHUNK ", 11)) {
+    handleSerialPetChunk(line + 11);
+    return;
+  }
+  if (!strcmp(line, "#PET_END")) {
+    handleSerialPetEnd();
     return;
   }
   if (!strncmp(line, "#STATUS ", 8)) {
@@ -1549,6 +1835,11 @@ void handleRoot() {
                                         : "5h ?") + "</td></tr>";
   html += "</table>";
 
+#if AICLOCK_OTA_AVAILABLE
+  html += "<h2 style='font-size:16px;margin-top:28px'>Firmware update</h2>";
+  html += "<p><a href='/update'>Open password-protected update page</a></p>";
+#endif
+
   html += "<form method='POST' action='/reset-wifi' onsubmit=\"return confirm('清除 WiFi "
           "设置并重启？设备会开启配网热点。');\">";
   html += "<button type='submit' style='background:#dc2626'>重置 WiFi</button>";
@@ -1579,6 +1870,14 @@ const char *displayModeName(DisplayMode m) {
   return "auto";
 }
 
+const char *spriteUploadStateName() {
+  if (spriteUploadState == SPRITE_UPLOAD_PENDING) return "pending";
+  if (spriteUploadState == SPRITE_UPLOAD_PROCESSING) return "processing";
+  if (spriteUploadState == SPRITE_UPLOAD_SUCCEEDED) return "succeeded";
+  if (spriteUploadState == SPRITE_UPLOAD_FAILED) return "failed";
+  return "idle";
+}
+
 void handleApiInfo() {
   JsonDocument doc;
   doc["ip"] = WiFi.localIP().toString();
@@ -1593,6 +1892,14 @@ void handleApiInfo() {
   doc["brightness"] = brightness;
   doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
   doc["fw"] = FW_VERSION;
+  doc["ota"] = (bool)AICLOCK_OTA_AVAILABLE;
+  doc["reset_reason"] = ESP.getResetReason();
+  doc["free_heap"] = ESP.getFreeHeap();
+  doc["max_free_block"] = ESP.getMaxFreeBlockSize();
+  JsonObject upload = doc["sprite_upload"].to<JsonObject>();
+  upload["state"] = spriteUploadStateName();
+  upload["slot"] = (spriteUploadSlot == APP_CLAUDE) ? "claude" : "codex";
+  upload["error"] = (spriteUploadState == SPRITE_UPLOAD_FAILED) ? lastGifDecodeError : "";
   JsonObject c = doc["claude"].to<JsonObject>();
   c["status"] = claudeStatus.status;
   c["custom_sprite"] = claudeCustom;
@@ -1736,6 +2043,7 @@ struct GifDecodeCtx {
   File prevFile;        // previous frame in the .bin, read sequentially for compositing
   bool hasPrev;         // false for frame 0 (nothing to composite over -> black)
   int producedRow;      // next target row still owed for the current frame
+  bool failed;          // set by the callback when LittleFS I/O is incomplete
 };
 
 static File gifReadFile; // one decode runs at a time, so a single handle is fine
@@ -1770,31 +2078,44 @@ int32_t gifSeekCB(GIFFILE *pFile, int32_t iPosition) {
 
 // Loads the next previous-frame row into prevRowBuf (black if there's no
 // previous frame). Reads are sequential and stay aligned with producedRow.
-static void readPrevRow(GifDecodeCtx *ctx) {
-  if (ctx->hasPrev)
-    ctx->prevFile.read((uint8_t *)prevRowBuf, ctx->rowBytes);
-  else
+static bool readPrevRow(GifDecodeCtx *ctx) {
+  if (ctx->hasPrev) {
+    int readBytes = ctx->prevFile.read((uint8_t *)prevRowBuf, ctx->rowBytes);
+    if (readBytes < 0 || (size_t)readBytes != ctx->rowBytes) {
+      ctx->failed = true;
+      return false;
+    }
+  } else {
     memset(prevRowBuf, 0, ctx->rowBytes);
+  }
+  return true;
 }
 
 // Appends the current rowBuf as the next output row.
-static void emitRow(GifDecodeCtx *ctx) {
-  ctx->out.write((const uint8_t *)rowBuf, ctx->rowBytes);
+static bool emitRow(GifDecodeCtx *ctx) {
+  if (ctx->out.write((const uint8_t *)rowBuf, ctx->rowBytes) != ctx->rowBytes) {
+    ctx->failed = true;
+    return false;
+  }
   ctx->producedRow++;
+  if ((ctx->producedRow & 0x07) == 0) yield();
+  return true;
 }
 
 // Emits a row that this frame doesn't touch: a straight copy of the previous
 // frame (top/bottom gaps of a partial frame).
-static void emitPrevRow(GifDecodeCtx *ctx) {
-  readPrevRow(ctx);
+static bool emitPrevRow(GifDecodeCtx *ctx) {
+  if (!readPrevRow(ctx)) return false;
   memcpy(rowBuf, prevRowBuf, ctx->rowBytes);
-  emitRow(ctx);
+  return emitRow(ctx);
 }
 
 // Rescales one decoded native line into target rows, compositing over the
 // previous frame, and streams every target row it can now finalize.
 void gifDrawCB(GIFDRAW *pDraw) {
   GifDecodeCtx *ctx = (GifDecodeCtx *)pDraw->pUser;
+  if (ctx->failed) return;
+  if ((pDraw->y & 0x0F) == 0) yield();
   int sy = pDraw->iY + pDraw->y; // absolute source line on the GIF canvas
   if (sy < 0 || sy >= ctx->canvasH) return;
 
@@ -1808,10 +2129,13 @@ void gifDrawCB(GIFDRAW *pDraw) {
     int ty = ctx->producedRow;
     int srcRow = (int)((long)ty * ctx->canvasH / ctx->targetH);
     if (srcRow > sy) break;                       // needs a later source line
-    if (srcRow < sy) { emitPrevRow(ctx); continue; } // source line was skipped -> previous frame
+    if (srcRow < sy) {
+      if (!emitPrevRow(ctx)) return;
+      continue;
+    } // source line was skipped -> previous frame
 
     // srcRow == sy: composite this source line over the previous frame's row.
-    readPrevRow(ctx);
+    if (!readPrevRow(ctx)) return;
     memcpy(rowBuf, prevRowBuf, ctx->rowBytes);
     for (int tx = 0; tx < ctx->targetW; tx++) {
       int sx = (int)((long)tx * ctx->canvasW / ctx->targetW);
@@ -1823,21 +2147,39 @@ void gifDrawCB(GIFDRAW *pDraw) {
       uint16_t val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
       rowBuf[tx] = (uint16_t)(((val & 0xFF) << 8) | (val >> 8)); // byte-swap to match convert_sprites.py
     }
-    emitRow(ctx);
+    if (!emitRow(ctx)) return;
   }
 }
 
 // Decodes gifPath into binPath in the [count][frames...] wire format the
 // display path reads. Returns false on open/decode failure.
 bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int targetH) {
+  lastGifDecodeError = "unknown";
+  if (!fileSystemReady || targetW <= 0 || targetW > SCREEN_W || targetH <= 0) {
+    lastGifDecodeError = "invalid decoder state";
+    return false;
+  }
+
   // AnimatedGIF's internal state (~24KB of LZW/line/palette buffers) is big, so
   // allocate it on the heap only for the duration of a decode rather than
   // paying for it in .bss for the whole uptime.
+  uint32_t decoderBytes = sizeof(AnimatedGIF);
+  uint32_t maxBlock = ESP.getMaxFreeBlockSize();
+  Serial.printf("[gif] start heap=%u max_block=%u decoder=%u\n", ESP.getFreeHeap(), maxBlock,
+                decoderBytes);
+  if (maxBlock < decoderBytes) {
+    lastGifDecodeError = "insufficient contiguous heap";
+    return false;
+  }
   AnimatedGIF *gif = new AnimatedGIF();
-  if (!gif) return false;
+  if (!gif) {
+    lastGifDecodeError = "decoder allocation failed";
+    return false;
+  }
   gif->begin(GIF_PALETTE_RGB888);
   if (!gif->open(gifPath, gifOpenCB, gifCloseCB, gifReadCB, gifSeekCB, gifDrawCB)) {
     Serial.printf("[gif] open failed err=%d\n", gif->getLastError());
+    lastGifDecodeError = "GIF open failed";
     delete gif;
     return false;
   }
@@ -1849,15 +2191,31 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
   ctx.targetH = targetH;
   ctx.rowBytes = (size_t)targetW * 2;
   ctx.hasPrev = false;
+  ctx.failed = false;
   size_t frameBytes = (size_t)targetW * targetH * 2;
 
-  ctx.out = LittleFS.open(binPath, "w");
-  if (!ctx.out) {
+  if (ctx.canvasW <= 0 || ctx.canvasH <= 0 || ctx.canvasW > 480) {
+    lastGifDecodeError = "unsupported GIF dimensions";
     gif->close();
     delete gif;
     return false;
   }
-  ctx.out.write((uint8_t)0); // placeholder frame count, patched once we know the total
+
+  ctx.out = LittleFS.open(binPath, "w");
+  if (!ctx.out) {
+    lastGifDecodeError = "output file open failed";
+    gif->close();
+    delete gif;
+    return false;
+  }
+  if (ctx.out.write((uint8_t)0) != 1) {
+    lastGifDecodeError = "output file write failed";
+    gif->close();
+    delete gif;
+    ctx.out.close();
+    LittleFS.remove(binPath);
+    return false;
+  }
 
   uint8_t count = 0;
   int delayMs = 0, more = 1;
@@ -1873,30 +2231,49 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
 
     more = gif->playFrame(false, &delayMs, &ctx);
 
-    if (more >= 0) {
+    if (more >= 0 && !ctx.failed) {
       // finalize any bottom rows this frame never touched
-      while (ctx.producedRow < ctx.targetH) emitPrevRow(&ctx);
-      count++;
+      while (ctx.producedRow < ctx.targetH && emitPrevRow(&ctx)) {}
+      if (!ctx.failed) count++;
     }
     if (ctx.prevFile) ctx.prevFile.close();
+    if (ctx.failed) break;
     if (more <= 0) break; // 0 = last frame, <0 = decode error
     yield();              // feed the WDT between frames
   }
+  int decodeError = gif->getLastError();
   gif->close();
   delete gif;
   ctx.out.close();
 
-  if (count == 0) {
+  if (ctx.failed || count == 0 || more < 0) {
+    lastGifDecodeError = ctx.failed ? "output file I/O failed" : "GIF decode failed";
+    Serial.printf("[gif] failed frames=%u err=%d io=%d\n", count, decodeError, ctx.failed);
     LittleFS.remove(binPath);
     return false;
   }
   File patch = LittleFS.open(binPath, "r+");
-  if (patch) {
-    patch.seek(0);
-    patch.write(count);
-    patch.close();
+  if (!patch || !patch.seek(0) || patch.write(count) != 1) {
+    if (patch) patch.close();
+    lastGifDecodeError = "frame count finalize failed";
+    LittleFS.remove(binPath);
+    return false;
   }
+  patch.close();
+  lastGifDecodeError = "none";
   Serial.printf("[gif] decoded %d frame(s) %dx%d -> %dx%d\n", count, ctx.canvasW, ctx.canvasH, targetW, targetH);
+  return true;
+}
+
+bool replaceSpriteFile(const char *binPath, const char *tempPath, const char *backupPath) {
+  LittleFS.remove(backupPath);
+  bool hadCurrent = LittleFS.exists(binPath);
+  if (hadCurrent && !LittleFS.rename(binPath, backupPath)) return false;
+  if (!LittleFS.rename(tempPath, binPath)) {
+    if (hadCurrent) LittleFS.rename(backupPath, binPath);
+    return false;
+  }
+  LittleFS.remove(backupPath);
   return true;
 }
 
@@ -1907,9 +2284,93 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
 // LittleFS in small chunks, then decode it on the done callback.
 File uploadFile;
 
+#if AICLOCK_OTA_AVAILABLE
+bool otaAuthenticated = false;
+bool otaUploadSucceeded = false;
+bool otaRestartPending = false;
+unsigned long otaRestartRequestedMs = 0;
+String otaUploadError;
+
+const char OTA_UPDATE_PAGE[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Clock Firmware Update</title>
+<style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:32px auto;padding:0 16px}
+input,button{display:block;margin-top:16px;font-size:16px}button{padding:10px 18px}</style>
+</head><body><h1>Firmware Update</h1>
+<p>Upload a firmware.bin built for this device. Settings and pet data are preserved.</p>
+<form method="POST" action="/update" enctype="multipart/form-data">
+<input type="file" name="firmware" accept=".bin,application/octet-stream" required>
+<button type="submit">Upload and restart</button></form></body></html>
+)HTML";
+
+bool authenticateOtaRequest() {
+  if (webServer.authenticate(OTA_USERNAME, OTA_PASSWORD)) return true;
+  webServer.requestAuthentication();
+  return false;
+}
+
+void handleOtaUploadChunk() {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    otaAuthenticated = webServer.authenticate(OTA_USERNAME, OTA_PASSWORD);
+    otaUploadSucceeded = false;
+    otaRestartPending = false;
+    otaUploadError = "";
+    if (!otaAuthenticated) return;
+    if (!upload.filename.endsWith(".bin")) {
+      otaUploadError = "Only .bin firmware images are accepted.";
+      return;
+    }
+    uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    if (!Update.begin(maxSketchSpace, U_FLASH)) {
+      otaUploadError = Update.getErrorString();
+      Serial.printf("[ota] begin failed: %s\n", otaUploadError.c_str());
+      return;
+    }
+    Serial.printf("[ota] receiving %s, max=%u bytes\n", upload.filename.c_str(), maxSketchSpace);
+  } else if (otaAuthenticated && upload.status == UPLOAD_FILE_WRITE && otaUploadError.length() == 0) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      otaUploadError = Update.getErrorString();
+      Serial.printf("[ota] write failed: %s\n", otaUploadError.c_str());
+    }
+  } else if (otaAuthenticated && upload.status == UPLOAD_FILE_END && otaUploadError.length() == 0) {
+    otaUploadSucceeded = Update.end(true);
+    if (!otaUploadSucceeded) otaUploadError = Update.getErrorString();
+    Serial.printf("[ota] upload %s, bytes=%u\n", otaUploadSucceeded ? "complete" : "failed",
+                  upload.totalSize);
+  } else if (otaAuthenticated && upload.status == UPLOAD_FILE_ABORTED) {
+    Update.end();
+    otaUploadError = "Upload was aborted.";
+  }
+  yield();
+}
+
+void handleOtaUploadDone() {
+  if (!otaAuthenticated) {
+    webServer.requestAuthentication();
+    return;
+  }
+  if (!otaUploadSucceeded) {
+    String message = otaUploadError.length() > 0 ? otaUploadError : "Firmware update failed.";
+    webServer.send(500, "text/plain", message);
+    return;
+  }
+  webServer.sendHeader("Connection", "close");
+  webServer.send(200, "text/html",
+                 "<meta http-equiv='refresh' content='15;url=/'>Update complete. Restarting...");
+  otaRestartPending = true;
+  otaRestartRequestedMs = millis();
+}
+#endif
+
 void handleSpriteUploadChunk(const char *gifPath) {
   HTTPUpload &upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
+    if (spriteUploadState == SPRITE_UPLOAD_PENDING ||
+        spriteUploadState == SPRITE_UPLOAD_PROCESSING) {
+      return;
+    }
     uploadFile = LittleFS.open(gifPath, "w");
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
@@ -1919,26 +2380,73 @@ void handleSpriteUploadChunk(const char *gifPath) {
 }
 
 void handleSpriteUploadDone(ActiveApp slot) {
+  if (spriteUploadState == SPRITE_UPLOAD_PENDING ||
+      spriteUploadState == SPRITE_UPLOAD_PROCESSING) {
+    webServer.send(409, "text/plain", "another sprite upload is still processing");
+    return;
+  }
+
+  const char *gifPath = (slot == APP_CLAUDE) ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
+  File uploaded = LittleFS.open(gifPath, "r");
+  bool valid = uploaded && uploaded.size() > 0;
+  if (uploaded) uploaded.close();
+  if (!valid) {
+    LittleFS.remove(gifPath);
+    webServer.send(500, "text/plain", "uploaded GIF was not stored");
+    return;
+  }
+
+  spriteUploadSlot = slot;
+  spriteUploadState = SPRITE_UPLOAD_PENDING;
+  spriteUploadReadyMs = millis() + 250;
+  lastGifDecodeError = "none";
+  webServer.sendHeader("Connection", "close");
+  webServer.send(202, "text/plain", "accepted; poll /api/info sprite_upload");
+  Serial.println("[sprite] upload stored; decode deferred until HTTP memory is released");
+}
+
+bool applyUploadedGif(ActiveApp slot) {
   const char *gifPath = (slot == APP_CLAUDE) ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
   const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
+  const char *tempPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_TEMP_FILE : CODEX_SPRITE_TEMP_FILE;
+  const char *backupPath =
+      (slot == APP_CLAUDE) ? CLAUDE_SPRITE_BACKUP_FILE : CODEX_SPRITE_BACKUP_FILE;
   int tw = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_W : CODEX_SPRITE_W;
   int th = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_H : CODEX_SPRITE_H;
 
-  bool ok = decodeGifToBin(gifPath, binPath, tw, th);
+  LittleFS.remove(tempPath);
+  bool ok = decodeGifToBin(gifPath, tempPath, tw, th);
   LittleFS.remove(gifPath); // temp raw gif no longer needed once decoded
+
+  if (!ok) {
+    LittleFS.remove(tempPath);
+    return false;
+  }
+  if (!replaceSpriteFile(binPath, tempPath, backupPath)) {
+    lastGifDecodeError = "sprite file swap failed";
+    LittleFS.remove(tempPath);
+    return false;
+  }
 
   spriteRev++;
   loadCustomSpriteState();
   if (slot == APP_CLAUDE) claudeFrame = 0;
   else codexFrame = 0;
   if (currentApp == slot) drawActiveApp();
+  return true;
+}
 
+void processPendingSpriteUpload() {
+  if (spriteUploadState != SPRITE_UPLOAD_PENDING || millis() < spriteUploadReadyMs) return;
+  if (webServer.client()) return;
+
+  spriteUploadState = SPRITE_UPLOAD_PROCESSING;
+  bool ok = applyUploadedGif(spriteUploadSlot);
+  spriteUploadState = ok ? SPRITE_UPLOAD_SUCCEEDED : SPRITE_UPLOAD_FAILED;
   if (ok) {
-    webServer.send(200, "text/plain", "ok");
-    Serial.println("[sprite] gif decoded & applied");
+    Serial.println("[sprite] deferred GIF decoded & applied");
   } else {
-    webServer.send(500, "text/plain", "gif decode failed (too large or unsupported?)");
-    Serial.println("[sprite] gif decode FAILED");
+    Serial.printf("[sprite] deferred GIF decode FAILED: %s\n", lastGifDecodeError);
   }
 }
 
@@ -1960,6 +2468,12 @@ void setupWebServer() {
   webServer.on(
       "/sprite/codex", HTTP_POST, []() { handleSpriteUploadDone(APP_CODEX); },
       []() { handleSpriteUploadChunk(CODEX_GIF_FILE); });
+#if AICLOCK_OTA_AVAILABLE
+  webServer.on("/update", HTTP_GET, []() {
+    if (authenticateOtaRequest()) webServer.send_P(200, "text/html", OTA_UPDATE_PAGE);
+  });
+  webServer.on("/update", HTTP_POST, handleOtaUploadDone, handleOtaUploadChunk);
+#endif
   webServer.begin();
   Serial.printf("[web] admin server listening on http://%s/\n", WiFi.localIP().toString().c_str());
 }
@@ -1969,11 +2483,15 @@ void setupWebServer() {
 void setup() {
   Serial.setRxBufferSize(2048); // a serial #STATUS frame (~600B) must survive a slow draw
   Serial.begin(115200);
+  fileSystemReady = LittleFS.begin();
 #if !AICLOCK_WIRED_ONLY
-  LittleFS.begin();
-  loadBridgeHost();
-  loadBrightness();
-  loadCustomSpriteState();
+  if (fileSystemReady) {
+    loadBridgeHost();
+    loadBrightness();
+    loadCustomSpriteState();
+  }
+#else
+  if (fileSystemReady) loadCustomSpriteState();
 #endif
 
   tft.init();
@@ -2024,7 +2542,16 @@ void loop() {
     showMainUiIfNeeded();
     lastPollMs = 0; // poll the bridge right away
   }
-  if (webServerStarted) webServer.handleClient();
+  if (webServerStarted) {
+    webServer.handleClient();
+    processPendingSpriteUpload();
+  }
+#if AICLOCK_OTA_AVAILABLE
+  if (otaRestartPending && millis() - otaRestartRequestedMs >= 1000) {
+    Serial.println("[ota] restarting");
+    ESP.restart();
+  }
+#endif
 #endif
   if (!mainUiShown) return; // config-portal screen is up, nothing to animate
 

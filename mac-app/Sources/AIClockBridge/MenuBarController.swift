@@ -1,7 +1,7 @@
 import AppKit
 
-// Menu-bar item: a retro Macintosh icon (drawn in code, template so it adapts
-// to light/dark menu bars). Left click opens a live mirror of the ESP8266
+// Menu-bar item: a retro Macintosh icon drawn with a fixed black background.
+// Left click opens a live mirror of the ESP8266
 // screen (MirrorPopover); right click opens the control menu with usage
 // meters and device remote control. No quota text lives in the bar itself.
 final class MenuBarController: NSObject, NSMenuDelegate {
@@ -16,7 +16,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let codexUsageItem = NSMenuItem(title: "Codex …", action: nil, keyEquivalent: "")
     private let deviceInfoItem = NSMenuItem(title: "设备：未设置", action: nil, keyEquivalent: "")
     private var modeItems: [String: NSMenuItem] = [:]
-    private var appearanceNotification: NSObjectProtocol?
 
     init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
          nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor, port: UInt16) {
@@ -28,42 +27,18 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         super.init()
         buildMenu()
         if let button = statusItem.button {
-            updateStatusIcon(for: button)
-            appearanceNotification = DistributedNotificationCenter.default().addObserver(
-                forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
-                object: nil,
-                queue: .main
-            ) { [weak self, weak button] _ in
-                guard let self, let button else { return }
-                self.updateStatusIcon(for: button)
-            }
+            button.image = Self.retroMacIcon()
+            button.imagePosition = .imageOnly
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
     }
 
-    deinit {
-        if let appearanceNotification {
-            DistributedNotificationCenter.default().removeObserver(appearanceNotification)
-        }
-    }
-
-    private func updateStatusIcon(for button: NSStatusBarButton) {
-        button.image = Self.retroMacIcon(dark: Self.systemUsesDarkAppearance())
-        button.imagePosition = .imageOnly
-    }
-
-    static func systemUsesDarkAppearance(defaults: UserDefaults = .standard) -> Bool {
-        defaults.string(forKey: "AppleInterfaceStyle")?.caseInsensitiveCompare("Dark") == .orderedSame
-    }
-
-    /// Full-color adaptive icon. A template image would invert the requested
-    /// palette, so the two variants are drawn explicitly.
-    static func retroMacIcon(dark: Bool) -> NSImage {
-        let background = dark ? NSColor(calibratedWhite: 0.06, alpha: 1) : NSColor.white
-        let foreground = dark ? NSColor.white : NSColor.black
-        let border = dark ? NSColor(calibratedWhite: 0.92, alpha: 1) : NSColor.black
+    static func retroMacIcon() -> NSImage {
+        let background = NSColor(calibratedWhite: 0.06, alpha: 1)
+        let foreground = NSColor.white
+        let border = NSColor(calibratedWhite: 0.92, alpha: 1)
 
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
             let bezel = NSBezierPath(roundedRect: NSRect(x: 1.25, y: 1.25, width: 15.5, height: 15.5),
@@ -127,6 +102,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(makeItem("自动查找并配对设备", #selector(autoPairAction)))
         menu.addItem(makeItem("设置设备地址…", #selector(setDeviceAddress)))
         menu.addItem(makeItem("打开设备网页", #selector(openDevicePage)))
+        menu.addItem(makeItem(OTAUpdateController.menuTitle, #selector(openFirmwareUpdater)))
 
         let displayMenu = NSMenu()
         for (title, mode) in [("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
@@ -297,6 +273,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openFirmwareUpdater() {
+        OTAUpdateController.shared.start()
     }
 
     @objc private func setDisplayMode(_ sender: NSMenuItem) {

@@ -1,5 +1,6 @@
 firmware/.pio/
 firmware/.pio-venv/
+firmware/include/ota_secrets.h
 mac-app/.build/
 windows-app/**/bin/
 windows-app/**/obj/

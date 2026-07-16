@@ -7,6 +7,7 @@ import PackageDescription
 // Foundation) so there are no dependencies to fetch or vendor.
 let package = Package(
     name: "AIClockBridge",
+    defaultLocalization: "en",
     platforms: [.macOS(.v12)],
     targets: [
         .executableTarget(

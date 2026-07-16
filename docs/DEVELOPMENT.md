@@ -41,8 +41,8 @@ cd mac-app
 swift run                # 前台运行；或 swift build 后跑 .build/debug/AIClockBridge
 ```
 
-菜单栏会出现一个**复古麦金塔小电脑图标**（代码画的模板图，自动适配深浅色菜单栏，
-不占宽度显示额度数字）：
+菜单栏会出现一个**固定黑底的复古麦金塔小电脑图标**（代码绘制，不跟随系统主题切换，
+也不占宽度显示额度数字）：
 
 - **左键点击** → 弹出 ESP8266 屏幕的**实时镜像**：Mac 端用与固件完全相同的数据
   重绘同一个画面（方形额度环 + 当前桌宠动画 + logo + 额度文字），动画帧直接从设备
@@ -79,8 +79,17 @@ curl -s http://localhost:8765/status | python3 -m json.tool
 }
 ```
 
-想要开机自启：`swift build -c release` 得到 `.build/release/AIClockBridge`，把它包成
-LaunchAgent（`~/Library/LaunchAgents/`）即可，未内置，按需再加。
+需要登录后自动启动和异常退出自动恢复时，运行：
+
+```bash
+mac-app/install-launch-agent.sh
+```
+
+脚本会构建 release 版本，将二进制和 SwiftPM 资源包安装到
+`~/Library/Application Support/AIClockBridge/`，并注册用户级 LaunchAgent
+`~/Library/LaunchAgents/local.AIClockBridge.plist`。正常从菜单退出后不会强制重启；进程
+异常结束时 launchd 会自动拉起。更新源码后重新运行安装脚本即可部署，卸载使用
+`mac-app/uninstall-launch-agent.sh`。
 
 **注意**：HTTP 服务监听 `0.0.0.0:8765`，同一局域网内的设备都能读到（只是状态和 token
 计数，不含任何 API key），如果在意，建议只在家庭可信网络下跑，或用系统防火墙限制。
@@ -100,6 +109,28 @@ LaunchAgent（`~/Library/LaunchAgents/`）即可，未内置，按需再加。
 已确认的硬件：ESP8266EX（ESP-12S 模组）/ 4MB flash / CH340C 转串口，macOS 设备节点
 通常为 `/dev/cu.usbserial-XXXX`（后缀因设备而异）。这是拼多多"WiFi天气时钟 MG01"成品板，本质是 oshwhub 上
 ["SD2/小电视"开源方案](https://oshwhub.com/q21182889/sd2) 的量产版。
+
+### Web OTA
+
+混合版支持带 HTTP Basic Authentication 的固件更新页面。实际凭据放在被 Git 忽略的
+`firmware/include/ota_secrets.h`；新环境可复制 `ota_secrets.example.h` 后设置独立密码。
+没有本机凭据文件时固件仍可编译，但 OTA 会保持关闭。
+
+首次用 USB 刷入支持 OTA 的版本后，后续流程是：
+
+```bash
+cd firmware
+.pio-venv/bin/pio run -e nodemcuv2
+open http://DEVICE_IP/update
+```
+
+登录后上传 `.pio/build/nodemcuv2/firmware.bin`。更新只写程序分区，LittleFS 中的桌宠数据、
+Wi-Fi 配置、亮度和 Bridge 地址都会保留。Basic Authentication 在普通 HTTP 上传输，因而
+只应在可信局域网使用；不要把 `ota_secrets.h` 提交到 Git。
+
+Mac 菜单栏的「Wi-Fi 更新固件…」使用同一个 `/update` 接口。它会强制通过 LAN 查询
+`/api/info`，不会因为 USB 串口在线而误走有线设备信息；首次使用时将用户名和密码保存到
+macOS Keychain，之后选择 `.bin` 即可。若设备返回 401，程序会删除失效凭据，下次重新询问。
 
 **接线是厂家固定的，一体成型无法重接**，网上能搜到的几份"看起来像"的教程接线图实测
 都是错的——真正正确的引脚来自该开源项目附带的厂家参考固件源码
@@ -142,13 +173,15 @@ AICLOCK_SERIAL_PORT=/dev/cu.usbserial-XXXX swift run
 ```
 
 `AICLOCK_SERIAL_PORT` 是可选的；未设置时会自动扫描 CH340 串口。纯 USB 模式支持
-Claude / Codex 状态、额度、系统负载、股票数据、显示模式切换和亮度调节。亮度在纯 USB
-模式下只对本次开机有效；依赖 HTTP 的音乐封面、自定义 GIF 上传和设备 Web 管理页不可用。
+Claude / Codex 状态、额度、系统负载、股票数据、显示模式切换、亮度调节和自定义 GIF
+上传。亮度在纯 USB 模式下只对本次开机有效；依赖 HTTP 的音乐封面、动画恢复默认、
+设备画面原始帧读取和 Web 管理页不可用。
 菜单栏镜像会根据设备每 5 秒返回的串口确认判断在线状态，不需要配置设备 IP；连续 15 秒
 没有确认才会显示离线。
 
-后台启动可使用 `mac-app/start-aiclock.sh`。脚本会按自身位置定位工程，首次启动时自动
-构建，并将日志写入 `~/Library/Logs/AIClockBridge/bridge.log`。
+前台开发运行可使用 `mac-app/start-aiclock.sh`；脚本会按自身位置定位工程，首次运行时
+自动构建。已安装 LaunchAgent 时，该脚本只会唤醒现有服务。需要常驻运行则使用
+`mac-app/install-launch-agent.sh`，日志位于 `~/Library/Logs/AIClockBridge/`。
 
 烧录后串口会打印调试日志（这版固件不再是"静默"的）：
 
@@ -206,7 +239,8 @@ pio device monitor -b 115200
    manifest（`assets.petdex.dev/manifests/petdex-v1.json`，3300+ 开源桌宠）搜索选择。
    每个桌宠是一张 1536x1872 的 WebP 精灵图（8 列 x 9 行，每帧 192x208，每行一种动画：
    待机/左右跑/挥手/跳跃/失败/等待/原地跑/思考）。app 在本地裁出所选动画行、缩放到
-   目标插槽尺寸、合成黑底循环 GIF，然后 POST 到设备的 `/sprite/claude|codex`。
+   目标插槽尺寸、合成黑底循环 GIF。USB 设备已连接时优先走串口上传，否则 POST 到设备的
+   `/sprite/claude|codex`。
 2. **设备网页** `http://<设备IP>/`：手动上传任意 `.gif`，适合用自己的图。
 
 两条路最终都走同一条链路：设备收到 GIF 后**自己在板上解码并缩放**，立刻替换该角色的
@@ -225,6 +259,25 @@ pio device monitor -b 115200
 
 `/api/info` 里的 `sprite_rev` 在每次上传/重置动画后自增，镜像端据此决定是否重新拉帧。
 
+### USB 桌宠上传协议
+
+串口传输采用逐块确认，避免 ESP8266 写 Flash 或解码时 UART 接收缓冲区溢出：
+
+```text
+Mac -> ESP  #PET_BEGIN {"slot":"claude","size":12345,"crc32":2309737967}
+ESP -> Mac  #PET_READY
+Mac -> ESP  #PET_CHUNK 0 <base64>
+ESP -> Mac  #PET_ACK 0
+Mac -> ESP  #PET_END
+ESP -> Mac  #PET_PROCESSING
+ESP -> Mac  #PET_DONE
+```
+
+每块原始数据最多 384 字节；设备在解码前同时校验总长度和 IEEE CRC32，任一步失败会返回
+`#PET_ERR <reason>`。USB 模式启动时只尝试挂载 LittleFS，不会自动破坏已有数据；仅当用户
+明确发起第一次宠物上传且文件系统无法挂载时，才格式化并初始化存储区。上传成功后仍复用
+HTTP 路径相同的 AnimatedGIF 解码与 `/c.bin`、`/x.bin` 持久化链路。
+
 ## 5. 网速曲线页（Mac + 设备同步显示）
 
 Mac app 每 250ms（4Hz）读一次内核的网卡字节计数（getifaddrs/AF_LINK，只统计物理
@@ -241,10 +294,10 @@ Mac app 每 250ms（4Hz）读一次内核的网卡字节计数（getifaddrs/AF_L
 "先清屏再画"的过程，所以完全无闪烁。顶部大号 DL/UL 读数取 1 秒平均，只在数值
 变化时局部重绘。Mac 弹窗镜像用同一套数据模型和布局同步渲染。
 
-Mac 端常驻进程由 LaunchAgent（`~/Library/LaunchAgents/local.AIClockBridge.plist`，
-每 60 秒拉活 `mac-app/.build/AIClockBridge.app`）管理；**改代码后要把新二进制和
-资源包同步进这个 .app**（`cp .build/debug/AIClockBridge .build/AIClockBridge.app/Contents/MacOS/`），
-否则 LaunchAgent 会不断复活旧版本、和手动启动的新版本抢 8765 端口轮流应答。
+Mac 端常驻进程可由 `mac-app/install-launch-agent.sh` 安装的用户级 LaunchAgent 管理。
+LaunchAgent 直接运行 `~/Library/Application Support/AIClockBridge/AIClockBridge`，并在
+异常退出后自动恢复。**改代码后需要重新运行安装脚本**，确保 release 二进制和 SwiftPM
+资源包一起更新；不要同时手动运行另一份实例，否则会争用 8765 端口。
 
 ## 6. 音乐播放页（Mac + 设备同步显示，自动切换）
 
@@ -318,7 +371,8 @@ ESP8266 总共只有 ~80KB RAM，一帧 120x120 的 RGB565 就 ~28KB，AnimatedG
   设备的 HTTP API 同样无鉴权。
 - Claude 用量接口有较严格的服务端限流（429），app 已做 60s 节流 + 429 后 5 分钟退避 +
   沿用旧值，偶尔菜单里额度会显示为几分钟前的数据。
-- 未做开机自启 LaunchAgent，需要的话可以再加（见第 1 节）。
+- LaunchAgent 在用户登录后启动，不会在尚未登录的系统启动阶段运行；菜单栏程序本身也
+  依赖 Aqua 图形会话。
 - 改**默认**编译进固件的动画（`firmware/include/img/claude_sprite.h` /
   `codex_sprite.h`）仍可用 `tools/convert_sprites.py` 生成新的 `.h` 后 `pio run -t upload`；
   日常换形象用菜单栏 petdex 选择器或设备网页即可，无需烧录。

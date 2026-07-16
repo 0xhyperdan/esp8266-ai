@@ -75,7 +75,7 @@ final class MirrorView: NSView {
     var needsInput = false // shown app waiting on approval -> red border flash
     var flashOn = false
     var line1 = "5h -"
-    var line2 = "Weekly -"
+    var line2 = "\u{5468}\u{989D}\u{5EA6} -"
     var showingClaude = true
     var deviceOK = false
     // net-mode mirror: same scrolling area-chart model as the firmware —
@@ -152,8 +152,8 @@ final class MirrorView: NSView {
             return
         }
 
-        // square quota ring: margin 4, thickness 10, clockwise from top-left
-        let m: CGFloat = 4, t: CGFloat = 10
+        // square quota ring: margin 4, thickness 2, clockwise from top-left
+        let m: CGFloat = 4, t: CGFloat = 2
         let side: CGFloat = 240 - 2 * m
         let color = deviceOK ? NSColor(calibratedRed: 0, green: 0.85, blue: 0.2, alpha: 1)
                              : NSColor.darkGray
@@ -172,11 +172,13 @@ final class MirrorView: NSView {
         seg = min(remaining, side)
         if seg > 0 { NSRect(x: x0, y: 240 - m - seg, width: t, height: seg).fill() }     // left
 
-        // sprite, centered, pixel-crisp
+        // sprite, 10% larger and anchored above the quota labels
         if !frames.isEmpty {
             let img = frames[min(frameIdx, frames.count - 1)]
-            let rect = CGRect(x: 120 - spriteW / 2, y: 120 - spriteH / 2,
-                              width: spriteW, height: spriteH)
+            let displayW = CGFloat(spriteW) * 1.1
+            let displayH = CGFloat(spriteH) * 1.1
+            let rect = CGRect(x: 120 - displayW / 2, y: 180 - displayH,
+                              width: displayW, height: displayH)
             ctx.saveGState()
             ctx.interpolationQuality = .none
             // CGContext draws images bottom-up; flip locally around the rect
@@ -187,9 +189,9 @@ final class MirrorView: NSView {
             ctx.restoreGState()
         }
 
-        // app logo, top-left inside the ring (firmware draws it at 14,18 @40px)
+        // app logo, top-left inside the ring (firmware draws it at 14,18 @30px)
         if let logo = Self.claudeLogo, let logo2 = Self.codexLogo {
-            (showingClaude ? logo : logo2).draw(in: NSRect(x: 14, y: 18, width: 40, height: 40))
+            (showingClaude ? logo : logo2).draw(in: NSRect(x: 14, y: 18, width: 30, height: 30))
         }
 
         // quota text
@@ -379,11 +381,12 @@ final class MirrorView: NSView {
             ])
     }
 
-    // Stock watchlist, same 54px rows as the firmware: grey code (the mirror
-    // can render the CJK name next to it), big white price, colored change.
+    // Stock watchlist, same 54px rows as the firmware: grey name on the left,
+    // code on the right, big white price, and colored change.
     private func drawStockScene() {
         let grey = NSColor(white: 0.55, alpha: 1)
-        let codeFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+        let nameFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let codeFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
         let valueFont = NSFont.monospacedSystemFont(ofSize: 17, weight: .bold)
         if stockRows.isEmpty {
             let style = NSMutableParagraphStyle()
@@ -397,11 +400,19 @@ final class MirrorView: NSView {
         }
         for (i, row) in stockRows.prefix(4).enumerated() {
             let y0 = CGFloat(10 + i * 54)
-            let label = row.name.isEmpty ? row.code : "\(row.code)  \(row.name)"
-            (label as NSString).draw(at: NSPoint(x: 14, y: y0), withAttributes: [
-                .font: codeFont, .foregroundColor: grey,
-            ])
-            (row.price as NSString).draw(at: NSPoint(x: 14, y: y0 + 15), withAttributes: [
+            let nameStyle = NSMutableParagraphStyle()
+            nameStyle.lineBreakMode = .byTruncatingTail
+            (row.name as NSString).draw(
+                in: NSRect(x: 14, y: y0, width: 156, height: 17), withAttributes: [
+                    .font: nameFont, .foregroundColor: grey, .paragraphStyle: nameStyle,
+                ])
+            let codeStyle = NSMutableParagraphStyle()
+            codeStyle.alignment = .right
+            (row.code as NSString).draw(
+                in: NSRect(x: 174, y: y0, width: 52, height: 17), withAttributes: [
+                    .font: codeFont, .foregroundColor: grey, .paragraphStyle: codeStyle,
+                ])
+            (row.price as NSString).draw(at: NSPoint(x: 14, y: y0 + 18), withAttributes: [
                 .font: valueFont, .foregroundColor: NSColor.white,
             ])
             let pctColor = row.up > 0 ? NSColor(calibratedRed: 1, green: 0.23, blue: 0.19, alpha: 1)
@@ -410,13 +421,13 @@ final class MirrorView: NSView {
             let style = NSMutableParagraphStyle()
             style.alignment = .right
             (row.pct as NSString).draw(
-                in: NSRect(x: 120, y: y0 + 15, width: 106, height: 22), withAttributes: [
+                in: NSRect(x: 120, y: y0 + 18, width: 106, height: 22), withAttributes: [
                     .font: valueFont, .foregroundColor: pctColor, .paragraphStyle: style,
                 ])
         }
         let center = NSMutableParagraphStyle()
         center.alignment = .center
-        ("STOCKS" as NSString).draw(
+        ("\u{80A1}\u{7968}" as NSString).draw(
             in: NSRect(x: 0, y: 224, width: 240, height: 12), withAttributes: [
                 .font: NSFont.monospacedSystemFont(ofSize: 8, weight: .medium),
                 .foregroundColor: grey, .paragraphStyle: center,
@@ -658,18 +669,18 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                     ? 100.0 * Double(snap.claude.sessionMin) / Double(snap.claude.sessionWindowMin) : 0)
             mirror.ringPct = pct
             mirror.line1 = "5h " + Self.pctText(pct)
-            mirror.line2 = "Weekly " + Self.pctText(snap.claude.sevenDayPct)
+            mirror.line2 = "\u{5468}\u{989D}\u{5EA6} " + Self.pctText(snap.claude.sevenDayPct)
             mirror.needsInput = snap.claude.needsInput
         } else {
             // Codex may only have a weekly window now (5h limit dropped):
             // ring + single line follow whatever windows actually exist.
             mirror.ringPct = snap.codex.primaryPct ?? snap.codex.weeklyPct ?? 0
             if snap.codex.primaryPct == nil, snap.codex.weeklyPct != nil {
-                mirror.line1 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+                mirror.line1 = "\u{5468}\u{989D}\u{5EA6} " + Self.pctText(snap.codex.weeklyPct)
                 mirror.line2 = ""
             } else {
                 mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
-                mirror.line2 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+                mirror.line2 = "\u{5468}\u{989D}\u{5EA6} " + Self.pctText(snap.codex.weeklyPct)
             }
             mirror.needsInput = snap.codex.needsInput
         }

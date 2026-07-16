@@ -5,12 +5,12 @@ import Foundation
 // supports sh/sz/hk/us prefixes in one batch request, GBK-encoded response):
 //   http://qt.gtimg.cn/q=sh600519,hk00700,usAAPL
 // Polled every 5s; the device and the mirror both render the pre-formatted
-// strings so the firmware stays dumb (and ASCII-only: it shows the code, the
-// CJK company name is only used by the Mac mirror).
+// strings so the firmware stays dumb. The ASCII-only firmware draws the code
+// itself and receives each CJK company name as an RGB565 strip from the Mac.
 final class StockMonitor {
     struct Row {
         let code: String  // ASCII display code: "600519", "00700", "AAPL"
-        let name: String  // CJK name, mirror only
+        let name: String  // CJK name, rendered for the mirror and device strip
         let price: String // pre-formatted
         let pct: String   // "+1.24%"
         let up: Int       // 1 rising / -1 falling / 0 flat
@@ -48,6 +48,7 @@ final class StockMonitor {
     static let nameW = 156, nameH = 16
     private var namesRev = 0
     private var namesData = Data([0])
+    private var namesV2Data = Data([0])
     private var lastNamesKey = ""
 
     func start() {
@@ -81,6 +82,13 @@ final class StockMonitor {
         return namesData
     }
 
+    /// Name-left layout used by firmware 0.4.9 and later.
+    func namesV2RGB565() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return namesV2Data
+    }
+
     private func renderNamesIfNeeded(_ parsed: [Row]) {
         let key = parsed.prefix(4).map { $0.name }.joined(separator: "\n")
         lock.lock()
@@ -88,17 +96,22 @@ final class StockMonitor {
         lock.unlock()
         guard dirty else { return }
         var data = Data([UInt8(min(parsed.count, 4))])
+        var v2Data = Data([UInt8(min(parsed.count, 4))])
         for row in parsed.prefix(4) {
-            data.append(Self.renderNameStrip(row.name) ?? Data(count: Self.nameW * Self.nameH * 2))
+            let emptyStrip = Data(count: Self.nameW * Self.nameH * 2)
+            data.append(Self.renderNameStrip(row.name, alignment: .right, fontSize: 12) ?? emptyStrip)
+            v2Data.append(Self.renderNameStrip(row.name, alignment: .left, fontSize: 13) ?? emptyStrip)
         }
         lock.lock()
         lastNamesKey = key
         namesData = data
+        namesV2Data = v2Data
         namesRev += 1
         lock.unlock()
     }
 
-    private static func renderNameStrip(_ name: String) -> Data? {
+    private static func renderNameStrip(_ name: String, alignment: NSTextAlignment,
+                                        fontSize: CGFloat) -> Data? {
         let w = nameW, h = nameH
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
                                   bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
@@ -110,10 +123,10 @@ final class StockMonitor {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
         let style = NSMutableParagraphStyle()
-        style.alignment = .right // sits left of the row's right edge, code is on the left
+        style.alignment = alignment
         style.lineBreakMode = .byTruncatingTail
         (name as NSString).draw(in: NSRect(x: 0, y: 1, width: w, height: h - 1), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
             .foregroundColor: NSColor(white: 0.72, alpha: 1),
             .paragraphStyle: style,
         ])

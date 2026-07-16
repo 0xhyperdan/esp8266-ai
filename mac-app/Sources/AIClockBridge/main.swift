@@ -52,6 +52,9 @@ let serialLink = SerialLink(service: service, netMonitor: netMonitor, stockMonit
 serialLink.start()
 DeviceClient.wiredCommandHandler = { serialLink.sendCommand($0) }
 DeviceClient.wiredInfoProvider = { serialLink.deviceInfo }
+DeviceClient.wiredPetUploadHandler = { data, slot, completion in
+    serialLink.uploadPet(data, slot: slot, completion: completion)
+}
 
 let server = HTTPServer(port: port, routes: [
     "/": { service.snapshot().jsonData() },
@@ -66,6 +69,7 @@ let server = HTTPServer(port: port, routes: [
     "/music/cover.raw": { nowPlaying.coverRGB565 },
     "/music/text.raw": { nowPlaying.textRGB565 },
     "/stock/names.raw": { stockMonitor.namesRGB565() },
+    "/stock/names-v2.raw": { stockMonitor.namesV2RGB565() },
 ], postRoutes: [
     // Claude Code / Codex hooks push lifecycle events here (see README §7):
     // curl -d '{"agent":"claude","event":"PreToolUse"}' http://127.0.0.1:8765/event

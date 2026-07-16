@@ -48,6 +48,7 @@ static class Program
                 ["/music/cover.raw"] = () => nowPlaying.CoverRgb565,
                 ["/music/text.raw"] = () => nowPlaying.TextRgb565,
                 ["/stock/names.raw"] = () => stockMonitor.NamesRgb565,
+                ["/stock/names-v2.raw"] = () => stockMonitor.NamesV2Rgb565,
             },
             postRoutes: new()
             {
