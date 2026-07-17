@@ -208,14 +208,15 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
     @objc private func uploadTapped() {
         guard let cache = sheetCache, let pet = selectedPet, cache.slug == pet.slug else { return }
         let s = slotSize
-        guard let gif = PetdexService.buildGif(sheet: cache.image, state: selectedState,
-                                               targetW: s.w, targetH: s.h) else {
+        guard let animation = PetdexService.buildAnimation(sheet: cache.image, state: selectedState,
+                                                           targetW: s.w, targetH: s.h) else {
             statusLabel.stringValue = "GIF 生成失败"
             return
         }
         uploadButton.isEnabled = false
         statusLabel.stringValue = "正在上传到设备并解码（约几秒）…"
-        DeviceClient.uploadGif(gif, slot: s.slot) { [weak self] error in
+        DeviceClient.uploadPet(animation.sprite, fallbackGif: animation.gif,
+                               slot: s.slot) { [weak self] error in
             guard let self = self else { return }
             self.uploadButton.isEnabled = true
             self.statusLabel.stringValue = error.map { "上传失败：\($0.localizedDescription)" }

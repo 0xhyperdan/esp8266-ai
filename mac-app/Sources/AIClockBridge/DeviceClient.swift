@@ -7,7 +7,7 @@ struct DeviceInfo {
     var ip = ""
     var ssid = ""
     var bridge = ""
-    var mode = "auto"       // configured: auto | claude | codex | net | music
+    var mode = "auto"       // configured: auto | claude | codex | net | music | stock | pomodoro
     var effective = "auto"  // what's actually on screen (AUTO may promote to music)
     var showing = ""
     var lastUpdateS = -1    // seconds since the device last got /status data, -1 = never
@@ -18,6 +18,13 @@ struct DeviceInfo {
     var spriteUploadState = ""
     var spriteUploadSlot = ""
     var spriteUploadError = ""
+    var pomodoroPhase = "focus"
+    var pomodoroRunning = false
+    var pomodoroRemainingS = 25 * 60
+    var pomodoroDurationS = 25 * 60
+    var pomodoroCompleted = 0
+    var pomodoroFocusMinutes = 25
+    var pomodoroBreakMinutes = 5
     var claudeCustomSprite = false
     var codexCustomSprite = false
     var claudeW = 111, claudeH = 120
@@ -88,8 +95,11 @@ final class DeviceClient {
 
     static var wiredCommandHandler: (([String: Any]) -> Bool)?
     static var wiredInfoProvider: (() -> DeviceInfo?)?
-    static var wiredPetUploadHandler: ((Data, String, @escaping (Error?) -> Void) -> Bool)?
+    static var wiredPetUploadHandler: ((Data, String, String, @escaping (Error?) -> Void) -> Bool)?
     private static var activeFirmwareUploads: [UUID: FirmwareUploadTask] = [:]
+    private static let pairingScanLock = NSLock()
+    private static var pairingScanGeneration = 0
+    private static var activePairingSession: URLSession?
 
     static var host: String {
         get { UserDefaults.standard.string(forKey: hostKey) ?? "" }
@@ -158,6 +168,14 @@ final class DeviceClient {
         info.spriteUploadState = upload?["state"] as? String ?? ""
         info.spriteUploadSlot = upload?["slot"] as? String ?? ""
         info.spriteUploadError = upload?["error"] as? String ?? ""
+        let pomodoro = obj["pomodoro"] as? [String: Any]
+        info.pomodoroPhase = pomodoro?["phase"] as? String ?? "focus"
+        info.pomodoroRunning = pomodoro?["running"] as? Bool ?? false
+        info.pomodoroRemainingS = (pomodoro?["remaining_s"] as? NSNumber)?.intValue ?? 25 * 60
+        info.pomodoroDurationS = (pomodoro?["duration_s"] as? NSNumber)?.intValue ?? 25 * 60
+        info.pomodoroCompleted = (pomodoro?["completed"] as? NSNumber)?.intValue ?? 0
+        info.pomodoroFocusMinutes = (pomodoro?["focus_min"] as? NSNumber)?.intValue ?? 25
+        info.pomodoroBreakMinutes = (pomodoro?["break_min"] as? NSNumber)?.intValue ?? 5
         let claude = obj["claude"] as? [String: Any]
         let codex = obj["codex"] as? [String: Any]
         info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false
@@ -169,13 +187,34 @@ final class DeviceClient {
         return info
     }
 
-    /// POST /api/display  mode=auto|claude|codex|net|music
+    /// POST /api/display  mode=auto|claude|codex|net|music|stock|pomodoro
     static func setDisplayMode(_ mode: String, completion: @escaping (Error?) -> Void) {
         if wiredCommandHandler?(["display": mode]) == true {
             completion(nil)
             return
         }
         postForm(path: "api/display", fields: ["mode": mode], completion: completion)
+    }
+
+    /// Controls the device-owned Pomodoro state machine and brings it on screen.
+    static func controlPomodoro(_ action: String, focusMinutes: Int? = nil,
+                                breakMinutes: Int? = nil,
+                                completion: @escaping (Error?) -> Void) {
+        var command: [String: Any] = ["pomodoro": action]
+        var fields = ["action": action]
+        if let focusMinutes = focusMinutes {
+            command["focus_min"] = focusMinutes
+            fields["focus_min"] = String(focusMinutes)
+        }
+        if let breakMinutes = breakMinutes {
+            command["break_min"] = breakMinutes
+            fields["break_min"] = String(breakMinutes)
+        }
+        if wiredCommandHandler?(command) == true {
+            completion(nil)
+            return
+        }
+        postForm(path: "api/pomodoro", fields: fields, completion: completion)
     }
 
     /// POST /api/bridge  host=ip:port
@@ -192,29 +231,35 @@ final class DeviceClient {
         postForm(path: "api/brightness", fields: ["level": String(level)], completion: completion)
     }
 
-    /// POST /sprite/{claude|codex} multipart GIF upload. WiFi firmware decodes
-    /// after releasing HTTP memory; USB reports completion after direct decode.
+    /// Uploads the device-native RGB565 stream. Firmware before 0.6.1 falls
+    /// back to the legacy GIF decoder when the raw HTTP route is unavailable.
+    static func uploadPet(_ sprite: Data, fallbackGif gif: Data, slot: String,
+                          completion: @escaping (Error?) -> Void) {
+        if wiredPetUploadHandler?(sprite, slot, "rgb565", completion) == true {
+            return
+        }
+        uploadMultipart(sprite, slot: slot, pathSuffix: "raw", filename: "pet.rgb565",
+                        contentType: "application/octet-stream") { error in
+            if let error = error, [404, 405, 501].contains((error as NSError).code) {
+                uploadGif(gif, slot: slot, completion: completion)
+                return
+            }
+            guard error == nil else {
+                completion(error)
+                return
+            }
+            waitForSpriteUpload(slot: slot, deadline: Date().addingTimeInterval(30),
+                                completion: completion)
+        }
+    }
+
+    /// POST /sprite/{claude|codex} multipart GIF upload for legacy firmware.
     static func uploadGif(_ gif: Data, slot: String, completion: @escaping (Error?) -> Void) {
-        if wiredPetUploadHandler?(gif, slot, completion) == true {
+        if wiredPetUploadHandler?(gif, slot, "gif", completion) == true {
             return
         }
-        guard let base = baseURL else {
-            completion(Self.noHostError)
-            return
-        }
-        var req = URLRequest(url: base.appendingPathComponent("sprite/\(slot)"))
-        req.httpMethod = "POST"
-        req.timeoutInterval = 60 // on-device decode takes a few seconds
-        let boundary = "aiclock-\(UUID().uuidString)"
-        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        var body = Data()
-        body.append(Data("--\(boundary)\r\n".utf8))
-        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"pet.gif\"\r\n".utf8))
-        body.append(Data("Content-Type: image/gif\r\n\r\n".utf8))
-        body.append(gif)
-        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-        req.httpBody = body
-        run(req) { error in
+        uploadMultipart(gif, slot: slot, pathSuffix: nil, filename: "pet.gif",
+                        contentType: "image/gif") { error in
             guard error == nil else {
                 completion(error)
                 return
@@ -222,6 +267,30 @@ final class DeviceClient {
             waitForSpriteUpload(slot: slot, deadline: Date().addingTimeInterval(90),
                                 completion: completion)
         }
+    }
+
+    private static func uploadMultipart(_ payload: Data, slot: String, pathSuffix: String?,
+                                        filename: String, contentType: String,
+                                        completion: @escaping (Error?) -> Void) {
+        guard let base = baseURL else {
+            completion(Self.noHostError)
+            return
+        }
+        var path = "sprite/\(slot)"
+        if let pathSuffix = pathSuffix { path += "/\(pathSuffix)" }
+        var req = URLRequest(url: base.appendingPathComponent(path))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 60
+        let boundary = "aiclock-\(UUID().uuidString)"
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        var body = Data()
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".utf8))
+        body.append(Data("Content-Type: \(contentType)\r\n\r\n".utf8))
+        body.append(payload)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        req.httpBody = body
+        run(req, completion: completion)
     }
 
     /// Uploads an ESP8266 firmware image over the authenticated Web OTA route,
@@ -471,12 +540,20 @@ final class DeviceClient {
             cfg.httpMaximumConnectionsPerHost = 1
             return URLSession(configuration: cfg)
         }()
+        pairingScanLock.lock()
+        pairingScanGeneration += 1
+        let generation = pairingScanGeneration
+        let previousSession = activePairingSession
+        activePairingSession = session
+        pairingScanLock.unlock()
+        previousSession?.invalidateAndCancel()
         let group = DispatchGroup()
         let lock = NSLock()
         var found: String?
         let sem = DispatchSemaphore(value: 32)
         DispatchQueue.global(qos: .utility).async {
             for n in 1...254 {
+                guard isPairingScanActive(generation) else { break }
                 let ip = "\(prefix).\(n)"
                 if ip == myIP { continue }
                 sem.wait()
@@ -488,7 +565,7 @@ final class DeviceClient {
                 let task = session.dataTask(with: URL(string: "http://\(ip)/api/info")!) { data, _, _ in
                     let ok = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
                         .map { $0["mode"] is String && $0["sprite_rev"] != nil } ?? false
-                    if ok {
+                    if ok, isPairingScanActive(generation) {
                         lock.lock()
                         if found == nil { found = ip }
                         lock.unlock()
@@ -499,10 +576,40 @@ final class DeviceClient {
                 task.resume()
             }
             group.notify(queue: .main) {
+                let active = finishPairingScan(generation, session: session)
+                guard active else {
+                    completion(nil)
+                    return
+                }
                 if let ip = found { host = ip }
                 completion(found)
             }
         }
+    }
+
+    private static func isPairingScanActive(_ generation: Int) -> Bool {
+        pairingScanLock.lock()
+        defer { pairingScanLock.unlock() }
+        return generation == pairingScanGeneration
+    }
+
+    private static func finishPairingScan(_ generation: Int, session: URLSession) -> Bool {
+        pairingScanLock.lock()
+        let active = generation == pairingScanGeneration
+        if active { activePairingSession = nil }
+        pairingScanLock.unlock()
+        session.finishTasksAndInvalidate()
+        return active
+    }
+
+    static func cancelPairingActivity() {
+        pairingScanLock.lock()
+        pairingScanGeneration += 1
+        let session = activePairingSession
+        activePairingSession = nil
+        pairingScanLock.unlock()
+        session?.invalidateAndCancel()
+        healInFlight = false
     }
 
     // MARK: - pairing watchdog

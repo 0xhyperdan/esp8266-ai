@@ -4,7 +4,7 @@ import Foundation
 // isolation - or for skipping WiFi setup entirely. Scans for CH340-style
 // serial ports, handshakes, then pushes the same payloads the device would
 // otherwise poll over HTTP, as newline-terminated frames:
-//   bridge -> device:  #HELLO   #STATUS {json}   #NET {json}   #CMD {json}
+//   bridge -> device:  #HELLO   #INFO   #STATUS {json}   #NET {json}   #CMD {json}
 //                       #PET_BEGIN {json}   #PET_CHUNK <seq> <base64>   #PET_END
 //   device -> bridge:  #DEVICE {"name":"aiclock","fw":"x.y.z"}
 //                       #ACK status   #PET_READY   #PET_ACK <seq>   #PET_DONE
@@ -24,6 +24,7 @@ final class SerialLink {
     private struct PetUpload {
         let data: Data
         let slot: String
+        let format: String
         let completion: (Error?) -> Void
         var offset = 0
         var sequence = 0
@@ -37,6 +38,7 @@ final class SerialLink {
     private let service: StatusService
     private let netMonitor: NetSpeedMonitor
     private let stockMonitor: StockMonitor
+    private let featurePreferences: FeaturePreferences
 
     private var fd: Int32 = -1
     private var portPath = ""
@@ -50,23 +52,38 @@ final class SerialLink {
     private var lastHelloAt = Date.distantPast
     private var lastStatusAt = Date.distantPast
     private var lastNetAt = Date.distantPast
+    private var lastInfoAt = Date.distantPast
     private var rxBuf = Data()
     private var timer: Timer?
+    private(set) var isRunning = false
     private var petUpload: PetUpload?
     private var claudeCustomSprite = false
     private var codexCustomSprite = false
+    private var reportedInfo = DeviceInfo()
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor) {
+    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor,
+         featurePreferences: FeaturePreferences = .shared) {
         self.service = service
         self.netMonitor = netMonitor
         self.stockMonitor = stockMonitor
+        self.featurePreferences = featurePreferences
     }
 
     func start() {
+        guard !isRunning else { return }
+        isRunning = true
         // one 250ms tick drives everything: port scan, handshake, reads, pushes
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.tick()
         }
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        isRunning = false
+        timer?.invalidate()
+        timer = nil
+        closePort()
     }
 
     var isLinked: Bool { linked }
@@ -75,30 +92,11 @@ final class SerialLink {
         guard linked, dataConfirmed,
               Date().timeIntervalSince(lastStatusConfirmedAt) < 15 else { return nil }
 
-        let snapshot = service.snapshot()
-        if displayMode == "claude" || displayMode == "codex" {
-            showing = displayMode
-        } else if snapshot.claude.needsInput != snapshot.codex.needsInput {
-            showing = snapshot.claude.needsInput ? "claude" : "codex"
-        } else {
-            let claudeWorking = snapshot.claude.status == "working"
-            let codexWorking = snapshot.codex.status == "working"
-            if claudeWorking != codexWorking {
-                showing = claudeWorking ? "claude" : "codex"
-            }
-        }
-
-        var info = DeviceInfo()
+        var info = reportedInfo
         info.ip = portPath
         info.ssid = "USB"
         info.bridge = "USB serial"
-        info.mode = displayMode
-        info.effective = displayMode
-        info.showing = showing
         info.lastUpdateS = Int(Date().timeIntervalSince(lastStatusConfirmedAt))
-        info.brightness = brightness
-        info.claudeCustomSprite = claudeCustomSprite
-        info.codexCustomSprite = codexCustomSprite
         return info
     }
 
@@ -110,42 +108,51 @@ final class SerialLink {
         guard send(frame("#CMD ", json)) else { return false }
         if let mode = command["display"] as? String {
             displayMode = mode
+            reportedInfo.mode = mode
+            reportedInfo.effective = mode
         }
         if let level = command["brightness"] as? Int {
             brightness = max(0, min(100, level))
+            reportedInfo.brightness = brightness
         }
         return true
     }
 
     @discardableResult
-    func uploadPet(_ data: Data, slot: String, completion: @escaping (Error?) -> Void) -> Bool {
+    func uploadPet(_ data: Data, slot: String, format: String = "gif",
+                   completion: @escaping (Error?) -> Void) -> Bool {
         guard linked, fd >= 0 else { return false }
         guard slot == "claude" || slot == "codex" else {
             completion(Self.petUploadError(code: 1, message: "Unsupported pet slot"))
             return true
         }
+        guard format == "gif" || format == "rgb565" else {
+            completion(Self.petUploadError(code: 2, message: "Unsupported pet format"))
+            return true
+        }
         guard !data.isEmpty, data.count <= Self.maximumPetBytes else {
-            completion(Self.petUploadError(code: 2, message: "Pet GIF must be between 1 byte and 384 KB"))
+            completion(Self.petUploadError(code: 3, message: "Pet data must be between 1 byte and 384 KB"))
             return true
         }
         guard petUpload == nil else {
-            completion(Self.petUploadError(code: 3, message: "Another pet upload is already running"))
+            completion(Self.petUploadError(code: 4, message: "Another pet upload is already running"))
             return true
         }
 
         let metadata: [String: Any] = [
             "slot": slot,
+            "format": format,
             "size": data.count,
             "crc32": NSNumber(value: Self.crc32(data)),
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: metadata) else {
-            completion(Self.petUploadError(code: 4, message: "Could not encode pet metadata"))
+            completion(Self.petUploadError(code: 5, message: "Could not encode pet metadata"))
             return true
         }
 
-        petUpload = PetUpload(data: data, slot: slot, completion: completion)
+        petUpload = PetUpload(data: data, slot: slot, format: format, completion: completion)
         if !send(frame("#PET_BEGIN ", json)) {
-            finishPetUpload(error: Self.petUploadError(code: 5, message: "Could not write to the USB device"))
+            finishPetUpload(error: Self.petUploadError(code: 6, message: "Could not write to the USB device"))
         }
         return true
     }
@@ -193,12 +200,18 @@ final class SerialLink {
         if now.timeIntervalSince(lastStatusAt) > 5 {
             lastStatusAt = now
             send(frame("#STATUS ", service.snapshot().jsonData()))
-            send(frame("#STOCK ", stockMonitor.jsonData()))
+            if featurePreferences.isEnabled("stock") {
+                send(frame("#STOCK ", stockMonitor.jsonData()))
+            }
         }
-        if now.timeIntervalSince(lastNetAt) > 2 {
+        if featurePreferences.isEnabled("net"), now.timeIntervalSince(lastNetAt) > 2 {
             lastNetAt = now
             let stats = SystemStatsMonitor.shared.snapshot()
             send(frame("#NET ", netMonitor.jsonData(cpu: stats.cpu, mem: stats.mem)))
+        }
+        if now.timeIntervalSince(lastInfoAt) > 1 {
+            lastInfoAt = now
+            send(Data("#INFO\n".utf8))
         }
     }
 
@@ -255,6 +268,8 @@ final class SerialLink {
         codexCustomSprite = false
         openedAt = Date()
         lastHelloAt = .distantPast
+        lastInfoAt = .distantPast
+        reportedInfo = DeviceInfo()
         rxBuf.removeAll()
         FileHandle.standardError.write(Data("[serial] trying \(path)\n".utf8))
         return true
@@ -328,6 +343,16 @@ final class SerialLink {
             if handlePetUploadLine(line) {
                 continue
             } else if line.hasPrefix("#DEVICE") {
+                let payload = line.dropFirst("#DEVICE ".count)
+                if let data = String(payload).data(using: .utf8),
+                   let info = DeviceClient.decodeInfo(data) {
+                    reportedInfo = info
+                    displayMode = info.mode
+                    brightness = info.brightness
+                    showing = info.showing
+                    claudeCustomSprite = info.claudeCustomSprite
+                    codexCustomSprite = info.codexCustomSprite
+                }
                 if !linked {
                     linked = true
                     lastStatusAt = .distantPast // push a status immediately

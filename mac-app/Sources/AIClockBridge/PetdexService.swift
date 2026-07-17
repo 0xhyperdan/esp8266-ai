@@ -25,6 +25,12 @@ struct PetdexAnimState {
     let durationMs: Int
 }
 
+struct PetdexAnimation {
+    let gif: Data
+    let sprite: Data
+    let frameCount: Int
+}
+
 enum PetdexService {
     static let manifestURL = URL(string: "https://assets.petdex.dev/manifests/petdex-v1.json")!
 
@@ -105,19 +111,18 @@ enum PetdexService {
         }.resume()
     }
 
-    /// Crops `state`'s row out of the sheet and encodes a looping GIF at
-    /// targetW x targetH: frames aspect-fit, composited onto black (matches
-    /// the clock's black background and avoids GIF transparency compositing
-    /// surprises in the on-device decoder).
-    static func buildGif(sheet: CGImage, state: PetdexAnimState,
-                         targetW: Int, targetH: Int) -> Data? {
+    /// Builds both the animated preview and the device's native RGB565 stream.
+    /// Sending native rows avoids a large contiguous decoder allocation on the
+    /// memory-constrained ESP8266 while retaining GIF fallback for old firmware.
+    static func buildAnimation(sheet: CGImage, state: PetdexAnimState,
+                               targetW: Int, targetH: Int) -> PetdexAnimation? {
         let frameCount = min(state.frames, maxFrames)
-        guard frameCount > 0 else { return nil }
-        let delay = Double(state.durationMs) / Double(state.frames) / 1000.0
+        guard frameCount > 0, targetW > 0, targetH > 0 else { return nil }
+        let delay = Double(state.durationMs) / Double(frameCount) / 1000.0
 
-        let data = NSMutableData()
+        let gifData = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
-            data as CFMutableData, UTType.gif.identifier as CFString, frameCount, nil) else { return nil }
+            gifData as CFMutableData, UTType.gif.identifier as CFString, frameCount, nil) else { return nil }
         CGImageDestinationSetProperties(dest, [
             kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0],
         ] as CFDictionary)
@@ -131,23 +136,50 @@ enum PetdexService {
         let drawW = CGFloat(frameW) * scale, drawH = CGFloat(frameH) * scale
         let drawRect = CGRect(x: (CGFloat(targetW) - drawW) / 2,
                               y: (CGFloat(targetH) - drawH) / 2, width: drawW, height: drawH)
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue |
+            CGImageAlphaInfo.premultipliedLast.rawValue
+        let bytesPerRow = targetW * 4
+        var sprite = Data(capacity: 1 + frameCount * targetW * targetH * 2)
+        sprite.append(UInt8(frameCount))
 
         for i in 0..<frameCount {
             let crop = CGRect(x: i * frameW, y: state.row * frameH, width: frameW, height: frameH)
             guard let frame = sheet.cropping(to: crop),
                   let ctx = CGContext(data: nil, width: targetW, height: targetH,
-                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      bitsPerComponent: 8, bytesPerRow: bytesPerRow,
                                       space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                                      bitmapInfo: bitmapInfo)
             else { return nil }
             ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
             ctx.fill(CGRect(x: 0, y: 0, width: targetW, height: targetH))
             ctx.interpolationQuality = .high
             ctx.draw(frame, in: drawRect)
-            guard let out = ctx.makeImage() else { return nil }
+            guard let out = ctx.makeImage(), let pixels = ctx.data else { return nil }
             CGImageDestinationAddImage(dest, out, frameProps)
+
+            let rgba = pixels.assumingMemoryBound(to: UInt8.self)
+            for y in 0..<targetH {
+                let row = rgba.advanced(by: y * bytesPerRow)
+                for x in 0..<targetW {
+                    let pixel = row.advanced(by: x * 4)
+                    let value = rgb565(red: pixel[0], green: pixel[1], blue: pixel[2])
+                    sprite.append(UInt8(value >> 8))
+                    sprite.append(UInt8(value & 0xFF))
+                }
+            }
         }
         guard CGImageDestinationFinalize(dest) else { return nil }
-        return data as Data
+        return PetdexAnimation(gif: gifData as Data, sprite: sprite, frameCount: frameCount)
+    }
+
+    static func buildGif(sheet: CGImage, state: PetdexAnimState,
+                         targetW: Int, targetH: Int) -> Data? {
+        buildAnimation(sheet: sheet, state: state, targetW: targetW, targetH: targetH)?.gif
+    }
+
+    static func rgb565(red: UInt8, green: UInt8, blue: UInt8) -> UInt16 {
+        (UInt16(red & 0xF8) << 8) |
+            (UInt16(green & 0xFC) << 3) |
+            UInt16(blue >> 3)
     }
 }
