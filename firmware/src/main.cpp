@@ -64,7 +64,7 @@ bool codexCustom = false;
 int codexCustomFrames = 0;
 uint32_t spriteRev = 0; // bumped on upload/reset so the Mac mirror re-fetches
 bool fileSystemReady = false;
-const char *lastGifDecodeError = "none";
+const char *lastSpriteUploadError = "none";
 
 enum SpriteUploadState {
   SPRITE_UPLOAD_IDLE,
@@ -78,7 +78,6 @@ unsigned long spriteUploadReadyMs = 0;
 
 const int SCREEN_CX = 120, SCREEN_CY = 120;
 const int SPRITE_SCALE_NUM = 11, SPRITE_SCALE_DEN = 10;
-const int SPRITE_BOTTOM_Y = 180;
 const int RING_MARGIN = 4;      // inset from screen edge
 const int RING_THICKNESS = 2;   // ring bar thickness
 const unsigned long ANIM_INTERVAL_MS = 120;  // sprite frame advance
@@ -93,8 +92,16 @@ unsigned long lastSwitchMs = 0;
 
 // Display override, settable from the Mac app via POST /api/display:
 // auto = follow working status, claude/codex = pin that app on screen,
-// net/music = show Mac-side telemetry pages instead of the pet.
-enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK };
+// net/music/stock = show bridge-fed pages; pomodoro is fully device-owned.
+enum DisplayMode {
+  MODE_AUTO,
+  MODE_CLAUDE,
+  MODE_CODEX,
+  MODE_NET,
+  MODE_MUSIC,
+  MODE_STOCK,
+  MODE_POMODORO
+};
 DisplayMode displayMode = MODE_AUTO;
 
 // When AUTO and the Mac reports audio playing, the screen auto-switches to the
@@ -102,6 +109,21 @@ DisplayMode displayMode = MODE_AUTO;
 // switch. Only AUTO does this; a pinned mode is always honored as-is.
 bool statusMusicPlaying = false;
 DisplayMode lastEffectiveMode = MODE_AUTO;
+
+// ---------- device-owned Pomodoro timer ----------
+// The ESP8266 is the source of truth so timing continues without USB or a
+// desktop bridge. Only the configured durations are persisted; a reboot starts
+// a fresh, paused focus session to avoid reconstructing elapsed wall time.
+enum PomodoroPhase { POMODORO_FOCUS, POMODORO_BREAK };
+PomodoroPhase pomodoroPhase = POMODORO_FOCUS;
+int pomodoroFocusMin = POMODORO_FOCUS_DEFAULT_MIN;
+int pomodoroBreakMin = POMODORO_BREAK_DEFAULT_MIN;
+unsigned long pomodoroRemainingS = POMODORO_FOCUS_DEFAULT_MIN * 60UL;
+unsigned long pomodoroLastTickMs = 0;
+unsigned long pomodoroCompleted = 0;
+bool pomodoroRunning = false;
+bool pomodoroChromeDrawn = false;
+String pomodoroLastTime;
 
 // ---------- net speed mode state ----------
 // Rendering is decoupled from the network: pollNet() fetches every 2s and
@@ -258,6 +280,35 @@ void saveBridgeHost(const String &host) {
   f.close();
 }
 
+// ---------- persistence for Pomodoro durations ----------
+
+void loadPomodoroConfig() {
+  if (LittleFS.exists(POMODORO_CONFIG_FILE)) {
+    File f = LittleFS.open(POMODORO_CONFIG_FILE, "r");
+    if (f) {
+      int focus = f.readStringUntil(',').toInt();
+      int rest = f.readStringUntil('\n').toInt();
+      f.close();
+      if (focus >= POMODORO_FOCUS_MIN && focus <= POMODORO_FOCUS_MAX)
+        pomodoroFocusMin = focus;
+      if (rest >= POMODORO_BREAK_MIN && rest <= POMODORO_BREAK_MAX)
+        pomodoroBreakMin = rest;
+    }
+  }
+  pomodoroPhase = POMODORO_FOCUS;
+  pomodoroRemainingS = (unsigned long)pomodoroFocusMin * 60UL;
+  pomodoroRunning = false;
+  pomodoroCompleted = 0;
+}
+
+void savePomodoroConfig() {
+  if (!fileSystemReady) return;
+  File f = LittleFS.open(POMODORO_CONFIG_FILE, "w");
+  if (!f) return;
+  f.printf("%d,%d\n", pomodoroFocusMin, pomodoroBreakMin);
+  f.close();
+}
+
 // ---------- custom sprite loading ----------
 
 void recoverSpriteSwap(const char *binPath, const char *tempPath, const char *backupPath) {
@@ -324,14 +375,14 @@ void loadCustomSpriteState() {
 int claudeFrameCount() { return claudeCustom ? claudeCustomFrames : CLAUDE_SPRITE_FRAMES; }
 int codexFrameCount() { return codexCustom ? codexCustomFrames : CODEX_SPRITE_FRAMES; }
 
-// Draws one sprite frame 10% larger, anchored just above the quota labels.
+// Draws one sprite frame 10% larger, centered on the display.
 // Source rows still stream from LittleFS or PROGMEM, so scaling adds no full
 // frame buffer and keeps the stored custom-pet format backward compatible.
 void drawSpriteFrame(bool custom, const char *file, const uint16_t *const *progmemFrames, int frameIdx, int w,
                      int h, size_t frameBytes) {
   int displayW = (w * SPRITE_SCALE_NUM + SPRITE_SCALE_DEN / 2) / SPRITE_SCALE_DEN;
   int displayH = (h * SPRITE_SCALE_NUM + SPRITE_SCALE_DEN / 2) / SPRITE_SCALE_DEN;
-  int x0 = SCREEN_CX - displayW / 2, y0 = SPRITE_BOTTOM_Y - displayH;
+  int x0 = SCREEN_CX - displayW / 2, y0 = SCREEN_CY - displayH / 2;
   size_t rowBytes = (size_t)w * 2;
   File f;
   if (custom) {
@@ -481,10 +532,10 @@ String pctText(float pct) {
   return pct >= 0 ? String((int)pct) + "%" : "-";
 }
 
-// Quota readout below the sprite: two columns ("5h" / "Wk"), small grey label
+// Quota readout below the sprite: two columns (5-hour / weekly), small grey label
 // over a big font-4 percentage. Values repaint only when their text changes
 // (force = after a full-screen clear), so the 5s poll never flashes them.
-const int QUOTA_LABEL_Y = 183, QUOTA_VALUE_Y = 199;
+const int QUOTA_LABEL_Y = 189, QUOTA_VALUE_Y = 205, QUOTA_INLINE_Y = 198;
 const int QUOTA_COL1_X = 70, QUOTA_COL2_X = 170;
 String lastQuota5h, lastQuotaWk;
 
@@ -511,34 +562,181 @@ void drawCenteredMonoLabel(const uint8_t *bits, int width, int height, int cente
 }
 
 void drawWeekQuotaLabel(int centerX, int y, uint16_t color) {
-  drawCenteredMonoLabel(week_quota_label_bits, WEEK_QUOTA_LABEL_W, WEEK_QUOTA_LABEL_H,
-                        centerX, y, color);
+  drawCenteredMonoLabel(week_label_bits, WEEK_LABEL_W, WEEK_LABEL_H, centerX, y, color);
+}
+
+void drawWeekQuotaInline(const String &value, int centerX, int y, uint16_t color) {
+  const int gap = 6;
+  int valueW = tft.textWidth(value, 4);
+  int totalW = WEEK_LABEL_W + gap + valueW + 1;
+  int x0 = centerX - totalW / 2;
+  drawCenteredMonoLabel(week_label_bits, WEEK_LABEL_W, WEEK_LABEL_H,
+                        x0 + WEEK_LABEL_W / 2, y + 5, color);
+  tft.setTextDatum(TL_DATUM);
+  drawBoldString(value, x0 + WEEK_LABEL_W + gap, y, 4, color);
+}
+
+// ---------- Pomodoro timer ----------
+
+unsigned long pomodoroDurationS(PomodoroPhase phase) {
+  int minutes = phase == POMODORO_FOCUS ? pomodoroFocusMin : pomodoroBreakMin;
+  return (unsigned long)minutes * 60UL;
+}
+
+String pomodoroTimeText() {
+  unsigned long minutes = pomodoroRemainingS / 60UL;
+  unsigned long seconds = pomodoroRemainingS % 60UL;
+  char text[12];
+  snprintf(text, sizeof(text), "%02lu:%02lu", minutes, seconds);
+  return String(text);
+}
+
+void beginPomodoroPhase(PomodoroPhase phase) {
+  pomodoroPhase = phase;
+  pomodoroRemainingS = pomodoroDurationS(phase);
+  pomodoroLastTickMs = millis();
+  pomodoroChromeDrawn = false;
+  pomodoroLastTime = "";
+}
+
+void advancePomodoro(unsigned long nowMs) {
+  if (!pomodoroRunning || pomodoroRemainingS == 0) {
+    pomodoroLastTickMs = nowMs;
+    return;
+  }
+  unsigned long elapsedS = (nowMs - pomodoroLastTickMs) / 1000UL;
+  if (elapsedS == 0) return;
+  pomodoroLastTickMs += elapsedS * 1000UL;
+
+  while (elapsedS >= pomodoroRemainingS) {
+    elapsedS -= pomodoroRemainingS;
+    if (pomodoroPhase == POMODORO_FOCUS) {
+      pomodoroCompleted++;
+      pomodoroPhase = POMODORO_BREAK;
+    } else {
+      pomodoroPhase = POMODORO_FOCUS;
+    }
+    pomodoroRemainingS = pomodoroDurationS(pomodoroPhase);
+    pomodoroChromeDrawn = false;
+  }
+  pomodoroRemainingS -= elapsedS;
+}
+
+bool controlPomodoro(const String &action, int focusMinutes = -1, int breakMinutes = -1) {
+  unsigned long nowMs = millis();
+  advancePomodoro(nowMs);
+
+  if (action == "toggle") {
+    pomodoroRunning = !pomodoroRunning;
+    pomodoroLastTickMs = nowMs;
+  } else if (action == "start") {
+    pomodoroRunning = true;
+    pomodoroLastTickMs = nowMs;
+  } else if (action == "pause") {
+    pomodoroRunning = false;
+  } else if (action == "reset") {
+    pomodoroRunning = false;
+    pomodoroRemainingS = pomodoroDurationS(pomodoroPhase);
+    pomodoroLastTickMs = nowMs;
+  } else if (action == "skip") {
+    beginPomodoroPhase(pomodoroPhase == POMODORO_FOCUS ? POMODORO_BREAK : POMODORO_FOCUS);
+  } else if (action == "configure") {
+    if (focusMinutes < POMODORO_FOCUS_MIN || focusMinutes > POMODORO_FOCUS_MAX ||
+        breakMinutes < POMODORO_BREAK_MIN || breakMinutes > POMODORO_BREAK_MAX) {
+      return false;
+    }
+    pomodoroFocusMin = focusMinutes;
+    pomodoroBreakMin = breakMinutes;
+    pomodoroCompleted = 0;
+    pomodoroRunning = false;
+    beginPomodoroPhase(POMODORO_FOCUS);
+    savePomodoroConfig();
+  } else {
+    return false;
+  }
+
+  displayMode = MODE_POMODORO;
+  pomodoroChromeDrawn = false;
+  pomodoroLastTime = "";
+  return true;
+}
+
+void drawTomatoIcon() {
+  const int cx = SCREEN_CX, cy = 61;
+  tft.fillCircle(cx, cy + 2, 21, TFT_RED);
+  tft.drawCircle(cx, cy + 2, 21, 0xFBE0);
+  tft.fillTriangle(cx, cy - 23, cx - 5, cy - 13, cx + 5, cy - 13, TFT_GREEN);
+  tft.fillTriangle(cx - 13, cy - 15, cx - 2, cy - 10, cx - 5, cy - 20, TFT_GREEN);
+  tft.fillTriangle(cx + 13, cy - 15, cx + 2, cy - 10, cx + 5, cy - 20, TFT_GREEN);
+}
+
+void drawPomodoroScreen() {
+  if (!pomodoroChromeDrawn) {
+    tft.fillScreen(TFT_BLACK);
+    ringLastPct = -1000;
+    pomodoroLastTime = "";
+    drawCenteredMonoLabel(pomodoro_label_bits, POMODORO_LABEL_W, POMODORO_LABEL_H,
+                          SCREEN_CX, 17, TFT_LIGHTGREY);
+    drawTomatoIcon();
+    const uint8_t *phaseBits = pomodoroPhase == POMODORO_FOCUS ? focus_label_bits : break_label_bits;
+    drawCenteredMonoLabel(phaseBits, FOCUS_LABEL_W, FOCUS_LABEL_H, SCREEN_CX, 88,
+                          pomodoroPhase == POMODORO_FOCUS ? TFT_RED : TFT_GREEN);
+    const uint8_t *stateBits = pomodoroRunning ? running_label_bits : paused_label_bits;
+    drawCenteredMonoLabel(stateBits, RUNNING_LABEL_W, RUNNING_LABEL_H, SCREEN_CX, 174,
+                          pomodoroRunning ? TFT_WHITE : TFT_LIGHTGREY);
+    drawCenteredMonoLabel(completed_label_bits, COMPLETED_LABEL_W, COMPLETED_LABEL_H,
+                          104, 207, TFT_LIGHTGREY);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(String(pomodoroCompleted), 124, 214, 2);
+    pomodoroChromeDrawn = true;
+  }
+
+  unsigned long duration = pomodoroDurationS(pomodoroPhase);
+  float remainingPct = duration > 0 ? 100.0f * pomodoroRemainingS / duration : 0;
+  uint16_t ringColor = !pomodoroRunning ? 0x4208
+      : pomodoroPhase == POMODORO_FOCUS ? TFT_RED : TFT_GREEN;
+  drawSquareRing(remainingPct, ringColor);
+
+  String time = pomodoroTimeText();
+  if (time != pomodoroLastTime) {
+    pomodoroLastTime = time;
+    tft.fillRect(22, 108, 196, 55, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(time, SCREEN_CX, 135, 7);
+  }
 }
 
 void drawQuotaText(float hourPct, float weekPct, bool force) {
   // Codex dropped the 5h window (2026-07): the bridge then sends
-  // primary_pct=null, so collapse to a single centered "Wk" column.
+  // primary_pct=null, so collapse to a single centered weekly value.
   bool single = hourPct < 0 && weekPct >= 0;
   static int8_t lastSingle = -1;
   if ((int8_t)single != lastSingle) {
     lastSingle = (int8_t)single;
     force = true;
-    tft.fillRect(0, QUOTA_LABEL_Y, 240, QUOTA_VALUE_Y + 26 - QUOTA_LABEL_Y, TFT_BLACK);
+    // Keep the quota ring intact when switching between one and two columns.
+    // Clearing the full panel width used to erase both vertical ring segments.
+    int contentX = RING_MARGIN + RING_THICKNESS;
+    tft.fillRect(contentX, QUOTA_LABEL_Y, SCREEN_W - 2 * contentX,
+                 QUOTA_VALUE_Y + 26 - QUOTA_LABEL_Y, TFT_BLACK);
   }
   tft.setTextDatum(TC_DATUM);
   if (single) {
-    if (force) drawWeekQuotaLabel(120, QUOTA_LABEL_Y, TFT_LIGHTGREY);
     String v = pctText(weekPct);
     if (force || v != lastQuotaWk) {
       lastQuotaWk = v;
       lastQuota5h = "";
-      tft.fillRect(120 - 50, QUOTA_VALUE_Y, 100, 26, TFT_BLACK);
-      drawBoldString(v, 120, QUOTA_VALUE_Y, 4, TFT_WHITE);
+      int contentX = RING_MARGIN + RING_THICKNESS;
+      tft.fillRect(contentX, QUOTA_LABEL_Y, SCREEN_W - 2 * contentX,
+                   QUOTA_VALUE_Y + 26 - QUOTA_LABEL_Y, TFT_BLACK);
+      drawWeekQuotaInline(v, SCREEN_CX, QUOTA_INLINE_Y, TFT_WHITE);
     }
     return;
   }
   if (force) {
-    drawBoldString("5h", QUOTA_COL1_X, QUOTA_LABEL_Y, 2, TFT_LIGHTGREY);
+    drawBoldString("5H", QUOTA_COL1_X, QUOTA_LABEL_Y, 2, TFT_LIGHTGREY);
     drawWeekQuotaLabel(QUOTA_COL2_X, QUOTA_LABEL_Y, TFT_LIGHTGREY);
   }
   String v1 = pctText(hourPct), v2 = pctText(weekPct);
@@ -634,7 +832,7 @@ void drawCountdown(bool force) {
     if (showingCd == CD_WEEK)
       drawWeekQuotaLabel(SCREEN_CX, 72, TFT_LIGHTGREY);
     else
-      drawBoldString("5h RESET IN", SCREEN_CX, 72, 2, TFT_LIGHTGREY);
+      drawBoldString("5H RESET IN", SCREEN_CX, 72, 2, TFT_LIGHTGREY);
   }
   // Background-color draw overwrites glyphs in place (no clear-then-draw
   // flash between seconds).
@@ -1460,7 +1658,7 @@ void pollBridge() {
   }
   http.end();
   DisplayMode eff = effectiveMode();
-  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_POMODORO) {
     // Only a real app switch clears the screen; a plain data refresh paints
     // in place so the poll doesn't flash the whole display.
     if (updateActiveApp()) drawActiveApp();
@@ -1487,6 +1685,7 @@ uint8_t serialPetChunk[SERIAL_PET_CHUNK_BYTES];
 File serialPetFile;
 bool serialPetActive = false;
 ActiveApp serialPetSlot = APP_CLAUDE;
+bool serialPetRaw = false;
 size_t serialPetExpectedSize = 0;
 size_t serialPetReceived = 0;
 uint32_t serialPetExpectedCrc = 0;
@@ -1494,6 +1693,8 @@ uint32_t serialPetRunningCrc = 0xFFFFFFFFUL;
 unsigned long serialPetNextSequence = 0;
 
 bool applyUploadedGif(ActiveApp slot);
+bool applyUploadedRaw(ActiveApp slot);
+void sendSerialDeviceInfo();
 
 bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 15000UL; }
 
@@ -1506,14 +1707,18 @@ void showMainUiIfNeeded() {
   drawActiveApp();
 }
 
-const char *serialPetGifPath() {
+const char *serialPetUploadPath() {
+  if (serialPetRaw) {
+    return serialPetSlot == APP_CLAUDE ? CLAUDE_SPRITE_TEMP_FILE : CODEX_SPRITE_TEMP_FILE;
+  }
   return serialPetSlot == APP_CLAUDE ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
 }
 
 void clearSerialPetUpload(bool removeTemporaryFile) {
   if (serialPetFile) serialPetFile.close();
-  if (removeTemporaryFile && fileSystemReady) LittleFS.remove(serialPetGifPath());
+  if (removeTemporaryFile && fileSystemReady) LittleFS.remove(serialPetUploadPath());
   serialPetActive = false;
+  serialPetRaw = false;
   serialPetExpectedSize = 0;
   serialPetReceived = 0;
   serialPetExpectedCrc = 0;
@@ -1578,10 +1783,15 @@ void handleSerialPetBegin(const char *payload) {
     return;
   }
   const char *slot = doc["slot"] | (const char *)nullptr;
+  const char *format = doc["format"] | "gif";
   unsigned long size = doc["size"].as<unsigned long>();
   uint32_t crc = doc["crc32"].as<uint32_t>();
   if (!slot || (strcmp(slot, "claude") && strcmp(slot, "codex"))) {
     Serial.println("#PET_ERR invalid_slot");
+    return;
+  }
+  if (strcmp(format, "gif") && strcmp(format, "rgb565")) {
+    Serial.println("#PET_ERR unsupported_format");
     return;
   }
   if (size == 0 || size > SERIAL_PET_MAX_BYTES) {
@@ -1594,8 +1804,9 @@ void handleSerialPetBegin(const char *payload) {
   }
 
   serialPetSlot = !strcmp(slot, "claude") ? APP_CLAUDE : APP_CODEX;
-  LittleFS.remove(serialPetGifPath());
-  serialPetFile = LittleFS.open(serialPetGifPath(), "w");
+  serialPetRaw = !strcmp(format, "rgb565");
+  LittleFS.remove(serialPetUploadPath());
+  serialPetFile = LittleFS.open(serialPetUploadPath(), "w");
   if (!serialPetFile) {
     Serial.println("#PET_ERR file_open_failed");
     return;
@@ -1671,19 +1882,23 @@ void handleSerialPetEnd() {
   }
 
   ActiveApp slot = serialPetSlot;
+  bool raw = serialPetRaw;
   Serial.println("#PET_PROCESSING");
   Serial.flush();
-  bool ok = applyUploadedGif(slot);
+  bool ok = raw ? applyUploadedRaw(slot) : applyUploadedGif(slot);
   clearSerialPetUpload(false);
-  Serial.println(ok ? "#PET_DONE" : "#PET_ERR gif_decode_failed");
+  if (ok) {
+    Serial.println("#PET_DONE");
+  } else {
+    Serial.printf("#PET_ERR %s\n", lastSpriteUploadError);
+  }
 }
 
 void handleSerialFrame(char *line) {
   lastSerialFrameMs = millis();
   wiredEverLinked = true;
-  if (!strncmp(line, "#HELLO", 6)) {
-    Serial.printf("#DEVICE {\"name\":\"aiclock\",\"fw\":\"%s\",\"transport\":\"%s\"}\n",
-                  FW_VERSION, AICLOCK_WIRED_ONLY ? "usb" : "hybrid");
+  if (!strncmp(line, "#HELLO", 6) || !strcmp(line, "#INFO")) {
+    sendSerialDeviceInfo();
     return;
   }
   if (!strncmp(line, "#PET_BEGIN ", 11)) {
@@ -1704,7 +1919,7 @@ void handleSerialFrame(char *line) {
       everPolled = true;
       showMainUiIfNeeded();
       DisplayMode eff = effectiveMode();
-      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_POMODORO) {
         if (updateActiveApp()) drawActiveApp();
         else refreshActiveApp();
       }
@@ -1739,7 +1954,18 @@ void handleSerialFrame(char *line) {
       else if (m == "net") displayMode = MODE_NET;
       else if (m == "music") displayMode = MODE_MUSIC;
       else if (m == "stock") displayMode = MODE_STOCK;
+      else if (m == "pomodoro") displayMode = MODE_POMODORO;
       // the effectiveMode transition handler in loop() repaints the chrome
+    }
+    const char *pomodoroAction = doc["pomodoro"] | (const char *)nullptr;
+    if (pomodoroAction) {
+      int focusMinutes = doc["focus_min"] | -1;
+      int breakMinutes = doc["break_min"] | -1;
+      if (!controlPomodoro(String(pomodoroAction), focusMinutes, breakMinutes)) {
+        Serial.println("#ACK pomodoro error");
+      } else {
+        Serial.println("#ACK pomodoro");
+      }
     }
     return;
   }
@@ -1778,7 +2004,7 @@ String htmlEscape(const String &s) {
 void handleRoot() {
   String age = everPolled ? String((millis() - lastSuccessMs) / 1000) + "s ago" : "never";
   String html;
-  html.reserve(3072);
+  html.reserve(4608);
   html += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<title>AI Clock 设置</title>";
@@ -1808,6 +2034,32 @@ void handleRoot() {
   html += "<div style='font-size:13px;color:#555'>当前：<span id='briv'>" + String(brightness) +
           "%</span>（0 = 熄屏，设置立即生效并记住）</div>";
 
+  advancePomodoro(millis());
+  html += "<h2 style='font-size:16px;margin-top:28px'>&#30058;&#33540;&#26102;&#38047;</h2>";
+  html += "<p style='font-size:13px;color:#555'>";
+  html += pomodoroPhase == POMODORO_FOCUS ? "&#19987;&#27880; " : "&#20241;&#24687; ";
+  html += pomodoroTimeText();
+  html += pomodoroRunning ? " · &#36827;&#34892;&#20013;" : " · &#24050;&#26242;&#20572;";
+  html += " · &#23436;&#25104; " + String(pomodoroCompleted) + "</p>";
+  html += "<form method='POST' action='/api/pomodoro' style='display:inline'>"
+          "<input type='hidden' name='return' value='1'><input type='hidden' name='action' value='toggle'>"
+          "<button type='submit'>";
+  html += pomodoroRunning ? "&#26242;&#20572;" : "&#24320;&#22987;";
+  html += "</button></form>";
+  html += "<form method='POST' action='/api/pomodoro' style='display:inline;margin-left:8px'>"
+          "<input type='hidden' name='return' value='1'><input type='hidden' name='action' value='reset'>"
+          "<button type='submit'>&#37325;&#32622;</button></form>";
+  html += "<form method='POST' action='/api/pomodoro' style='display:inline;margin-left:8px'>"
+          "<input type='hidden' name='return' value='1'><input type='hidden' name='action' value='skip'>"
+          "<button type='submit'>&#36339;&#36807;</button></form>";
+  html += "<form method='POST' action='/api/pomodoro'>"
+          "<input type='hidden' name='return' value='1'><input type='hidden' name='action' value='configure'>"
+          "<label>&#19987;&#27880;&#20998;&#38047;</label><input type='number' name='focus_min' min='1' max='120' value='" +
+          String(pomodoroFocusMin) + "'>"
+          "<label>&#20241;&#24687;&#20998;&#38047;</label><input type='number' name='break_min' min='1' max='60' value='" +
+          String(pomodoroBreakMin) + "'>"
+          "<button type='submit'>&#20445;&#23384;&#26102;&#38271;</button></form>";
+
   // On-device GIF upload: replaces a character's animation without reflashing.
   html += "<h2 style='font-size:16px;margin-top:28px'>桌宠动画（上传 GIF）</h2>";
   html += "<p style='font-size:13px;color:#555'>上传一个 .gif，设备会在板上解码并缩放到对应角色的尺寸，"
@@ -1830,9 +2082,9 @@ void handleRoot() {
           formatTokens(claudeStatus.tokensToday) + " tok</td></tr>";
   html += "<tr><td>Codex</td><td>" + htmlEscape(codexStatus.status) + ", " +
           formatTokens(codexStatus.tokensToday) + " tok, " +
-          (codexStatus.primaryPct >= 0 ? "5h " + String(codexStatus.primaryPct, 0) + "%"
-           : codexStatus.weeklyPct >= 0 ? "Wk " + String(codexStatus.weeklyPct, 0) + "%"
-                                        : "5h ?") + "</td></tr>";
+          (codexStatus.primaryPct >= 0 ? "5H " + String(codexStatus.primaryPct, 0) + "%"
+           : codexStatus.weeklyPct >= 0 ? "\xE5\x91\xA8 " + String(codexStatus.weeklyPct, 0) + "%"
+                                        : "5H ?") + "</td></tr>";
   html += "</table>";
 
 #if AICLOCK_OTA_AVAILABLE
@@ -1867,6 +2119,7 @@ const char *displayModeName(DisplayMode m) {
   if (m == MODE_NET) return "net";
   if (m == MODE_MUSIC) return "music";
   if (m == MODE_STOCK) return "stock";
+  if (m == MODE_POMODORO) return "pomodoro";
   return "auto";
 }
 
@@ -1878,8 +2131,10 @@ const char *spriteUploadStateName() {
   return "idle";
 }
 
-void handleApiInfo() {
-  JsonDocument doc;
+void fillDeviceInfo(JsonDocument &doc) {
+  advancePomodoro(millis());
+  doc["name"] = "aiclock";
+  doc["transport"] = AICLOCK_WIRED_ONLY ? "usb" : "hybrid";
   doc["ip"] = WiFi.localIP().toString();
   doc["ssid"] = WiFi.SSID();
   doc["bridge"] = bridgeHost;
@@ -1899,7 +2154,15 @@ void handleApiInfo() {
   JsonObject upload = doc["sprite_upload"].to<JsonObject>();
   upload["state"] = spriteUploadStateName();
   upload["slot"] = (spriteUploadSlot == APP_CLAUDE) ? "claude" : "codex";
-  upload["error"] = (spriteUploadState == SPRITE_UPLOAD_FAILED) ? lastGifDecodeError : "";
+  upload["error"] = (spriteUploadState == SPRITE_UPLOAD_FAILED) ? lastSpriteUploadError : "";
+  JsonObject pomodoro = doc["pomodoro"].to<JsonObject>();
+  pomodoro["phase"] = pomodoroPhase == POMODORO_FOCUS ? "focus" : "break";
+  pomodoro["running"] = pomodoroRunning;
+  pomodoro["remaining_s"] = pomodoroRemainingS;
+  pomodoro["duration_s"] = pomodoroDurationS(pomodoroPhase);
+  pomodoro["completed"] = pomodoroCompleted;
+  pomodoro["focus_min"] = pomodoroFocusMin;
+  pomodoro["break_min"] = pomodoroBreakMin;
   JsonObject c = doc["claude"].to<JsonObject>();
   c["status"] = claudeStatus.status;
   c["custom_sprite"] = claudeCustom;
@@ -1910,6 +2173,19 @@ void handleApiInfo() {
   x["custom_sprite"] = codexCustom;
   x["w"] = CODEX_SPRITE_W;
   x["h"] = CODEX_SPRITE_H;
+}
+
+void sendSerialDeviceInfo() {
+  JsonDocument doc;
+  fillDeviceInfo(doc);
+  Serial.print("#DEVICE ");
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void handleApiInfo() {
+  JsonDocument doc;
+  fillDeviceInfo(doc);
   String out;
   serializeJson(doc, out);
   webServer.send(200, "application/json", out);
@@ -1923,8 +2199,9 @@ void handleApiDisplay() {
   else if (mode == "net") displayMode = MODE_NET;
   else if (mode == "music") displayMode = MODE_MUSIC;
   else if (mode == "stock") displayMode = MODE_STOCK;
+  else if (mode == "pomodoro") displayMode = MODE_POMODORO;
   else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock");
+    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock|pomodoro");
     return;
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
@@ -1937,11 +2214,32 @@ void handleApiDisplay() {
   } else if (displayMode == MODE_STOCK) {
     stockChromeDrawn = false;
     lastStockPollMs = 0; // poll + draw on the next loop tick
+  } else if (displayMode == MODE_POMODORO) {
+    pomodoroChromeDrawn = false;
   } else {
     updateActiveApp();
     drawActiveApp(); // unconditional: also repaints over a previous net chart
   }
   webServer.send(200, "text/plain", "ok");
+}
+
+void handleApiPomodoro() {
+  String action = webServer.arg("action");
+  int focusMinutes = webServer.hasArg("focus_min") ? webServer.arg("focus_min").toInt() : -1;
+  int breakMinutes = webServer.hasArg("break_min") ? webServer.arg("break_min").toInt() : -1;
+  if (!controlPomodoro(action, focusMinutes, breakMinutes)) {
+    webServer.send(400, "text/plain",
+                   "invalid action or duration (focus 1-120, break 1-60 minutes)");
+    return;
+  }
+  Serial.printf("[api] pomodoro action=%s focus=%d break=%d\n", action.c_str(),
+                pomodoroFocusMin, pomodoroBreakMin);
+  if (webServer.hasArg("return")) {
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+  } else {
+    webServer.send(200, "text/plain", "ok");
+  }
 }
 
 void handleApiBrightness() {
@@ -2154,9 +2452,9 @@ void gifDrawCB(GIFDRAW *pDraw) {
 // Decodes gifPath into binPath in the [count][frames...] wire format the
 // display path reads. Returns false on open/decode failure.
 bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int targetH) {
-  lastGifDecodeError = "unknown";
+  lastSpriteUploadError = "unknown";
   if (!fileSystemReady || targetW <= 0 || targetW > SCREEN_W || targetH <= 0) {
-    lastGifDecodeError = "invalid decoder state";
+    lastSpriteUploadError = "invalid decoder state";
     return false;
   }
 
@@ -2168,18 +2466,18 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
   Serial.printf("[gif] start heap=%u max_block=%u decoder=%u\n", ESP.getFreeHeap(), maxBlock,
                 decoderBytes);
   if (maxBlock < decoderBytes) {
-    lastGifDecodeError = "insufficient contiguous heap";
+    lastSpriteUploadError = "insufficient contiguous heap";
     return false;
   }
   AnimatedGIF *gif = new AnimatedGIF();
   if (!gif) {
-    lastGifDecodeError = "decoder allocation failed";
+    lastSpriteUploadError = "decoder allocation failed";
     return false;
   }
   gif->begin(GIF_PALETTE_RGB888);
   if (!gif->open(gifPath, gifOpenCB, gifCloseCB, gifReadCB, gifSeekCB, gifDrawCB)) {
     Serial.printf("[gif] open failed err=%d\n", gif->getLastError());
-    lastGifDecodeError = "GIF open failed";
+    lastSpriteUploadError = "GIF open failed";
     delete gif;
     return false;
   }
@@ -2195,7 +2493,7 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
   size_t frameBytes = (size_t)targetW * targetH * 2;
 
   if (ctx.canvasW <= 0 || ctx.canvasH <= 0 || ctx.canvasW > 480) {
-    lastGifDecodeError = "unsupported GIF dimensions";
+    lastSpriteUploadError = "unsupported GIF dimensions";
     gif->close();
     delete gif;
     return false;
@@ -2203,13 +2501,13 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
 
   ctx.out = LittleFS.open(binPath, "w");
   if (!ctx.out) {
-    lastGifDecodeError = "output file open failed";
+    lastSpriteUploadError = "output file open failed";
     gif->close();
     delete gif;
     return false;
   }
   if (ctx.out.write((uint8_t)0) != 1) {
-    lastGifDecodeError = "output file write failed";
+    lastSpriteUploadError = "output file write failed";
     gif->close();
     delete gif;
     ctx.out.close();
@@ -2247,7 +2545,7 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
   ctx.out.close();
 
   if (ctx.failed || count == 0 || more < 0) {
-    lastGifDecodeError = ctx.failed ? "output file I/O failed" : "GIF decode failed";
+    lastSpriteUploadError = ctx.failed ? "output file I/O failed" : "GIF decode failed";
     Serial.printf("[gif] failed frames=%u err=%d io=%d\n", count, decodeError, ctx.failed);
     LittleFS.remove(binPath);
     return false;
@@ -2255,12 +2553,12 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
   File patch = LittleFS.open(binPath, "r+");
   if (!patch || !patch.seek(0) || patch.write(count) != 1) {
     if (patch) patch.close();
-    lastGifDecodeError = "frame count finalize failed";
+    lastSpriteUploadError = "frame count finalize failed";
     LittleFS.remove(binPath);
     return false;
   }
   patch.close();
-  lastGifDecodeError = "none";
+  lastSpriteUploadError = "none";
   Serial.printf("[gif] decoded %d frame(s) %dx%d -> %dx%d\n", count, ctx.canvasW, ctx.canvasH, targetW, targetH);
   return true;
 }
@@ -2274,6 +2572,39 @@ bool replaceSpriteFile(const char *binPath, const char *tempPath, const char *ba
     return false;
   }
   LittleFS.remove(backupPath);
+  return true;
+}
+
+bool applyUploadedRaw(ActiveApp slot) {
+  const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
+  const char *tempPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_TEMP_FILE : CODEX_SPRITE_TEMP_FILE;
+  const char *backupPath =
+      (slot == APP_CLAUDE) ? CLAUDE_SPRITE_BACKUP_FILE : CODEX_SPRITE_BACKUP_FILE;
+  size_t frameBytes = (slot == APP_CLAUDE) ? CLAUDE_FRAME_BYTES : CODEX_FRAME_BYTES;
+
+  File raw = LittleFS.open(tempPath, "r");
+  size_t storedSize = raw ? (size_t)raw.size() : 0;
+  int frameCount = raw ? raw.read() : -1;
+  if (raw) raw.close();
+  size_t expectedSize = frameCount > 0 ? 1 + (size_t)frameCount * frameBytes : 0;
+  if (frameCount <= 0 || frameCount > MAX_CUSTOM_FRAMES || storedSize != expectedSize) {
+    lastSpriteUploadError = "invalid RGB565 sprite";
+    LittleFS.remove(tempPath);
+    return false;
+  }
+  if (!replaceSpriteFile(binPath, tempPath, backupPath)) {
+    lastSpriteUploadError = "sprite file swap failed";
+    LittleFS.remove(tempPath);
+    return false;
+  }
+
+  lastSpriteUploadError = "none";
+  spriteRev++;
+  loadCustomSpriteState();
+  if (slot == APP_CLAUDE) claudeFrame = 0;
+  else codexFrame = 0;
+  if (currentApp == slot) drawActiveApp();
+  Serial.printf("[sprite] applied native RGB565 animation, frames=%d\n", frameCount);
   return true;
 }
 
@@ -2379,6 +2710,41 @@ void handleSpriteUploadChunk(const char *gifPath) {
   }
 }
 
+void handleRawSpriteUploadChunk(const char *tempPath) {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    if (spriteUploadState == SPRITE_UPLOAD_PENDING ||
+        spriteUploadState == SPRITE_UPLOAD_PROCESSING) {
+      return;
+    }
+    LittleFS.remove(tempPath);
+    uploadFile = LittleFS.open(tempPath, "w");
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
+    if (uploadFile) uploadFile.close();
+  }
+}
+
+void handleRawSpriteUploadDone(ActiveApp slot) {
+  if (spriteUploadState == SPRITE_UPLOAD_PENDING ||
+      spriteUploadState == SPRITE_UPLOAD_PROCESSING) {
+    webServer.send(409, "text/plain", "another sprite upload is still processing");
+    return;
+  }
+
+  spriteUploadSlot = slot;
+  spriteUploadState = SPRITE_UPLOAD_PROCESSING;
+  lastSpriteUploadError = "none";
+  bool ok = applyUploadedRaw(slot);
+  spriteUploadState = ok ? SPRITE_UPLOAD_SUCCEEDED : SPRITE_UPLOAD_FAILED;
+  if (ok) {
+    webServer.send(200, "text/plain", "native sprite applied");
+  } else {
+    webServer.send(422, "text/plain", lastSpriteUploadError);
+  }
+}
+
 void handleSpriteUploadDone(ActiveApp slot) {
   if (spriteUploadState == SPRITE_UPLOAD_PENDING ||
       spriteUploadState == SPRITE_UPLOAD_PROCESSING) {
@@ -2399,7 +2765,7 @@ void handleSpriteUploadDone(ActiveApp slot) {
   spriteUploadSlot = slot;
   spriteUploadState = SPRITE_UPLOAD_PENDING;
   spriteUploadReadyMs = millis() + 250;
-  lastGifDecodeError = "none";
+  lastSpriteUploadError = "none";
   webServer.sendHeader("Connection", "close");
   webServer.send(202, "text/plain", "accepted; poll /api/info sprite_upload");
   Serial.println("[sprite] upload stored; decode deferred until HTTP memory is released");
@@ -2423,7 +2789,7 @@ bool applyUploadedGif(ActiveApp slot) {
     return false;
   }
   if (!replaceSpriteFile(binPath, tempPath, backupPath)) {
-    lastGifDecodeError = "sprite file swap failed";
+    lastSpriteUploadError = "sprite file swap failed";
     LittleFS.remove(tempPath);
     return false;
   }
@@ -2446,7 +2812,7 @@ void processPendingSpriteUpload() {
   if (ok) {
     Serial.println("[sprite] deferred GIF decoded & applied");
   } else {
-    Serial.printf("[sprite] deferred GIF decode FAILED: %s\n", lastGifDecodeError);
+    Serial.printf("[sprite] deferred GIF decode FAILED: %s\n", lastSpriteUploadError);
   }
 }
 
@@ -2456,12 +2822,19 @@ void setupWebServer() {
   webServer.on("/reset-wifi", HTTP_POST, handleResetWifi);
   webServer.on("/api/info", HTTP_GET, handleApiInfo);
   webServer.on("/api/display", HTTP_POST, handleApiDisplay);
+  webServer.on("/api/pomodoro", HTTP_POST, handleApiPomodoro);
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
   webServer.on("/api/brightness", HTTP_POST, handleApiBrightness);
   webServer.on("/sprite/claude/reset", HTTP_POST, []() { handleSpriteReset(APP_CLAUDE); });
   webServer.on("/sprite/codex/reset", HTTP_POST, []() { handleSpriteReset(APP_CODEX); });
   webServer.on("/sprite/claude/raw", HTTP_GET, []() { handleSpriteRaw(APP_CLAUDE); });
   webServer.on("/sprite/codex/raw", HTTP_GET, []() { handleSpriteRaw(APP_CODEX); });
+  webServer.on(
+      "/sprite/claude/raw", HTTP_POST, []() { handleRawSpriteUploadDone(APP_CLAUDE); },
+      []() { handleRawSpriteUploadChunk(CLAUDE_SPRITE_TEMP_FILE); });
+  webServer.on(
+      "/sprite/codex/raw", HTTP_POST, []() { handleRawSpriteUploadDone(APP_CODEX); },
+      []() { handleRawSpriteUploadChunk(CODEX_SPRITE_TEMP_FILE); });
   webServer.on(
       "/sprite/claude", HTTP_POST, []() { handleSpriteUploadDone(APP_CLAUDE); },
       []() { handleSpriteUploadChunk(CLAUDE_GIF_FILE); });
@@ -2488,10 +2861,14 @@ void setup() {
   if (fileSystemReady) {
     loadBridgeHost();
     loadBrightness();
+    loadPomodoroConfig();
     loadCustomSpriteState();
   }
 #else
-  if (fileSystemReady) loadCustomSpriteState();
+  if (fileSystemReady) {
+    loadPomodoroConfig();
+    loadCustomSpriteState();
+  }
 #endif
 
   tft.init();
@@ -2556,6 +2933,7 @@ void loop() {
   if (!mainUiShown) return; // config-portal screen is up, nothing to animate
 
   unsigned long nowMs = millis();
+  advancePomodoro(nowMs);
 
   // Effective mode may differ from the configured one (AUTO -> music while
   // audio plays). On a transition, reset the incoming mode's chrome so it
@@ -2572,6 +2950,8 @@ void loop() {
     } else if (eff == MODE_STOCK) {
       stockChromeDrawn = false;
       lastStockPollMs = 0;
+    } else if (eff == MODE_POMODORO) {
+      pomodoroChromeDrawn = false;
     } else {
       updateActiveApp();
       drawActiveApp();
@@ -2602,6 +2982,8 @@ void loop() {
       if (!wiredActive()) pollStock();
     }
     if (!stockChromeDrawn || stockDirty) drawStockScreen();
+  } else if (eff == MODE_POMODORO) {
+    drawPomodoroScreen();
   } else {
     // sprite walk-cycle animation (only advances while that app is showing)
     if (nowMs - lastAnimMs >= ANIM_INTERVAL_MS) {

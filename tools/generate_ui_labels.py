@@ -10,8 +10,14 @@ OUTPUT_PATH = ROOT / "firmware/include/img/ui_labels_zh.h"
 PREVIEW_PATH = Path("/private/tmp/aiclock-ui-labels.png")
 
 LABELS = [
-    ("WEEK_QUOTA_LABEL", "week_quota_label_bits", "\u5468\u989d\u5ea6", 14, 42, 16),
+    ("WEEK_LABEL", "week_label_bits", "\u5468", 14, 14, 16),
     ("STOCK_LABEL", "stock_label_bits", "\u80a1\u7968", 11, 22, 12),
+    ("POMODORO_LABEL", "pomodoro_label_bits", "\u756a\u8304\u949f", 14, 42, 16),
+    ("FOCUS_LABEL", "focus_label_bits", "\u4e13\u6ce8", 14, 28, 16),
+    ("BREAK_LABEL", "break_label_bits", "\u4f11\u606f", 14, 28, 16),
+    ("RUNNING_LABEL", "running_label_bits", "\u8fdb\u884c\u4e2d", 14, 42, 16),
+    ("PAUSED_LABEL", "paused_label_bits", "\u5df2\u6682\u505c", 14, 42, 16),
+    ("COMPLETED_LABEL", "completed_label_bits", "\u5b8c\u6210", 12, 24, 14),
 ]
 
 

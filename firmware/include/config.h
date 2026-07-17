@@ -6,7 +6,7 @@
 #endif
 
 // ---- Firmware version (shown on the first-time WiFi setup screen & /api/info) ----
-#define FW_VERSION "0.5.5"
+#define FW_VERSION "0.6.7"
 
 // ---- Web OTA ----
 // Copy ota_secrets.example.h to ota_secrets.h and set unique credentials.
@@ -31,6 +31,15 @@
 // ---- WiFiManager ----
 #define WIFI_PORTAL_AP_NAME "AI-Clock-Setup"
 #define WIFI_CONFIG_FILE "/bridge_host.txt"
+#define POMODORO_CONFIG_FILE "/pomodoro.txt"
+
+// ---- Pomodoro timer ----
+#define POMODORO_FOCUS_DEFAULT_MIN 25
+#define POMODORO_BREAK_DEFAULT_MIN 5
+#define POMODORO_FOCUS_MIN 1
+#define POMODORO_FOCUS_MAX 120
+#define POMODORO_BREAK_MIN 1
+#define POMODORO_BREAK_MAX 60
 
 // ---- Backlight ----
 #define BRIGHTNESS_FILE "/brightness.txt"
