@@ -56,7 +56,8 @@ swift run                # 前台运行；或 swift build 后跑 .build/debug/AI
   也会自愈。菜单项走完整流程：最近来访 IP → 已配置地址复验 → 子网 /24 扫描兜底
   （覆盖"刚配完 WiFi、还没设过桥接"的全新设备）。
 - **设置设备地址…**：手动填时钟的 IP（开机时屏幕会显示；有自动配对后基本用不上）
-- **屏幕显示**：自动（谁在干活显示谁）/ 固定 Claude / 固定 Codex
+- **屏幕显示**：自动 / 固定 Claude / 固定 Codex / 网速 / 音乐 / 股票 / 番茄时钟
+- **番茄时钟**：开始/暂停、重置、跳过，以及设置专注/休息时长
 - **音乐播放**：显示 Mac 当前播放的专辑封面、歌曲、歌手和进度
 - **更换桌宠动画…**：内置 [petdex.dev](https://petdex.dev) 画廊（3300+ 开源桌宠），
   搜索 → 选动画（待机/跑步/挥手…9 种）→ 预览 → 一键上传到设备
@@ -239,12 +240,13 @@ pio device monitor -b 115200
    manifest（`assets.petdex.dev/manifests/petdex-v1.json`，3300+ 开源桌宠）搜索选择。
    每个桌宠是一张 1536x1872 的 WebP 精灵图（8 列 x 9 行，每帧 192x208，每行一种动画：
    待机/左右跑/挥手/跳跃/失败/等待/原地跑/思考）。app 在本地裁出所选动画行、缩放到
-   目标插槽尺寸、合成黑底循环 GIF。USB 设备已连接时优先走串口上传，否则 POST 到设备的
-   `/sprite/claude|codex`。
+   目标插槽尺寸，同时生成预览 GIF 和设备原生 RGB565 帧流。USB 设备已连接时优先走串口
+   上传，否则 POST 到设备的 `/sprite/claude|codex/raw`。
 2. **设备网页** `http://<设备IP>/`：手动上传任意 `.gif`，适合用自己的图。
 
-两条路最终都走同一条链路：设备收到 GIF 后**自己在板上解码并缩放**，立刻替换该角色的
-动画，重启后也记得，**不需要重新编译或烧录固件**。
+菜单栏选择器优先上传已经转换好的 RGB565 帧，避开 ESP8266 连续堆内存不足；设备网页上传
+的任意 GIF 仍由板上兼容解码器处理。两条路径都会立刻替换角色动画并持久化到 LittleFS，
+**不需要重新编译或烧录固件**。
 
 ### 设备 HTTP API（Mac app 用的就是这套）
 
@@ -254,6 +256,7 @@ pio device monitor -b 115200
 | POST | `/api/display` | `mode=auto\|claude\|codex\|net\|music` 切换屏幕显示（net=网速曲线页，music=音乐播放页）|
 | POST | `/api/bridge` | `host=ip:port` 设置桥接地址 |
 | POST | `/sprite/claude`、`/sprite/codex` | multipart 上传 GIF 并板上解码替换 |
+| POST | `/sprite/claude/raw`、`/sprite/codex/raw` | multipart 上传 `[1B帧数][RGB565大端帧...]` 并直接替换 |
 | POST | `/sprite/claude/reset`、`/sprite/codex/reset` | 删除自定义动画，恢复内置形象 |
 | GET | `/sprite/claude/raw`、`/sprite/codex/raw` | 当前生效动画的原始帧流 `[1B帧数][RGB565大端帧...]`（镜像窗口用）|
 
@@ -264,7 +267,7 @@ pio device monitor -b 115200
 串口传输采用逐块确认，避免 ESP8266 写 Flash 或解码时 UART 接收缓冲区溢出：
 
 ```text
-Mac -> ESP  #PET_BEGIN {"slot":"claude","size":12345,"crc32":2309737967}
+Mac -> ESP  #PET_BEGIN {"slot":"claude","format":"rgb565","size":12345,"crc32":2309737967}
 ESP -> Mac  #PET_READY
 Mac -> ESP  #PET_CHUNK 0 <base64>
 ESP -> Mac  #PET_ACK 0
@@ -273,10 +276,11 @@ ESP -> Mac  #PET_PROCESSING
 ESP -> Mac  #PET_DONE
 ```
 
-每块原始数据最多 384 字节；设备在解码前同时校验总长度和 IEEE CRC32，任一步失败会返回
+每块原始数据最多 384 字节；设备在应用前同时校验格式、总长度和 IEEE CRC32，任一步失败会返回
 `#PET_ERR <reason>`。USB 模式启动时只尝试挂载 LittleFS，不会自动破坏已有数据；仅当用户
 明确发起第一次宠物上传且文件系统无法挂载时，才格式化并初始化存储区。上传成功后仍复用
-HTTP 路径相同的 AnimatedGIF 解码与 `/c.bin`、`/x.bin` 持久化链路。
+HTTP 原生路径相同的 `/c.bin`、`/x.bin` 校验、原子替换和持久化链路。`format=gif` 保留给
+旧客户端兼容。
 
 ## 5. 网速曲线页（Mac + 设备同步显示）
 
@@ -319,7 +323,26 @@ LaunchAgent 直接运行 `~/Library/Application Support/AIClockBridge/AIClockBri
 设备每 2 秒刷新一次音乐信息；封面只有在版本号变化时重新拉取。Mac 弹窗镜像同样显示
 音乐页，方便不用看设备也能确认布局。
 
-## 7. Hooks 实时状态（秒级，参考 clawd-on-desk 的做法）
+## 7. 番茄时钟（设备端独立计时）
+
+番茄时钟的状态机完全运行在 ESP8266 上，Mac/Windows 只负责遥控和镜像。因此开始计时后
+可以拔掉 USB 数据线，甚至退出桥接程序，设备仍会继续倒计时；专注结束自动进入休息，
+休息结束自动开始下一轮专注。默认时长为 25/5 分钟，设置保存在 LittleFS 的
+`/pomodoro.txt`，重启后保留时长，但会从一个暂停的新专注阶段开始。
+
+控制入口：
+
+- 菜单栏/托盘的「番茄时钟」子菜单：开始/暂停、重置、跳过、设置时长。
+- 设备管理网页：同样提供完整控制，电脑桥接程序未运行时可用手机操作。
+- `POST /api/pomodoro`：`action=toggle|start|pause|reset|skip|configure`；配置时额外传
+  `focus_min=1..120` 和 `break_min=1..60`。
+- `POST /api/display mode=pomodoro`：只切换页面，不改变当前计时状态。
+
+`GET /api/info` 的 `pomodoro` 对象返回 `phase`、`running`、`remaining_s`、
+`duration_s`、`completed`、`focus_min` 和 `break_min`。USB 模式每秒用 `#INFO` /
+`#DEVICE` 同步同一份字段，避免桌面端维护第二套倒计时造成漂移。
+
+## 8. Hooks 实时状态（秒级，参考 clawd-on-desk 的做法）
 
 除了日志 mtime 轮询（保留为兜底），bridge 还接收两个 CLI 官方 hooks 的事件推送，
 状态切换从"最多迟滞 20 秒"变成"毫秒级"：
@@ -335,7 +358,13 @@ LaunchAgent 直接运行 `~/Library/Application Support/AIClockBridge/AIClockBri
 - 局限：事件是全局的不分会话——A 会话 Stop 会把还在干活的 B 会话压成 idle 最多 60 秒
   （B 的下一个工具调用事件会立刻翻回 working）。
 
-### GIF 上传架构
+### 桌宠上传架构
+
+菜单栏 petdex 选择器在 Mac 上完成裁剪、缩放和 RGB565 转换，再通过 HTTP 或 USB 把
+`[1字节帧数][各帧像素...]` 流式写入临时文件。固件校验帧数与文件长度后原子替换
+`/c.bin` / `/x.bin`。这条日常路径不需要创建 GIF 解码器，因此不受 ESP8266 堆碎片影响。
+
+设备网页的任意 GIF 上传作为兼容入口，仍使用下面的板上解码链路：
 
 架构：GIF 通过 `ESP8266WebServer` 的 multipart 文件上传（`HTTPUpload` 回调）边收边流式
 写进 LittleFS 的临时文件（`/c.gif` / `/x.gif`），然后固件用
@@ -355,7 +384,8 @@ ESP8266 总共只有 ~80KB RAM，一帧 120x120 的 RGB565 就 ~28KB，AnimatedG
 
 **注意事项 / 局限**：
 
-- GIF 太大（尺寸很大、颜色/帧很多）可能因内存不足解码失败，页面会报错，换小一点的即可。
+- 网页 GIF 太大（尺寸很大、颜色/帧很多）可能因内存不足解码失败；菜单栏 petdex 原生上传
+  不受这个限制。
 - 目标插槽尺寸固定：Claude 111x120、Codex 120x120，板上会最近邻缩放匹配（质量不如
   PIL 的 LANCZOS，像素风 GIF 通常没问题）。
 - 最多取 GIF 的**前 8 帧**（没有整体帧数信息，就不做均匀抽帧了）。

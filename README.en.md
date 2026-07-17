@@ -30,7 +30,12 @@ A retro mini-TV with a 240×240 screen that sits on your desk showing **what Cla
 | <img src="docs/images/feature1.jpg" width="360" alt="AI status"> | **AI status & quota**<br>Pet is walking = the AI is working. A square progress ring plus large digits show your real 5-hour / weekly quota usage; when a window is used up the pet becomes a reset countdown, and the border flashes red when the AI is waiting for your approval. |
 | <img src="docs/images/feature2.jpg" width="360" alt="Network monitor"> | **Live network monitor**<br>Task-manager-style upload/download curves, 56-second rolling window, auto-scaling axis. |
 | <img src="docs/images/music.jpg" width="360" alt="Now playing"> | **Now playing**<br>Album art, title, artist and progress bar in real time; switches in automatically when music starts, back when it stops. |
-| <img src="docs/images/feature3.jpg" width="360" alt="Swappable pets"> | **Swappable pets**<br>Built-in [petdex.dev](https://petdex.dev) gallery with 3300+ open-source pets, or upload any GIF — decoded on the board itself, no reflashing needed. |
+| <img src="docs/images/feature3.jpg" width="360" alt="Swappable pets"> | **Swappable pets**<br>Built-in [petdex.dev](https://petdex.dev) gallery with 3300+ open-source pets, encoded to the device-native format on the desktop for reliable uploads; arbitrary GIF uploads remain available from the device web page. |
+
+The firmware also includes a **device-owned Pomodoro timer**. It defaults to a
+25-minute focus period and a 5-minute break, supports start/pause, reset, skip,
+and configurable durations, and keeps running after the USB data cable or
+desktop bridge is disconnected.
 
 ## Getting started
 
@@ -61,7 +66,7 @@ The bridge lives in your menu bar / tray and **auto-discovers and pairs** with t
   <img src="docs/images/working.jpg" width="640" alt="In action">
 </p>
 
-Daily use is all on the tray icon: **left-click** opens a live mirror of the device screen (with a brightness slider at the bottom), **right-click** opens the full menu (quota details, screen switching, pet swapping, music/network pages, and more).
+Daily use is all on the tray icon: **left-click** opens a live mirror of the device screen (with a brightness slider at the bottom), **right-click** opens the full menu (quota details, screen switching, Pomodoro controls, pet swapping, music/network pages, and more).
 
 ## FAQ
 
@@ -72,7 +77,7 @@ Daily use is all on the tray icon: **left-click** opens a live mirror of the dev
 ## Development
 
 ```
-firmware/     ESP8266 firmware (PlatformIO + Arduino, with on-board GIF decoding)
+firmware/     ESP8266 firmware (PlatformIO + Arduino, native sprite uploads + GIF fallback)
 mac-app/      macOS menu bar bridge (Swift/SPM, zero third-party dependencies)
 windows-app/  Windows tray bridge (C# / .NET 8 WinForms)
 tools/        GIF → RGB565 built-in sprite conversion script

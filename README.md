@@ -30,7 +30,11 @@
 | <img src="docs/images/feature1.jpg" width="360" alt="AI 工作状态"> | **AI 工作状态与额度**<br>桌宠动起来 = AI 正在干活。方形进度环 + 大字显示 5 小时 / 周额度的真实用量；额度用满自动换成重置倒计时，等你审批时整圈边框红闪提醒。 |
 | <img src="docs/images/feature2.jpg" width="360" alt="网速监视"> | **网速实时监视**<br>任务管理器风格的上下行曲线，56 秒滚动窗口，量程自动调整。 |
 | <img src="docs/images/music.jpg" width="360" alt="音乐播放"> | **音乐播放显示**<br>专辑封面、歌名、歌手、进度条实时同步；音乐响起自动切入，停止自动切回。 |
-| <img src="docs/images/feature3.jpg" width="360" alt="桌宠可换"> | **可换桌宠**<br>内置 [petdex.dev](https://petdex.dev) 画廊 3300+ 开源桌宠，也可上传任意 GIF，设备板上直接解码，无需重烧固件。 |
+| <img src="docs/images/feature3.jpg" width="360" alt="桌宠可换"> | **可换桌宠**<br>内置 [petdex.dev](https://petdex.dev) 画廊 3300+ 开源桌宠，电脑端直接生成设备原生动画可靠上传；也可从设备网页上传任意 GIF，无需重烧固件。 |
+
+还内置了**番茄时钟**：默认专注 25 分钟、休息 5 分钟，可从菜单栏、Windows 托盘或设备
+网页开始/暂停、重置、跳过和修改时长。计时状态由 ESP8266 自己维护，开始后拔掉电脑
+数据线也会继续运行，阶段结束自动切换专注/休息。
 
 ## 快速上手
 
@@ -61,7 +65,7 @@
   <img src="docs/images/working.jpg" width="640" alt="工作演示">
 </p>
 
-日常使用都在托盘图标上：**左键**打开设备画面的实时镜像（底部有屏幕亮度滑条），**右键**是完整菜单（额度详情、屏幕切换、更换桌宠、音乐/网速页等）。
+日常使用都在托盘图标上：**左键**打开设备画面的实时镜像（底部有屏幕亮度滑条），**右键**是完整菜单（额度详情、屏幕切换、番茄时钟、更换桌宠、音乐/网速页等）。
 
 ## 常见问题
 
@@ -72,7 +76,7 @@
 ## 开发
 
 ```
-firmware/     ESP8266 固件（PlatformIO + Arduino，含板上 GIF 解码）
+firmware/     ESP8266 固件（PlatformIO + Arduino，含原生动画上传与 GIF 兼容解码）
 mac-app/      macOS 菜单栏桥接（Swift/SPM，零第三方依赖）
 windows-app/  Windows 托盘桥接（C# / .NET 8 WinForms）
 tools/        GIF → RGB565 内置精灵图转换脚本
@@ -96,7 +100,7 @@ cd ../mac-app && AICLOCK_SERIAL_PORT=/dev/cu.usbserial-XXXX swift run
 `~/Library/Logs/AIClockBridge/`。更新源码后重新运行安装脚本即可部署新版本。
 
 纯 USB 模式也支持菜单栏里的「更换桌宠动画…」。选择宠物和目标槽位后，Mac 会自动通过
-串口分块上传，设备校验并解码后立即应用；动画保存在 LittleFS 中，重启后仍然有效。
+串口分块上传，设备校验后立即应用；动画保存在 LittleFS 中，重启后仍然有效。
 
 混合版首次通过 USB 刷入支持 Web OTA 的固件后，后续可打开
 `http://<设备IP>/update`，使用本机 `firmware/include/ota_secrets.h` 中的独立凭据登录并
