@@ -15,12 +15,19 @@ class DeviceInfo
     public string Ip = "";
     public string Ssid = "";
     public string Bridge = "";
-    public string Mode = "auto";       // configured: auto | claude | codex | net | music
+    public string Mode = "auto";       // configured: auto | claude | codex | net | music | stock | pomodoro
     public string Effective = "auto";  // what's actually on screen (AUTO may promote to music)
     public string Showing = "";
     public int LastUpdateS = -1;       // seconds since the device last got /status data, -1 = never
     public int SpriteRev;              // bumped by the device on animation change
     public int Brightness = 100;       // backlight 0-100 (0 = off)
+    public string PomodoroPhase = "focus";
+    public bool PomodoroRunning;
+    public int PomodoroRemainingS = 25 * 60;
+    public int PomodoroDurationS = 25 * 60;
+    public int PomodoroCompleted;
+    public int PomodoroFocusMinutes = 25;
+    public int PomodoroBreakMinutes = 5;
     public bool ClaudeCustomSprite;
     public bool CodexCustomSprite;
     public int ClaudeW = 111, ClaudeH = 120;
@@ -102,6 +109,16 @@ static class DeviceClient
                 Showing = Str(root, "showing"),
             };
             info.Effective = Str(root, "effective", info.Mode);
+            if (root.TryGetProperty("pomodoro", out var pomodoro))
+            {
+                info.PomodoroPhase = Str(pomodoro, "phase", "focus");
+                info.PomodoroRunning = Bool(pomodoro, "running");
+                info.PomodoroRemainingS = Int(pomodoro, "remaining_s", 25 * 60);
+                info.PomodoroDurationS = Int(pomodoro, "duration_s", 25 * 60);
+                info.PomodoroCompleted = Int(pomodoro, "completed");
+                info.PomodoroFocusMinutes = Int(pomodoro, "focus_min", 25);
+                info.PomodoroBreakMinutes = Int(pomodoro, "break_min", 5);
+            }
             if (root.TryGetProperty("claude", out var claude))
             {
                 info.ClaudeCustomSprite = Bool(claude, "custom_sprite");
@@ -122,9 +139,18 @@ static class DeviceClient
         }
     }
 
-    /// POST /api/display  mode=auto|claude|codex|net|music
+    /// POST /api/display  mode=auto|claude|codex|net|music|stock|pomodoro
     public static Task SetDisplayMode(string mode) =>
         PostForm("api/display", new() { ["mode"] = mode });
+
+    public static Task ControlPomodoro(string action, int? focusMinutes = null,
+                                       int? breakMinutes = null)
+    {
+        Dictionary<string, string> fields = new() { ["action"] = action };
+        if (focusMinutes.HasValue) fields["focus_min"] = focusMinutes.Value.ToString();
+        if (breakMinutes.HasValue) fields["break_min"] = breakMinutes.Value.ToString();
+        return PostForm("api/pomodoro", fields);
+    }
 
     /// POST /api/bridge  host=ip:port
     public static Task SetBridgeHost(string bridgeHost) =>

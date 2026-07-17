@@ -24,8 +24,8 @@ sealed class MirrorControl : Control
     public double RingPct;
     public bool NeedsInput; // shown app waiting on approval -> red border flash
     public bool FlashOn;
-    public string Line1 = "5h -";
-    public string Line2 = "\u5468\u989D\u5EA6 -";
+    public string Line1 = "5H -";
+    public string Line2 = "\u5468 -";
     public bool ShowingClaude = true;
     public bool DeviceOK;
     // net-mode mirror: same scrolling area-chart model as the firmware —
@@ -42,6 +42,12 @@ sealed class MirrorControl : Control
 
     public bool StockMode;
     public StockMonitor.Row[] StockRows = Array.Empty<StockMonitor.Row>();
+    public bool PomodoroMode;
+    public string PomodoroPhase = "focus";
+    public bool PomodoroRunning;
+    public int PomodoroRemainingS = 25 * 60;
+    public int PomodoroDurationS = 25 * 60;
+    public int PomodoroCompleted;
 
     public bool MusicMode;
     public string MusicTitle = "";
@@ -120,6 +126,11 @@ sealed class MirrorControl : Control
         if (StockMode)
         {
             DrawStockScene(g);
+            return;
+        }
+        if (PomodoroMode)
+        {
+            DrawPomodoroScene(g);
             return;
         }
 
@@ -328,6 +339,54 @@ sealed class MirrorControl : Control
         }
     }
 
+    void DrawPomodoroScene(Graphics g)
+    {
+        var focus = PomodoroPhase != "break";
+        var activeColor = focus ? Color.FromArgb(255, 59, 48) : Green;
+        var ringColor = PomodoroRunning ? activeColor : Color.FromArgb(64, 64, 64);
+        const float m = 4, t = 2, side = 232;
+        var pct = Math.Clamp((double)PomodoroRemainingS / Math.Max(1, PomodoroDurationS), 0, 1);
+        var remaining = side * 4 * (float)pct;
+        using (var ring = new SolidBrush(ringColor))
+        {
+            var segment = Math.Min(remaining, side);
+            if (segment > 0) g.FillRectangle(ring, m, m, segment, t);
+            remaining -= side;
+            segment = Math.Min(remaining, side);
+            if (segment > 0) g.FillRectangle(ring, 240 - m - t, m, t, segment);
+            remaining -= side;
+            segment = Math.Min(remaining, side);
+            if (segment > 0) g.FillRectangle(ring, 240 - m - segment, 240 - m - t, segment, t);
+            remaining -= side;
+            segment = Math.Min(remaining, side);
+            if (segment > 0) g.FillRectangle(ring, m, 240 - m - segment, t, segment);
+        }
+
+        using var center = new StringFormat { Alignment = StringAlignment.Center };
+        using var titleFont = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold);
+        using var phaseFont = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold);
+        using var timeFont = new Font("Consolas", 30f, FontStyle.Bold);
+        using var stateFont = new Font("Microsoft YaHei UI", 10f);
+        using var footerFont = new Font("Microsoft YaHei UI", 9f);
+        g.DrawString("\u756A\u8304\u949F", titleFont, Brushes.LightGray,
+                     new RectangleF(0, 17, 240, 18), center);
+        using (var tomato = new SolidBrush(Color.FromArgb(255, 59, 48)))
+            g.FillEllipse(tomato, 99, 42, 42, 42);
+        using (var leaf = new SolidBrush(Green))
+            g.FillPolygon(leaf, new[] { new PointF(120, 38), new PointF(113, 49), new PointF(127, 49) });
+        using var activeBrush = new SolidBrush(activeColor);
+        g.DrawString(focus ? "\u4E13\u6CE8" : "\u4F11\u606F", phaseFont, activeBrush,
+                     new RectangleF(0, 88, 240, 18), center);
+        var time = $"{Math.Max(0, PomodoroRemainingS) / 60:00}:"
+            + $"{Math.Max(0, PomodoroRemainingS) % 60:00}";
+        g.DrawString(time, timeFont, Brushes.White, new RectangleF(0, 108, 240, 54), center);
+        g.DrawString(PomodoroRunning ? "\u8FDB\u884C\u4E2D" : "\u5DF2\u6682\u505C",
+                     stateFont, PomodoroRunning ? Brushes.White : Brushes.LightGray,
+                     new RectangleF(0, 174, 240, 18), center);
+        g.DrawString($"\u5B8C\u6210 {PomodoroCompleted}", footerFont, Brushes.LightGray,
+                     new RectangleF(0, 207, 240, 16), center);
+    }
+
     // Stock watchlist, same 54px rows as the firmware: grey name on the left,
     // code on the right, big white price, and colored change.
     void DrawStockScene(Graphics g)
@@ -398,8 +457,8 @@ sealed class MirrorForm : Form
     readonly StockMonitor _stockMonitor;
     readonly MirrorControl _mirror = new();
     readonly RadioButton[] _modeButtons;
-    static readonly string[] Modes = { "auto", "claude", "codex", "net", "music", "stock" };
-    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "网速", "音乐", "股票" };
+    static readonly string[] Modes = { "auto", "claude", "codex", "net", "music", "stock", "pomodoro" };
+    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "网速", "音乐", "股票", "番茄" };
     readonly Label _statusLabel = new();
     readonly TrackBar _brightness = new() { Minimum = 0, Maximum = 100, TickStyle = TickStyle.None };
     readonly Label _brightnessValue = new();
@@ -451,6 +510,7 @@ sealed class MirrorForm : Form
                 TextAlign = ContentAlignment.MiddleCenter,
                 Tag = Modes[i],
                 AutoSize = false,
+                Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 8f),
             };
             btn.SetBounds(Px(14) + i * segWidth, Px(312), segWidth, Px(28));
             btn.CheckedChanged += ModeChanged;
@@ -610,7 +670,9 @@ sealed class MirrorForm : Form
         _applyingMode = false;
         var modeText = info.Mode == "auto" ? "自动切换"
             : info.Mode == "net" ? "网速曲线"
-            : info.Mode == "music" ? "音乐播放" : "固定显示";
+            : info.Mode == "music" ? "音乐播放"
+            : info.Mode == "stock" ? "股票行情"
+            : info.Mode == "pomodoro" ? "番茄时钟" : "固定显示";
         _statusLabel.Text = $"{info.Ip} · {modeText} · 数据 {info.Bridge}";
     }
 
@@ -623,6 +685,18 @@ sealed class MirrorForm : Form
         _mirror.NetMode = info.Effective == "net";
         _mirror.MusicMode = info.Effective == "music";
         _mirror.StockMode = info.Effective == "stock";
+        _mirror.PomodoroMode = info.Effective == "pomodoro";
+        if (_mirror.PomodoroMode)
+        {
+            _mirror.PomodoroPhase = info.PomodoroPhase;
+            _mirror.PomodoroRunning = info.PomodoroRunning;
+            _mirror.PomodoroRemainingS = info.PomodoroRemainingS;
+            _mirror.PomodoroDurationS = info.PomodoroDurationS;
+            _mirror.PomodoroCompleted = info.PomodoroCompleted;
+            _mirror.NeedsInput = false;
+            _mirror.Invalidate();
+            return;
+        }
         if (_mirror.StockMode)
         {
             _mirror.StockRows = _stockMonitor.Snapshot;
@@ -657,8 +731,8 @@ sealed class MirrorForm : Form
                 ?? (snap.Claude.SessionWindowMin > 0
                     ? 100.0 * snap.Claude.SessionMin / snap.Claude.SessionWindowMin : 0);
             _mirror.RingPct = pct;
-            _mirror.Line1 = "5h " + PctText(pct);
-            _mirror.Line2 = "\u5468\u989D\u5EA6 " + PctText(snap.Claude.SevenDayPct);
+            _mirror.Line1 = "5H " + PctText(pct);
+            _mirror.Line2 = "\u5468 " + PctText(snap.Claude.SevenDayPct);
             _mirror.NeedsInput = snap.Claude.NeedsInput;
         }
         else
@@ -668,13 +742,13 @@ sealed class MirrorForm : Form
             _mirror.RingPct = snap.Codex.PrimaryPct ?? snap.Codex.WeeklyPct ?? 0;
             if (!snap.Codex.PrimaryPct.HasValue && snap.Codex.WeeklyPct.HasValue)
             {
-                _mirror.Line1 = "\u5468\u989D\u5EA6 " + PctText(snap.Codex.WeeklyPct);
+                _mirror.Line1 = "\u5468 " + PctText(snap.Codex.WeeklyPct);
                 _mirror.Line2 = "";
             }
             else
             {
-                _mirror.Line1 = "5h " + PctText(snap.Codex.PrimaryPct);
-                _mirror.Line2 = "\u5468\u989D\u5EA6 " + PctText(snap.Codex.WeeklyPct);
+                _mirror.Line1 = "5H " + PctText(snap.Codex.PrimaryPct);
+                _mirror.Line2 = "\u5468 " + PctText(snap.Codex.WeeklyPct);
             }
             _mirror.NeedsInput = snap.Codex.NeedsInput;
         }
@@ -686,6 +760,7 @@ sealed class MirrorForm : Form
 
     void EnsureSprite(DeviceInfo info)
     {
+        if (info.Effective is "net" or "music" or "stock" or "pomodoro") return;
         var slot = info.Showing == "codex" ? "codex" : "claude";
         var w = slot == "claude" ? info.ClaudeW : info.CodexW;
         var h = slot == "claude" ? info.ClaudeH : info.CodexH;
@@ -733,7 +808,8 @@ sealed class MirrorForm : Form
 
     void AnimTick()
     {
-        if (_lastInfo == null || _mirror.NetMode) return;
+        if (_lastInfo == null || _mirror.NetMode || _mirror.MusicMode
+            || _mirror.StockMode || _mirror.PomodoroMode) return;
 
         // ~400ms red-border flash while an approval is pending (device cadence)
         if (_mirror.NeedsInput)

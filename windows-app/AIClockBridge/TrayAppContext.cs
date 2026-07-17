@@ -19,7 +19,10 @@ sealed class TrayAppContext : ApplicationContext
     readonly ToolStripMenuItem _claudeUsageItem = new("Claude …") { Enabled = false };
     readonly ToolStripMenuItem _codexUsageItem = new("Codex …") { Enabled = false };
     readonly ToolStripMenuItem _deviceInfoItem = new("设备：未设置") { Enabled = false };
+    readonly ToolStripMenuItem _pomodoroStatusItem = new("\u756A\u8304\u65F6\u949F") { Enabled = false };
+    readonly ToolStripMenuItem _pomodoroToggleItem = new("\u5F00\u59CB");
     readonly Dictionary<string, ToolStripMenuItem> _modeItems = new();
+    DeviceInfo _latestDeviceInfo;
 
     public TrayAppContext(StatusService service, UsageFetcher usage, NetSpeedMonitor netMonitor,
                           NowPlayingMonitor nowPlaying, StockMonitor stockMonitor, int port)
@@ -80,7 +83,7 @@ sealed class TrayAppContext : ApplicationContext
         {
             ("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
             ("固定 Codex", "codex"), ("网速曲线", "net"), ("音乐播放", "music"),
-            ("股票行情", "stock"),
+            ("股票行情", "stock"), ("\u756A\u8304\u65F6\u949F", "pomodoro"),
         })
         {
             var item = new ToolStripMenuItem(title);
@@ -90,6 +93,19 @@ sealed class TrayAppContext : ApplicationContext
         }
         _menu.Items.Add(displayMenu);
         // (屏幕亮度在左键弹出的镜像页底部，做成滑条了)
+
+        var pomodoroMenu = new ToolStripMenuItem("\u756A\u8304\u65F6\u949F");
+        pomodoroMenu.DropDownItems.Add(_pomodoroStatusItem);
+        _pomodoroToggleItem.Click += async (_, _) => await ControlPomodoro("toggle");
+        pomodoroMenu.DropDownItems.Add(_pomodoroToggleItem);
+        pomodoroMenu.DropDownItems.Add(MakeItem("\u91CD\u7F6E\u672C\u9636\u6BB5",
+            async (_, _) => await ControlPomodoro("reset")));
+        pomodoroMenu.DropDownItems.Add(MakeItem("\u8DF3\u8FC7\u672C\u9636\u6BB5",
+            async (_, _) => await ControlPomodoro("skip")));
+        pomodoroMenu.DropDownItems.Add(new ToolStripSeparator());
+        pomodoroMenu.DropDownItems.Add(MakeItem("\u8BBE\u7F6E\u65F6\u957F…",
+            async (_, _) => await ConfigurePomodoro()));
+        _menu.Items.Add(pomodoroMenu);
 
         _menu.Items.Add(MakeItem("设置自选股…", (_, _) =>
         {
@@ -143,8 +159,8 @@ sealed class TrayAppContext : ApplicationContext
 
     void RefreshUsageLines()
     {
-        _claudeUsageItem.Text = UsageLine("Claude", _usage.Claude, "7天");
-        _codexUsageItem.Text = UsageLine("Codex", _usage.Codex, "周");
+        _claudeUsageItem.Text = UsageLine("Claude", _usage.Claude, "\u5468");
+        _codexUsageItem.Text = UsageLine("Codex", _usage.Codex, "\u5468");
     }
 
     static string UsageLine(string name, ProviderUsage u, string weeklyLabel)
@@ -153,7 +169,7 @@ sealed class TrayAppContext : ApplicationContext
         var parts = new List<string>();
         if (u.PrimaryPct.HasValue)
         {
-            var s = $"5h {(int)u.PrimaryPct.Value}%";
+            var s = $"5H {(int)u.PrimaryPct.Value}%";
             if (u.PrimaryResetMin.HasValue) s += $"（{FmtMin(u.PrimaryResetMin.Value)}后重置）";
             parts.Add(s);
         }
@@ -202,6 +218,7 @@ sealed class TrayAppContext : ApplicationContext
             }
             return;
         }
+        _latestDeviceInfo = info;
         var sprites = new[]
         {
             info.ClaudeCustomSprite ? "C:自定义" : "C:默认",
@@ -209,10 +226,17 @@ sealed class TrayAppContext : ApplicationContext
         };
         var showing = info.Mode == "net" ? "网速"
             : info.Mode == "music" ? "音乐"
+            : info.Mode == "stock" ? "股票"
+            : info.Mode == "pomodoro" ? "番茄钟"
             : (info.Showing == "claude" ? "Claude" : "Codex");
         _deviceInfoItem.Text =
             $"设备：{info.Ip} · 正在显示 {showing} · {string.Join(" ", sprites)}";
         foreach (var (mode, item) in _modeItems) item.Checked = mode == info.Mode;
+        var phase = info.PomodoroPhase == "break" ? "\u4F11\u606F" : "\u4E13\u6CE8";
+        var state = info.PomodoroRunning ? "\u8FDB\u884C\u4E2D" : "\u5DF2\u6682\u505C";
+        _pomodoroStatusItem.Text = $"{phase} {info.PomodoroRemainingS / 60:00}:"
+            + $"{info.PomodoroRemainingS % 60:00} · {state} · \u5B8C\u6210 {info.PomodoroCompleted}";
+        _pomodoroToggleItem.Text = info.PomodoroRunning ? "\u6682\u505C" : "\u5F00\u59CB";
     }
 
     // MARK: - pairing
@@ -270,6 +294,48 @@ sealed class TrayAppContext : ApplicationContext
         catch (Exception e)
         {
             Toast("切换失败", e.Message);
+        }
+    }
+
+    async Task ControlPomodoro(string action)
+    {
+        try
+        {
+            await DeviceClient.ControlPomodoro(action);
+            await RefreshDeviceSection();
+        }
+        catch (Exception e)
+        {
+            Toast("\u64CD\u4F5C\u5931\u8D25", e.Message);
+        }
+    }
+
+    async Task ConfigurePomodoro()
+    {
+        var info = _latestDeviceInfo;
+        var initial = $"{info?.PomodoroFocusMinutes ?? 25},{info?.PomodoroBreakMinutes ?? 5}";
+        var input = InputDialog.Show(
+            "\u8BBE\u7F6E\u756A\u8304\u65F6\u949F",
+            "\u8F93\u5165\u4E13\u6CE8\u548C\u4F11\u606F\u5206\u949F\uFF0C\u7528\u9017\u53F7\u5206\u9694\uFF08\u4F8B\u5982 25,5\uFF09",
+            initial, "25,5");
+        if (input == null) return;
+        var values = input.Split(',', StringSplitOptions.TrimEntries);
+        if (values.Length != 2 || !int.TryParse(values[0], out var focusMinutes)
+            || !int.TryParse(values[1], out var breakMinutes)
+            || focusMinutes is < 1 or > 120 || breakMinutes is < 1 or > 60)
+        {
+            Toast("\u65F6\u957F\u65E0\u6548",
+                  "\u4E13\u6CE8\u9700\u4E3A 1-120 \u5206\u949F\uFF0C\u4F11\u606F\u9700\u4E3A 1-60 \u5206\u949F\u3002");
+            return;
+        }
+        try
+        {
+            await DeviceClient.ControlPomodoro("configure", focusMinutes, breakMinutes);
+            await RefreshDeviceSection();
+        }
+        catch (Exception e)
+        {
+            Toast("\u4FDD\u5B58\u5931\u8D25", e.Message);
         }
     }
 
