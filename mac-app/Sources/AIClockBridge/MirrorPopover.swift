@@ -74,8 +74,8 @@ final class MirrorView: NSView {
     var ringPct: Double = 0
     var needsInput = false // shown app waiting on approval -> red border flash
     var flashOn = false
-    var line1 = "5h -"
-    var line2 = "\u{5468}\u{989D}\u{5EA6} -"
+    var line1 = "5H -"
+    var line2 = "\u{5468} -"
     var showingClaude = true
     var deviceOK = false
     // net-mode mirror: same scrolling area-chart model as the firmware —
@@ -86,6 +86,12 @@ final class MirrorView: NSView {
     var netMem = -1
     var stockMode = false
     var stockRows: [StockMonitor.Row] = []
+    var pomodoroMode = false
+    var pomodoroPhase = "focus"
+    var pomodoroRunning = false
+    var pomodoroRemainingS = 25 * 60
+    var pomodoroDurationS = 25 * 60
+    var pomodoroCompleted = 0
     var netHeaderDL = "0B"
     var netHeaderUL = "0B"
     private static let netCols = 224 // NET_CHART_W
@@ -151,6 +157,11 @@ final class MirrorView: NSView {
             ctx.restoreGState()
             return
         }
+        if pomodoroMode {
+            drawPomodoroScene()
+            ctx.restoreGState()
+            return
+        }
 
         // square quota ring: margin 4, thickness 2, clockwise from top-left
         let m: CGFloat = 4, t: CGFloat = 2
@@ -172,12 +183,12 @@ final class MirrorView: NSView {
         seg = min(remaining, side)
         if seg > 0 { NSRect(x: x0, y: 240 - m - seg, width: t, height: seg).fill() }     // left
 
-        // sprite, 10% larger and anchored above the quota labels
+        // sprite, 10% larger and centered on the display
         if !frames.isEmpty {
             let img = frames[min(frameIdx, frames.count - 1)]
             let displayW = CGFloat(spriteW) * 1.1
             let displayH = CGFloat(spriteH) * 1.1
-            let rect = CGRect(x: 120 - displayW / 2, y: 180 - displayH,
+            let rect = CGRect(x: 120 - displayW / 2, y: 120 - displayH / 2,
                               width: displayW, height: displayH)
             ctx.saveGState()
             ctx.interpolationQuality = .none
@@ -381,6 +392,76 @@ final class MirrorView: NSView {
             ])
     }
 
+    private func drawPomodoroScene() {
+        let focus = pomodoroPhase != "break"
+        let activeColor = focus ? NSColor.systemRed : NSColor.systemGreen
+        let ringColor = pomodoroRunning ? activeColor : NSColor(white: 0.25, alpha: 1)
+        let duration = max(1, pomodoroDurationS)
+        let pct = max(0, min(1, Double(pomodoroRemainingS) / Double(duration)))
+        let m: CGFloat = 4, t: CGFloat = 2
+        let side: CGFloat = 240 - 2 * m
+        ringColor.setFill()
+        var remaining = side * 4 * CGFloat(pct)
+        let x0 = m, y0 = m, x1 = 240 - m
+        var segment = min(remaining, side)
+        if segment > 0 { NSRect(x: x0, y: y0, width: segment, height: t).fill() }
+        remaining -= side
+        segment = min(remaining, side)
+        if segment > 0 { NSRect(x: x1 - t, y: y0, width: t, height: segment).fill() }
+        remaining -= side
+        segment = min(remaining, side)
+        if segment > 0 { NSRect(x: x1 - segment, y: 240 - m - t, width: segment, height: t).fill() }
+        remaining -= side
+        segment = min(remaining, side)
+        if segment > 0 { NSRect(x: x0, y: 240 - m - segment, width: t, height: segment).fill() }
+
+        let center = NSMutableParagraphStyle()
+        center.alignment = .center
+        ("\u{756A}\u{8304}\u{949F}" as NSString).draw(
+            in: NSRect(x: 0, y: 17, width: 240, height: 18), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+                .foregroundColor: NSColor.lightGray, .paragraphStyle: center,
+            ])
+
+        NSColor.systemRed.setFill()
+        NSBezierPath(ovalIn: NSRect(x: 99, y: 42, width: 42, height: 42)).fill()
+        NSColor.systemGreen.setFill()
+        let leaves = NSBezierPath()
+        leaves.move(to: NSPoint(x: 120, y: 38))
+        leaves.line(to: NSPoint(x: 113, y: 49))
+        leaves.line(to: NSPoint(x: 127, y: 49))
+        leaves.close()
+        leaves.fill()
+
+        let phase = focus ? "\u{4E13}\u{6CE8}" : "\u{4F11}\u{606F}"
+        (phase as NSString).draw(in: NSRect(x: 0, y: 88, width: 240, height: 18),
+                                 withAttributes: [
+                                    .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+                                    .foregroundColor: activeColor, .paragraphStyle: center,
+                                 ])
+        let minutes = max(0, pomodoroRemainingS) / 60
+        let seconds = max(0, pomodoroRemainingS) % 60
+        let time = String(format: "%02d:%02d", minutes, seconds)
+        (time as NSString).draw(in: NSRect(x: 0, y: 110, width: 240, height: 52),
+                                withAttributes: [
+                                    .font: NSFont.monospacedDigitSystemFont(ofSize: 40, weight: .medium),
+                                    .foregroundColor: NSColor.white, .paragraphStyle: center,
+                                ])
+        let state = pomodoroRunning ? "\u{8FDB}\u{884C}\u{4E2D}" : "\u{5DF2}\u{6682}\u{505C}"
+        (state as NSString).draw(in: NSRect(x: 0, y: 174, width: 240, height: 18),
+                                 withAttributes: [
+                                    .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+                                    .foregroundColor: pomodoroRunning ? NSColor.white : NSColor.lightGray,
+                                    .paragraphStyle: center,
+                                 ])
+        let completed = String(format: "%@ %d", "\u{5B8C}\u{6210}", pomodoroCompleted)
+        (completed as NSString).draw(in: NSRect(x: 0, y: 207, width: 240, height: 16),
+                                     withAttributes: [
+                                        .font: NSFont.systemFont(ofSize: 12),
+                                        .foregroundColor: NSColor.lightGray, .paragraphStyle: center,
+                                     ])
+    }
+
     // Stock watchlist, same 54px rows as the firmware: grey name on the left,
     // code on the right, big white price, and colored change.
     private func drawStockScene() {
@@ -451,8 +532,9 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let stockMonitor: StockMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
-    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐", "股票"],
+    private let modeControl = NSSegmentedControl(labels: [],
                                                  trackingMode: .selectOne, target: nil, action: nil)
+    private var selectableModes: [String]
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
     private let brightnessSlider = NSSlider(value: 100, minValue: 0, maxValue: 100,
                                             target: nil, action: nil)
@@ -470,11 +552,14 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var fetchingSlot: String?
 
     init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor,
-         stockMonitor: StockMonitor) {
+         stockMonitor: StockMonitor, enabledOptionalModes: [String]) {
         self.service = service
         self.netMonitor = netMonitor
         self.nowPlaying = nowPlaying
         self.stockMonitor = stockMonitor
+        self.selectableModes = DisplayModeDescriptor.selectableModes(
+            enabledOptionalModes: enabledOptionalModes
+        )
         super.init()
         popover.behavior = .transient
         popover.delegate = self
@@ -487,6 +572,8 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
 
         modeControl.target = self
         modeControl.action = #selector(modeChanged)
+        modeControl.font = NSFont.systemFont(ofSize: 11)
+        configureModeControl()
         statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.alignment = .center
@@ -513,6 +600,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.heightAnchor.constraint(equalToConstant: 288),
             modeControl.topAnchor.constraint(equalTo: mirror.bottomAnchor, constant: 12),
             modeControl.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            modeControl.widthAnchor.constraint(equalToConstant: 288),
             brightnessIcon.centerYAnchor.constraint(equalTo: brightnessSlider.centerYAnchor),
             brightnessIcon.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
             brightnessSlider.topAnchor.constraint(equalTo: modeControl.bottomAnchor, constant: 10),
@@ -527,6 +615,29 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         ])
         vc.view = container
         return vc
+    }
+
+    func updateEnabledFeatures(_ enabledOptionalModes: [String]) {
+        selectableModes = DisplayModeDescriptor.selectableModes(
+            enabledOptionalModes: enabledOptionalModes
+        )
+        configureModeControl()
+        configureSweepTimer()
+    }
+
+    private func configureModeControl() {
+        let selectedMode = lastInfo?.mode
+        modeControl.segmentCount = selectableModes.count
+        let preferredWidth = selectableModes.reduce(0.0) { total, mode in
+            total + (DisplayModeDescriptor.descriptor(for: mode)?.preferredWidth ?? 36)
+        }
+        let widthScale = preferredWidth > 0 ? 288.0 / preferredWidth : 1
+        for (index, mode) in selectableModes.enumerated() {
+            guard let descriptor = DisplayModeDescriptor.descriptor(for: mode) else { continue }
+            modeControl.setLabel(descriptor.segmentTitle, forSegment: index)
+            modeControl.setWidth(descriptor.preferredWidth * widthScale, forSegment: index)
+        }
+        modeControl.selectedSegment = selectedMode.flatMap(selectableModes.firstIndex(of:)) ?? 0
     }
 
     // MARK: - brightness slider
@@ -558,6 +669,15 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        stopTimers()
+    }
+
+    func prepareForSystemSleep() {
+        stopTimers()
+        if popover.isShown { popover.performClose(nil) }
+    }
+
+    private func stopTimers() {
         pollTimer?.invalidate()
         animTimer?.invalidate()
         sweepTimer?.invalidate()
@@ -577,7 +697,13 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         animTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             self?.animTick()
         }
-        // same cadence as the firmware's NET_DRAW_INTERVAL_MS sweep
+        configureSweepTimer()
+    }
+
+    private func configureSweepTimer() {
+        sweepTimer?.invalidate()
+        sweepTimer = nil
+        guard popover.isShown, selectableModes.contains("net") else { return }
         sweepTimer = Timer.scheduledTimer(withTimeInterval: NetSpeedMonitor.sampleInterval,
                                           repeats: true) { [weak self] _ in
             self?.sweepTick()
@@ -607,12 +733,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.applyScene(info)
                 self.ensureSprite(info)
                 self.syncBrightness(info)
-                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3,
-                               "music": 4, "stock": 5][info.mode] ?? 0
-                self.modeControl.selectedSegment = modeIdx
+                self.modeControl.selectedSegment = self.selectableModes.firstIndex(of: info.mode) ?? 0
                 let modeText = info.mode == "auto" ? "自动切换"
                     : info.mode == "net" ? "网速曲线"
-                    : info.mode == "music" ? "音乐播放" : "固定显示"
+                    : info.mode == "music" ? "音乐播放"
+                    : info.mode == "stock" ? "股票行情"
+                    : info.mode == "pomodoro" ? "番茄时钟" : "固定显示"
                 self.statusLabel.stringValue = "\(info.ip) · \(modeText) · 数据 \(info.bridge)"
             case .failure:
                 self.mirror.deviceOK = false
@@ -640,6 +766,17 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         mirror.netMode = info.effective == "net"
         mirror.musicMode = info.effective == "music"
         mirror.stockMode = info.effective == "stock"
+        mirror.pomodoroMode = info.effective == "pomodoro"
+        if mirror.pomodoroMode {
+            mirror.pomodoroPhase = info.pomodoroPhase
+            mirror.pomodoroRunning = info.pomodoroRunning
+            mirror.pomodoroRemainingS = info.pomodoroRemainingS
+            mirror.pomodoroDurationS = info.pomodoroDurationS
+            mirror.pomodoroCompleted = info.pomodoroCompleted
+            mirror.needsInput = false
+            mirror.needsDisplay = true
+            return
+        }
         if mirror.stockMode {
             mirror.stockRows = stockMonitor.snapshot
             mirror.needsDisplay = true
@@ -668,19 +805,19 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 ?? (snap.claude.sessionWindowMin > 0
                     ? 100.0 * Double(snap.claude.sessionMin) / Double(snap.claude.sessionWindowMin) : 0)
             mirror.ringPct = pct
-            mirror.line1 = "5h " + Self.pctText(pct)
-            mirror.line2 = "\u{5468}\u{989D}\u{5EA6} " + Self.pctText(snap.claude.sevenDayPct)
+            mirror.line1 = "5H " + Self.pctText(pct)
+            mirror.line2 = "\u{5468} " + Self.pctText(snap.claude.sevenDayPct)
             mirror.needsInput = snap.claude.needsInput
         } else {
             // Codex may only have a weekly window now (5h limit dropped):
             // ring + single line follow whatever windows actually exist.
             mirror.ringPct = snap.codex.primaryPct ?? snap.codex.weeklyPct ?? 0
             if snap.codex.primaryPct == nil, snap.codex.weeklyPct != nil {
-                mirror.line1 = "\u{5468}\u{989D}\u{5EA6} " + Self.pctText(snap.codex.weeklyPct)
+                mirror.line1 = "\u{5468} " + Self.pctText(snap.codex.weeklyPct)
                 mirror.line2 = ""
             } else {
-                mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
-                mirror.line2 = "\u{5468}\u{989D}\u{5EA6} " + Self.pctText(snap.codex.weeklyPct)
+                mirror.line1 = "5H " + Self.pctText(snap.codex.primaryPct)
+                mirror.line2 = "\u{5468} " + Self.pctText(snap.codex.weeklyPct)
             }
             mirror.needsInput = snap.codex.needsInput
         }
@@ -693,6 +830,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     private func ensureSprite(_ info: DeviceInfo) {
+        guard !["net", "music", "stock", "pomodoro"].contains(info.effective) else { return }
         let slot = info.showing == "codex" ? "codex" : "claude"
         let w = slot == "claude" ? info.claudeW : info.codexW
         let h = slot == "claude" ? info.claudeH : info.codexH
@@ -724,7 +862,8 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var flashCounter = 0
 
     private func animTick() {
-        guard let info = lastInfo, !mirror.netMode else { return }
+        guard let info = lastInfo, !mirror.netMode, !mirror.musicMode,
+              !mirror.stockMode, !mirror.pomodoroMode else { return }
 
         // ~400ms red-border flash while an approval is pending (device cadence)
         if mirror.needsInput {
@@ -752,7 +891,8 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func modeChanged() {
-        let mode = ["auto", "claude", "codex", "net", "music", "stock"][max(0, modeControl.selectedSegment)]
+        guard selectableModes.indices.contains(modeControl.selectedSegment) else { return }
+        let mode = selectableModes[modeControl.selectedSegment]
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }

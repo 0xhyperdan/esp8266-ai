@@ -25,6 +25,7 @@ final class NowPlayingMonitor {
     private var _coverRGB565 = Data()
     private var lastArtworkHash = 0
     private var helperRunning = false
+    private(set) var isRunning = false
     // Pre-rendered title/artist strip for the device. The ESP8266's built-in
     // fonts are ASCII-only, so CJK titles drew as nothing — instead the Mac
     // renders the text with real system fonts into a 232x44 RGB565 bitmap
@@ -68,10 +69,19 @@ final class NowPlayingMonitor {
     }
 
     func start() {
+        guard !isRunning else { return }
+        isRunning = true
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.poll()
         }
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        isRunning = false
+        timer?.invalidate()
+        timer = nil
     }
 
     func jsonData() -> Data {
@@ -160,6 +170,7 @@ final class NowPlayingMonitor {
     }
 
     private func poll() {
+        guard isRunning else { return }
         lock.lock()
         if helperRunning {
             lock.unlock()
@@ -172,11 +183,12 @@ final class NowPlayingMonitor {
             let result = Self.runProbe()
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                if let result {
+                if self.isRunning, let result {
                     self.applyProbe(result)
-                } else if let getNowPlayingInfo = self.getNowPlayingInfo {
+                } else if self.isRunning, let getNowPlayingInfo = self.getNowPlayingInfo {
                     getNowPlayingInfo(.main) { [weak self] info in
-                        self?.apply(info: info ?? [:])
+                        guard let self = self, self.isRunning else { return }
+                        self.apply(info: info ?? [:])
                     }
                 }
                 self.lock.lock()

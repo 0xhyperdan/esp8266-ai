@@ -9,23 +9,38 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let service: StatusService
     private let usage: UsageFetcher
     private let port: UInt16
+    private let featurePreferences: FeaturePreferences
+    private let featureConfigurationChanged: () -> Void
     private let controlMenu = NSMenu()
     private let mirrorPopover: MirrorPopoverController
 
     private let claudeUsageItem = NSMenuItem(title: "Claude …", action: nil, keyEquivalent: "")
     private let codexUsageItem = NSMenuItem(title: "Codex …", action: nil, keyEquivalent: "")
     private let deviceInfoItem = NSMenuItem(title: "设备：未设置", action: nil, keyEquivalent: "")
+    private let pomodoroStatusItem = NSMenuItem(title: "\u{756A}\u{8304}\u{65F6}\u{949F}",
+                                                action: nil, keyEquivalent: "")
+    private let pomodoroToggleItem = NSMenuItem(title: "\u{5F00}\u{59CB}",
+                                                action: nil, keyEquivalent: "")
     private var modeItems: [String: NSMenuItem] = [:]
+    private var featureToggleItems: [String: NSMenuItem] = [:]
+    private var featureSpecificItems: [String: NSMenuItem] = [:]
+    private var latestDeviceInfo: DeviceInfo?
 
     init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
-         nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor, port: UInt16) {
+         nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor, port: UInt16,
+         featurePreferences: FeaturePreferences = .shared,
+         featureConfigurationChanged: @escaping () -> Void = {}) {
         self.service = service
         self.usage = usage
         self.port = port
+        self.featurePreferences = featurePreferences
+        self.featureConfigurationChanged = featureConfigurationChanged
         self.mirrorPopover = MirrorPopoverController(service: service, netMonitor: netMonitor,
-                                                     nowPlaying: nowPlaying, stockMonitor: stockMonitor)
+                                                     nowPlaying: nowPlaying, stockMonitor: stockMonitor,
+                                                     enabledOptionalModes: featurePreferences.enabledOptionalModes)
         super.init()
         buildMenu()
+        applyFeatureConfiguration()
         if let button = statusItem.button {
             button.image = Self.retroMacIcon()
             button.imagePosition = .imageOnly
@@ -33,6 +48,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+    }
+
+    func systemWillSleep() {
+        mirrorPopover.prepareForSystemSleep()
+    }
+
+    func systemDidWake() {
+        refreshDeviceSection()
     }
 
     static func retroMacIcon() -> NSImage {
@@ -105,13 +128,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(makeItem(OTAUpdateController.menuTitle, #selector(openFirmwareUpdater)))
 
         let displayMenu = NSMenu()
-        for (title, mode) in [("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
-                              ("固定 Codex", "codex"), ("网速曲线", "net"),
-                              ("音乐播放", "music"), ("股票行情", "stock")] {
-            let item = NSMenuItem(title: title, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
+        for descriptor in DisplayModeDescriptor.all {
+            let item = NSMenuItem(title: descriptor.menuTitle,
+                                  action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = mode
-            modeItems[mode] = item
+            item.representedObject = descriptor.mode
+            modeItems[descriptor.mode] = item
             displayMenu.addItem(item)
         }
         let displayItem = NSMenuItem(title: "屏幕显示", action: nil, keyEquivalent: "")
@@ -119,7 +141,47 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(displayItem)
         // (屏幕亮度在左键弹出的镜像页底部，做成滑条了)
 
-        menu.addItem(makeItem("设置自选股…", #selector(setStockSymbols)))
+        let featureMenu = NSMenu()
+        for descriptor in DisplayModeDescriptor.configurable {
+            let item = NSMenuItem(title: descriptor.menuTitle,
+                                  action: #selector(toggleFeature(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = descriptor.mode
+            featureToggleItems[descriptor.mode] = item
+            featureMenu.addItem(item)
+        }
+        let featureItem = NSMenuItem(title: "\u{529F}\u{80FD}\u{914D}\u{7F6E}",
+                                     action: nil, keyEquivalent: "")
+        featureItem.submenu = featureMenu
+        menu.addItem(featureItem)
+
+        let pomodoroMenu = NSMenu()
+        pomodoroStatusItem.isEnabled = false
+        pomodoroMenu.addItem(pomodoroStatusItem)
+        pomodoroToggleItem.target = self
+        pomodoroToggleItem.action = #selector(controlPomodoro(_:))
+        pomodoroToggleItem.representedObject = "toggle"
+        pomodoroMenu.addItem(pomodoroToggleItem)
+        for (title, action) in [("\u{91CD}\u{7F6E}\u{672C}\u{9636}\u{6BB5}", "reset"),
+                                ("\u{8DF3}\u{8FC7}\u{672C}\u{9636}\u{6BB5}", "skip")] {
+            let item = NSMenuItem(title: title, action: #selector(controlPomodoro(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = action
+            pomodoroMenu.addItem(item)
+        }
+        pomodoroMenu.addItem(.separator())
+        pomodoroMenu.addItem(makeItem("\u{8BBE}\u{7F6E}\u{65F6}\u{957F}…",
+                                      #selector(configurePomodoro)))
+        let pomodoroItem = NSMenuItem(title: "\u{756A}\u{8304}\u{65F6}\u{949F}",
+                                      action: nil, keyEquivalent: "")
+        pomodoroItem.submenu = pomodoroMenu
+        featureSpecificItems["pomodoro"] = pomodoroItem
+        menu.addItem(pomodoroItem)
+
+        let stockItem = makeItem("设置自选股…", #selector(setStockSymbols))
+        featureSpecificItems["stock"] = stockItem
+        menu.addItem(stockItem)
 
         menu.addItem(makeItem("更换桌宠动画…（petdex）", #selector(openPetPicker)))
 
@@ -151,21 +213,22 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     // MARK: - refresh
 
     func menuWillOpen(_ menu: NSMenu) {
+        applyFeatureConfiguration()
         usage.refresh()
         refreshUsageLines()
         refreshDeviceSection()
     }
 
     private func refreshUsageLines() {
-        claudeUsageItem.title = Self.usageLine(name: "Claude", u: usage.claude, weeklyLabel: "7天")
-        codexUsageItem.title = Self.usageLine(name: "Codex", u: usage.codex, weeklyLabel: "周")
+        claudeUsageItem.title = Self.usageLine(name: "Claude", u: usage.claude, weeklyLabel: "\u{5468}")
+        codexUsageItem.title = Self.usageLine(name: "Codex", u: usage.codex, weeklyLabel: "\u{5468}")
     }
 
     private static func usageLine(name: String, u: ProviderUsage, weeklyLabel: String) -> String {
         if let err = u.error, u.primaryPct == nil { return "\(name)：\(err)" }
         var parts: [String] = []
         if let p = u.primaryPct {
-            var s = "5h \(Int(p))%"
+            var s = "5H \(Int(p))%"
             if let m = u.primaryResetMin { s += "（\(fmtMin(m))后重置）" }
             parts.append(s)
         }
@@ -185,26 +248,34 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     private func refreshDeviceSection() {
         let host = DeviceClient.host
-        guard !host.isEmpty else {
-            deviceInfoItem.title = "设备：未设置地址"
-            modeItems.values.forEach { $0.state = .off }
-            return
-        }
-        deviceInfoItem.title = "设备：\(host)（连接中…）"
+        deviceInfoItem.title = host.isEmpty ? "设备：正在检查 USB…" : "设备：\(host)（连接中…）"
         DeviceClient.fetchInfo { [weak self] result in
             guard let self = self else { return }
             switch result {
             case let .success(info):
+                if DisplayModeDescriptor.descriptor(for: info.mode)?.isConfigurable == true,
+                   !self.featurePreferences.isEnabled(info.mode) {
+                    DeviceClient.setDisplayMode("auto") { [weak self] _ in
+                        self?.refreshDeviceSection()
+                    }
+                    return
+                }
+                self.latestDeviceInfo = info
                 let sprites = [info.claudeCustomSprite ? "C:自定义" : "C:默认",
                                info.codexCustomSprite ? "X:自定义" : "X:默认"]
                 let showing = info.mode == "net" ? "网速"
                     : info.mode == "music" ? "音乐"
+                    : info.mode == "stock" ? "股票"
+                    : info.mode == "pomodoro" ? "番茄钟"
                     : (info.showing == "claude" ? "Claude" : "Codex")
                 self.deviceInfoItem.title =
                     "设备：\(info.ip) · 正在显示 \(showing) · \(sprites.joined(separator: " "))"
                 for (mode, item) in self.modeItems { item.state = mode == info.mode ? .on : .off }
+                self.updatePomodoroMenu(info)
             case .failure:
-                self.deviceInfoItem.title = "设备：\(host)（无法连接）"
+                self.latestDeviceInfo = nil
+                self.deviceInfoItem.title = host.isEmpty ? "设备：未设置地址或 USB 未连接"
+                    : "设备：\(host)（无法连接）"
                 self.modeItems.values.forEach { $0.state = .off }
                 // self-heal: the device may have moved to a new DHCP address;
                 // if it recently polled us from a different IP, adopt that.
@@ -219,6 +290,17 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 }
             }
         }
+    }
+
+    private func updatePomodoroMenu(_ info: DeviceInfo) {
+        let phase = info.pomodoroPhase == "break" ? "\u{4F11}\u{606F}" : "\u{4E13}\u{6CE8}"
+        let minutes = max(0, info.pomodoroRemainingS) / 60
+        let seconds = max(0, info.pomodoroRemainingS) % 60
+        let state = info.pomodoroRunning ? "\u{8FDB}\u{884C}\u{4E2D}" : "\u{5DF2}\u{6682}\u{505C}"
+        pomodoroStatusItem.title = String(format: "%@ %02d:%02d · %@ · %@ %d",
+                                          phase, minutes, seconds, state,
+                                          "\u{5B8C}\u{6210}", info.pomodoroCompleted)
+        pomodoroToggleItem.title = info.pomodoroRunning ? "\u{6682}\u{505C}" : "\u{5F00}\u{59CB}"
     }
 
     // MARK: - pairing
@@ -243,6 +325,33 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     // MARK: - actions
+
+    private func applyFeatureConfiguration() {
+        for descriptor in DisplayModeDescriptor.configurable {
+            let enabled = featurePreferences.isEnabled(descriptor.mode)
+            featureToggleItems[descriptor.mode]?.state = enabled ? .on : .off
+            modeItems[descriptor.mode]?.isHidden = !enabled
+            featureSpecificItems[descriptor.mode]?.isHidden = !enabled
+        }
+        mirrorPopover.updateEnabledFeatures(featurePreferences.enabledOptionalModes)
+    }
+
+    @objc private func toggleFeature(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? String else { return }
+        let enabled = !featurePreferences.isEnabled(mode)
+        featurePreferences.setEnabled(enabled, for: mode)
+        applyFeatureConfiguration()
+        featureConfigurationChanged()
+
+        guard !enabled, latestDeviceInfo?.mode == mode else { return }
+        DeviceClient.setDisplayMode("auto") { [weak self] error in
+            if let error = error {
+                Self.toast("\u{5207}\u{6362}\u{5931}\u{8D25}", error.localizedDescription)
+            } else {
+                self?.refreshDeviceSection()
+            }
+        }
+    }
 
     @objc private func refreshAction() {
         usage.refresh()
@@ -284,6 +393,58 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         DeviceClient.setDisplayMode(mode) { [weak self] error in
             if let error = error {
                 Self.toast("切换失败", error.localizedDescription)
+            } else {
+                self?.refreshDeviceSection()
+            }
+        }
+    }
+
+    @objc private func controlPomodoro(_ sender: NSMenuItem) {
+        guard let action = sender.representedObject as? String else { return }
+        DeviceClient.controlPomodoro(action) { [weak self] error in
+            if let error = error {
+                Self.toast("\u{64CD}\u{4F5C}\u{5931}\u{8D25}", error.localizedDescription)
+            } else {
+                self?.refreshDeviceSection()
+            }
+        }
+    }
+
+    @objc private func configurePomodoro() {
+        let info = latestDeviceInfo
+        let alert = NSAlert()
+        alert.messageText = "\u{8BBE}\u{7F6E}\u{756A}\u{8304}\u{65F6}\u{949F}"
+        alert.informativeText = "\u{4FDD}\u{5B58}\u{540E}\u{4F1A}\u{91CD}\u{7F6E}\u{5F53}\u{524D}\u{8BA1}\u{65F6}\u{FF0C}\u{5E76}\u{5207}\u{6362}\u{5230}\u{4E13}\u{6CE8}\u{9636}\u{6BB5}\u{3002}"
+        let focusInput = NSTextField(string: String(info?.pomodoroFocusMinutes ?? 25))
+        let breakInput = NSTextField(string: String(info?.pomodoroBreakMinutes ?? 5))
+        let focusRow = NSStackView(views: [NSTextField(labelWithString: "\u{4E13}\u{6CE8}\u{5206}\u{949F}"),
+                                           focusInput])
+        let breakRow = NSStackView(views: [NSTextField(labelWithString: "\u{4F11}\u{606F}\u{5206}\u{949F}"),
+                                           breakInput])
+        for row in [focusRow, breakRow] {
+            row.orientation = .horizontal
+            row.distribution = .fillEqually
+            row.spacing = 10
+        }
+        let stack = NSStackView(views: [focusRow, breakRow])
+        stack.orientation = .vertical
+        stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 260, height: 56)
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "\u{4FDD}\u{5B58}")
+        alert.addButton(withTitle: "\u{53D6}\u{6D88}")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let focusMinutes = Int(focusInput.stringValue), (1...120).contains(focusMinutes),
+              let breakMinutes = Int(breakInput.stringValue), (1...60).contains(breakMinutes) else {
+            Self.toast("\u{65F6}\u{957F}\u{65E0}\u{6548}",
+                       "\u{4E13}\u{6CE8}\u{9700}\u{4E3A} 1–120 \u{5206}\u{949F}\u{FF0C}\u{4F11}\u{606F}\u{9700}\u{4E3A} 1–60 \u{5206}\u{949F}\u{3002}")
+            return
+        }
+        DeviceClient.controlPomodoro("configure", focusMinutes: focusMinutes,
+                                     breakMinutes: breakMinutes) { [weak self] error in
+            if let error = error {
+                Self.toast("\u{4FDD}\u{5B58}\u{5931}\u{8D25}", error.localizedDescription)
             } else {
                 self?.refreshDeviceSection()
             }

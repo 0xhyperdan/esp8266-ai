@@ -40,6 +40,8 @@ final class StockMonitor {
     private let lock = NSLock()
     private var rows: [Row] = []
     private var timer: Timer?
+    private var activeTask: URLSessionDataTask?
+    private(set) var isRunning = false
 
     // The device's font is ASCII-only, so CJK company names go down as Mac-
     // rendered RGB565 strips (same trick as the music title strip): one
@@ -52,10 +54,21 @@ final class StockMonitor {
     private var lastNamesKey = ""
 
     func start() {
+        guard !isRunning else { return }
+        isRunning = true
         fetch()
         timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.fetch()
         }
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        isRunning = false
+        timer?.invalidate()
+        timer = nil
+        activeTask?.cancel()
+        activeTask = nil
     }
 
     var snapshot: [Row] {
@@ -144,6 +157,7 @@ final class StockMonitor {
     }
 
     private func fetch() {
+        guard isRunning else { return }
         let symbols = Self.symbols
         guard !symbols.isEmpty,
               let url = URL(string: "http://qt.gtimg.cn/q=" + symbols.joined(separator: ",")) else {
@@ -152,18 +166,25 @@ final class StockMonitor {
         }
         var req = URLRequest(url: url)
         req.timeoutInterval = 5
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+        activeTask?.cancel()
+        let task = URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
             guard let self = self, let data = data else { return }
             let gbk = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
                 CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
             let text = String(data: data, encoding: gbk)
                 ?? String(data: data, encoding: .isoLatin1) ?? ""
             let parsed = Self.parse(text: text, order: symbols)
-            self.lock.lock()
-            self.rows = parsed
-            self.lock.unlock()
-            self.renderNamesIfNeeded(parsed)
-        }.resume()
+            DispatchQueue.main.async {
+                guard self.isRunning else { return }
+                self.activeTask = nil
+                self.lock.lock()
+                self.rows = parsed
+                self.lock.unlock()
+                self.renderNamesIfNeeded(parsed)
+            }
+        }
+        activeTask = task
+        task.resume()
     }
 
     /// Response is lines of `v_sh600519="1~贵州茅台~600519~1212.00~...";`

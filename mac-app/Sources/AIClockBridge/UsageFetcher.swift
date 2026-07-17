@@ -27,6 +27,9 @@ final class UsageFetcher {
     private var timer: Timer?
     private var fetching = false
     private var nextAllowedFetch = Date.distantPast // throttle + 429 backoff
+    private(set) var isAutoRefreshRunning = false
+    private var requestsSuspended = true
+    private var activeTasks: [UUID: URLSessionDataTask] = [:]
 
     private let minFetchInterval: TimeInterval = 60
     private let rateLimitBackoff: TimeInterval = 300
@@ -38,15 +41,33 @@ final class UsageFetcher {
     var onUpdate: (() -> Void)?
 
     func startAutoRefresh(interval: TimeInterval = 120) {
+        guard !isAutoRefreshRunning else { return }
+        isAutoRefreshRunning = true
+        lock.lock()
+        requestsSuspended = false
+        lock.unlock()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
     }
 
+    func stopAutoRefresh() {
+        guard isAutoRefreshRunning else { return }
+        isAutoRefreshRunning = false
+        timer?.invalidate()
+        timer = nil
+        lock.lock()
+        requestsSuspended = true
+        let tasks = Array(activeTasks.values)
+        activeTasks.removeAll()
+        lock.unlock()
+        tasks.forEach { $0.cancel() }
+    }
+
     func refresh() {
         lock.lock()
-        let blocked = fetching || Date() < nextAllowedFetch
+        let blocked = requestsSuspended || fetching || Date() < nextAllowedFetch
         if !blocked { fetching = true }
         lock.unlock()
         if blocked { return }
@@ -94,7 +115,7 @@ final class UsageFetcher {
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
 
-        let resp = Self.syncRequest(req)
+        let resp = syncRequest(req)
         guard let data = resp.data else {
             usage.error = "Claude 用量请求失败：\(resp.error ?? "无响应")"
             return usage
@@ -169,7 +190,7 @@ final class UsageFetcher {
             req.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id")
         }
 
-        let resp = Self.syncRequest(req)
+        let resp = syncRequest(req)
         guard let data = resp.data else {
             usage.error = "Codex 用量请求失败：\(resp.error ?? "无响应")"
             return usage
@@ -255,17 +276,27 @@ final class UsageFetcher {
         return max(0, Int((d.timeIntervalSince1970 - now) / 60))
     }
 
-    private static func syncRequest(_ req: URLRequest) -> (data: Data?, code: Int, error: String?) {
+    private func syncRequest(_ req: URLRequest) -> (data: Data?, code: Int, error: String?) {
         let sem = DispatchSemaphore(value: 0)
+        let requestID = UUID()
         var result: (data: Data?, code: Int, error: String?) = (nil, 0, "无响应")
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        let task = URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
             if let data = data, let http = resp as? HTTPURLResponse {
                 result = (data, http.statusCode, nil)
             } else {
                 result = (nil, 0, err?.localizedDescription ?? "无响应")
             }
+            self?.lock.lock()
+            self?.activeTasks.removeValue(forKey: requestID)
+            self?.lock.unlock()
             sem.signal()
-        }.resume()
+        }
+        lock.lock()
+        let suspended = requestsSuspended
+        if !suspended { activeTasks[requestID] = task }
+        lock.unlock()
+        guard !suspended else { return (nil, 0, "已暂停") }
+        task.resume()
         sem.wait()
         return result
     }

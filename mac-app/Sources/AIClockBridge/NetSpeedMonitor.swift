@@ -22,14 +22,27 @@ final class NetSpeedMonitor {
     private var lastTx: UInt64?
     private var lastAt: Date?
     private var timer: Timer?
+    private(set) var isRunning = false
 
     private let capacity = 720 // 3 minutes at 4Hz
 
     func start() {
+        guard !isRunning else { return }
+        isRunning = true
         sampleNow()
         timer = Timer.scheduledTimer(withTimeInterval: Self.sampleInterval, repeats: true) { [weak self] _ in
             self?.sampleNow()
         }
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        isRunning = false
+        timer?.invalidate()
+        timer = nil
+        lastRx = nil
+        lastTx = nil
+        lastAt = nil
     }
 
     /// Most recent `count` samples, oldest first (padded semantics up to caller).
