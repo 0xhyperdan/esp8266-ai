@@ -31,10 +31,17 @@ final class StockMonitor {
 
     /// Market prefix must be lowercase but the US ticker must stay UPPERCASE
     /// ("usaapl" gets v_pv_none_match back), so normalize both halves.
+    /// HK codes must be zero-padded to 5 digits ("hk1810" -> "hk01810",
+    /// otherwise Tencent returns v_pv_none_match).
     static func normalize(_ s: String) -> String {
         let t = s.trimmingCharacters(in: .whitespaces)
         guard t.count > 2 else { return t.lowercased() }
-        return t.prefix(2).lowercased() + String(t.dropFirst(2)).uppercased()
+        let prefix = t.prefix(2).lowercased()
+        var body = String(t.dropFirst(2)).uppercased()
+        if prefix == "hk", body.count < 5, body.allSatisfy({ $0.isNumber }) {
+            body = String(repeating: "0", count: 5 - body.count) + body
+        }
+        return prefix + body
     }
 
     private let lock = NSLock()

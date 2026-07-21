@@ -32,11 +32,17 @@ sealed class StockMonitor
 
     /// Market prefix must be lowercase but the US ticker must stay UPPERCASE
     /// ("usaapl" gets v_pv_none_match back), so normalize both halves.
+    /// HK codes must be zero-padded to 5 digits ("hk1810" -> "hk01810",
+    /// otherwise Tencent returns v_pv_none_match).
     static string Normalize(string s)
     {
         var t = s.Trim();
         if (t.Length <= 2) return t.ToLowerInvariant();
-        return t[..2].ToLowerInvariant() + t[2..].ToUpperInvariant();
+        var prefix = t[..2].ToLowerInvariant();
+        var body = t[2..].ToUpperInvariant();
+        if (prefix == "hk" && body.Length < 5 && body.All(char.IsDigit))
+            body = body.PadLeft(5, '0');
+        return prefix + body;
     }
 
     static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(5) };
