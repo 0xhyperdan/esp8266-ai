@@ -3,7 +3,7 @@ import Foundation
 
 // Watchlist quotes from Tencent's free endpoint (no key, realtime for A-shares,
 // supports sh/sz/hk/us prefixes in one batch request, GBK-encoded response):
-//   http://qt.gtimg.cn/q=sh600519,hk00700,usAAPL
+//   https://qt.gtimg.cn/q=sh600519,hk00700,usAAPL
 // Polled every 5s; the device and the mirror both render the pre-formatted
 // strings so the firmware stays dumb. The ASCII-only firmware draws the code
 // itself and receives each CJK company name as an RGB565 strip from the Mac.
@@ -166,8 +166,7 @@ final class StockMonitor {
     private func fetch() {
         guard isRunning else { return }
         let symbols = Self.symbols
-        guard !symbols.isEmpty,
-              let url = URL(string: "http://qt.gtimg.cn/q=" + symbols.joined(separator: ",")) else {
+        guard let url = Self.quoteURL(for: symbols) else {
             lock.lock(); rows = []; lock.unlock()
             return
         }
@@ -192,6 +191,11 @@ final class StockMonitor {
         }
         activeTask = task
         task.resume()
+    }
+
+    static func quoteURL(for symbols: [String]) -> URL? {
+        guard !symbols.isEmpty else { return nil }
+        return URL(string: "https://qt.gtimg.cn/q=" + symbols.joined(separator: ","))
     }
 
     /// Response is lines of `v_sh600519="1~贵州茅台~600519~1212.00~...";`
