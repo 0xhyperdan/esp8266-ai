@@ -99,6 +99,18 @@ cd ../mac-app && AICLOCK_SERIAL_PORT=/dev/cu.usbserial-XXXX swift run
 脚本会构建 release 版本并安装为用户级 LaunchAgent；日志写入
 `~/Library/Logs/AIClockBridge/`。更新源码后重新运行安装脚本即可部署新版本。
 
+希望像普通应用一样手动双击启动时，可以构建并安装 `AIClockBridge.app`：
+
+```bash
+cd mac-app
+./build-app.sh
+./install-app.sh
+open "$HOME/Applications/AIClockBridge.app"
+```
+
+应用图标使用本 README 顶部的笑脸图标。安装脚本会卸载旧的
+`local.AIClockBridge` LaunchAgent，避免自动启动版本和手动启动版本重复运行。
+
 纯 USB 模式也支持菜单栏里的「更换桌宠动画…」。选择宠物和目标槽位后，Mac 会自动通过
 串口分块上传，设备校验后立即应用；动画保存在 LittleFS 中，重启后仍然有效。
 

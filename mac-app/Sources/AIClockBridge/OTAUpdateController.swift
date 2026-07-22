@@ -182,6 +182,6 @@ final class OTAUpdateController: NSObject {
     }
 
     fileprivate static func text(_ key: String, _ fallback: String) -> String {
-        Bundle.module.localizedString(forKey: key, value: fallback, table: nil)
+        Bundle.aiClockResources.localizedString(forKey: key, value: fallback, table: nil)
     }
 }
