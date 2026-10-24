@@ -5,20 +5,10 @@ protocol RuntimeActivity: AnyObject {
     func stop()
 }
 
-extension NetSpeedMonitor: RuntimeActivity {}
 extension NowPlayingMonitor: RuntimeActivity {}
 extension StockMonitor: RuntimeActivity {}
+extension WeatherMonitor: RuntimeActivity {}
 extension SerialLink: RuntimeActivity {}
-
-extension UsageFetcher: RuntimeActivity {
-    func start() {
-        startAutoRefresh()
-    }
-
-    func stop() {
-        stopAutoRefresh()
-    }
-}
 
 final class AppRuntimeController {
     private let featurePreferences: FeaturePreferences

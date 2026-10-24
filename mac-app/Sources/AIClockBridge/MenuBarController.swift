@@ -2,42 +2,44 @@ import AppKit
 
 // Menu-bar item: a retro Macintosh icon drawn with a fixed black background.
 // Left click opens a live mirror of the ESP8266
-// screen (MirrorPopover); right click opens the control menu with usage
-// meters and device remote control. No quota text lives in the bar itself.
+// screen (MirrorPopover); right click opens the control menu with device and
+// dashboard controls.
 final class MenuBarController: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    private let service: StatusService
-    private let usage: UsageFetcher
     private let port: UInt16
     private let featurePreferences: FeaturePreferences
     private let featureConfigurationChanged: () -> Void
+    private let weatherMonitor: WeatherMonitor
     private let controlMenu = NSMenu()
     private let mirrorPopover: MirrorPopoverController
 
-    private let claudeUsageItem = NSMenuItem(title: "Claude …", action: nil, keyEquivalent: "")
-    private let codexUsageItem = NSMenuItem(title: "Codex …", action: nil, keyEquivalent: "")
     private let deviceInfoItem = NSMenuItem(title: "设备：未设置", action: nil, keyEquivalent: "")
-    private let pomodoroStatusItem = NSMenuItem(title: "\u{756A}\u{8304}\u{65F6}\u{949F}",
-                                                action: nil, keyEquivalent: "")
-    private let pomodoroToggleItem = NSMenuItem(title: "\u{5F00}\u{59CB}",
-                                                action: nil, keyEquivalent: "")
+    private let deviceSelectionMenu = NSMenu()
+    private let autoRotateItem = NSMenuItem(title: "自动旋转屏幕", action: nil, keyEquivalent: "")
+    private let printerSettingsItem = NSMenuItem(title: "打印机设置…", action: nil, keyEquivalent: "")
+    private let weatherLocationItem = NSMenuItem(
+        title: "\u{5929}\u{6C14}\u{5730}\u{533A}\u{2026}",
+        action: nil,
+        keyEquivalent: ""
+    )
     private var modeItems: [String: NSMenuItem] = [:]
     private var featureToggleItems: [String: NSMenuItem] = [:]
     private var featureSpecificItems: [String: NSMenuItem] = [:]
     private var latestDeviceInfo: DeviceInfo?
 
-    init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
-         nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor, port: UInt16,
+    init(nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor,
+         weatherMonitor: WeatherMonitor, port: UInt16,
          featurePreferences: FeaturePreferences = .shared,
          featureConfigurationChanged: @escaping () -> Void = {}) {
-        self.service = service
-        self.usage = usage
         self.port = port
         self.featurePreferences = featurePreferences
         self.featureConfigurationChanged = featureConfigurationChanged
-        self.mirrorPopover = MirrorPopoverController(service: service, netMonitor: netMonitor,
-                                                     nowPlaying: nowPlaying, stockMonitor: stockMonitor,
-                                                     enabledOptionalModes: featurePreferences.enabledOptionalModes)
+        self.weatherMonitor = weatherMonitor
+        self.mirrorPopover = MirrorPopoverController(nowPlaying: nowPlaying,
+                                                     stockMonitor: stockMonitor,
+                                                     weatherMonitor: weatherMonitor,
+                                                     enabledOptionalModes:
+                                                        featurePreferences.enabledOptionalModes)
         super.init()
         buildMenu()
         applyFeatureConfiguration()
@@ -113,18 +115,21 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let menu = controlMenu
         menu.delegate = self
 
-        claudeUsageItem.isEnabled = false
-        codexUsageItem.isEnabled = false
-        menu.addItem(claudeUsageItem)
-        menu.addItem(codexUsageItem)
-        menu.addItem(.separator())
-
         deviceInfoItem.isEnabled = false
         menu.addItem(deviceInfoItem)
 
+        let deviceSelectionItem = NSMenuItem(title: "选择设备", action: nil, keyEquivalent: "")
+        deviceSelectionItem.submenu = deviceSelectionMenu
+        menu.addItem(deviceSelectionItem)
+
         menu.addItem(makeItem("自动查找并配对设备", #selector(autoPairAction)))
-        menu.addItem(makeItem("设置设备地址…", #selector(setDeviceAddress)))
+        menu.addItem(makeItem("添加设备地址…", #selector(setDeviceAddress)))
+        menu.addItem(makeItem("移除当前设备", #selector(removeCurrentDevice)))
         menu.addItem(makeItem("打开设备网页", #selector(openDevicePage)))
+        printerSettingsItem.target = self
+        printerSettingsItem.action = #selector(openPrinterSettings)
+        printerSettingsItem.isHidden = true
+        menu.addItem(printerSettingsItem)
         menu.addItem(makeItem(OTAUpdateController.menuTitle, #selector(openFirmwareUpdater)))
 
         let displayMenu = NSMenu()
@@ -134,11 +139,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             item.target = self
             item.representedObject = descriptor.mode
             modeItems[descriptor.mode] = item
+            if descriptor.mode == "printer" { item.isHidden = true }
             displayMenu.addItem(item)
         }
         let displayItem = NSMenuItem(title: "屏幕显示", action: nil, keyEquivalent: "")
         displayItem.submenu = displayMenu
         menu.addItem(displayItem)
+        autoRotateItem.target = self
+        autoRotateItem.action = #selector(toggleAutoRotate)
+        autoRotateItem.isHidden = true
+        menu.addItem(autoRotateItem)
         // (屏幕亮度在左键弹出的镜像页底部，做成滑条了)
 
         let featureMenu = NSMenu()
@@ -155,46 +165,18 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         featureItem.submenu = featureMenu
         menu.addItem(featureItem)
 
-        let pomodoroMenu = NSMenu()
-        pomodoroStatusItem.isEnabled = false
-        pomodoroMenu.addItem(pomodoroStatusItem)
-        pomodoroToggleItem.target = self
-        pomodoroToggleItem.action = #selector(controlPomodoro(_:))
-        pomodoroToggleItem.representedObject = "toggle"
-        pomodoroMenu.addItem(pomodoroToggleItem)
-        for (title, action) in [("\u{91CD}\u{7F6E}\u{672C}\u{9636}\u{6BB5}", "reset"),
-                                ("\u{8DF3}\u{8FC7}\u{672C}\u{9636}\u{6BB5}", "skip")] {
-            let item = NSMenuItem(title: title, action: #selector(controlPomodoro(_:)),
-                                  keyEquivalent: "")
-            item.target = self
-            item.representedObject = action
-            pomodoroMenu.addItem(item)
-        }
-        pomodoroMenu.addItem(.separator())
-        pomodoroMenu.addItem(makeItem("\u{8BBE}\u{7F6E}\u{65F6}\u{957F}…",
-                                      #selector(configurePomodoro)))
-        let pomodoroItem = NSMenuItem(title: "\u{756A}\u{8304}\u{65F6}\u{949F}",
-                                      action: nil, keyEquivalent: "")
-        pomodoroItem.submenu = pomodoroMenu
-        featureSpecificItems["pomodoro"] = pomodoroItem
-        menu.addItem(pomodoroItem)
+        let salaryItem = makeItem("设置工资进账…", #selector(configureSalary))
+        featureSpecificItems["salary"] = salaryItem
+        menu.addItem(salaryItem)
 
         let stockItem = makeItem("设置自选股…", #selector(setStockSymbols))
         featureSpecificItems["stock"] = stockItem
         menu.addItem(stockItem)
 
-        menu.addItem(makeItem("更换桌宠动画…（petdex）", #selector(openPetPicker)))
-
-        let resetMenu = NSMenu()
-        for (title, slot) in [("Claude 恢复默认", "claude"), ("Codex 恢复默认", "codex")] {
-            let item = NSMenuItem(title: title, action: #selector(resetSprite(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = slot
-            resetMenu.addItem(item)
-        }
-        let resetItem = NSMenuItem(title: "恢复默认动画", action: nil, keyEquivalent: "")
-        resetItem.submenu = resetMenu
-        menu.addItem(resetItem)
+        weatherLocationItem.target = self
+        weatherLocationItem.action = #selector(configureWeatherLocation)
+        featureSpecificItems["weather"] = weatherLocationItem
+        menu.addItem(weatherLocationItem)
 
         menu.addItem(makeItem("把本机设为设备桥接", #selector(pointBridgeHere)))
         menu.addItem(.separator())
@@ -214,73 +196,68 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         applyFeatureConfiguration()
-        usage.refresh()
-        refreshUsageLines()
+        refreshWeatherLocationItem()
         refreshDeviceSection()
-    }
-
-    private func refreshUsageLines() {
-        claudeUsageItem.title = Self.usageLine(name: "Claude", u: usage.claude, weeklyLabel: "\u{5468}")
-        codexUsageItem.title = Self.usageLine(name: "Codex", u: usage.codex, weeklyLabel: "\u{5468}")
-    }
-
-    private static func usageLine(name: String, u: ProviderUsage, weeklyLabel: String) -> String {
-        if let err = u.error, u.primaryPct == nil { return "\(name)：\(err)" }
-        var parts: [String] = []
-        if let p = u.primaryPct {
-            var s = "5H \(Int(p))%"
-            if let m = u.primaryResetMin { s += "（\(fmtMin(m))后重置）" }
-            parts.append(s)
-        }
-        if let p = u.weeklyPct {
-            var s = "\(weeklyLabel) \(Int(p))%"
-            if let m = u.weeklyResetMin { s += "（\(fmtMin(m))）" }
-            parts.append(s)
-        }
-        return parts.isEmpty ? "\(name)：额度未知" : "\(name)　" + parts.joined(separator: "　")
-    }
-
-    private static func fmtMin(_ min: Int) -> String {
-        if min >= 48 * 60 { return "\(min / (24 * 60))天" }
-        if min >= 60 { return "\(min / 60)h\(min % 60 > 0 ? "\(min % 60)m" : "")" }
-        return "\(min)m"
     }
 
     private func refreshDeviceSection() {
         let host = DeviceClient.host
-        deviceInfoItem.title = host.isEmpty ? "设备：正在检查 USB…" : "设备：\(host)（连接中…）"
+        refreshDeviceSelectionMenu()
+        let addresses = DeviceClient.deviceAddresses
+        let position = addresses.firstIndex(of: host).map { "\($0 + 1)/\(addresses.count)" }
+        deviceInfoItem.title = host.isEmpty ? "设备：正在检查 USB…"
+            : "设备\(position.map { " \($0)" } ?? "")：\(host)（连接中…）"
         DeviceClient.fetchInfo { [weak self] result in
-            guard let self = self else { return }
+            guard let self = self, host == DeviceClient.host else { return }
             switch result {
             case let .success(info):
                 if DisplayModeDescriptor.descriptor(for: info.mode)?.isConfigurable == true,
                    !self.featurePreferences.isEnabled(info.mode) {
-                    DeviceClient.setDisplayMode("auto") { [weak self] _ in
+                    DeviceClient.setDisplayMode("weather") { [weak self] _ in
                         self?.refreshDeviceSection()
                     }
                     return
                 }
                 self.latestDeviceInfo = info
-                let sprites = [info.claudeCustomSprite ? "C:自定义" : "C:默认",
-                               info.codexCustomSprite ? "X:自定义" : "X:默认"]
-                let showing = info.mode == "net" ? "网速"
-                    : info.mode == "music" ? "音乐"
-                    : info.mode == "stock" ? "股票"
-                    : info.mode == "pomodoro" ? "番茄钟"
-                    : (info.showing == "claude" ? "Claude" : "Codex")
+                self.printerSettingsItem.isHidden = !info.printer.supported
+                self.modeItems["printer"]?.isHidden = !info.printer.supported
+                let showing = info.effective == "music" ? "音乐"
+                    : info.effective == "stock" ? "股票"
+                    : info.effective == "weather"
+                        ? "\u{5929}\u{6C14}\u{65F6}\u{949F}"
+                    : info.effective == "printer" ? "打印机状态"
+                    : info.effective == "salary" ? "工资进账" : "天气时钟"
+                var details = ["正在显示 \(showing)"]
+                if info.batterySupported {
+                    if info.batteryPresent {
+                        let charging = info.batteryCharging ? " · 充电中" : ""
+                        details.append("电池 \(info.batteryLevel)%\(charging)")
+                    } else {
+                        details.append("未安装电池")
+                    }
+                }
                 self.deviceInfoItem.title =
-                    "设备：\(info.ip) · 正在显示 \(showing) · \(sprites.joined(separator: " "))"
-                for (mode, item) in self.modeItems { item.state = mode == info.mode ? .on : .off }
-                self.updatePomodoroMenu(info)
+                    "设备\(position.map { " \($0)" } ?? "")：\(info.ip) · " +
+                    details.joined(separator: " · ")
+                let selectedMode = DisplayModeDescriptor.normalizedMode(info.mode)
+                for (mode, item) in self.modeItems {
+                    item.state = mode == selectedMode ? .on : .off
+                }
+                self.autoRotateItem.isHidden = !info.autoRotateSupported
+                self.autoRotateItem.state = info.autoRotateEnabled ? .on : .off
             case .failure:
+                self.printerSettingsItem.isHidden = true
+                self.modeItems["printer"]?.isHidden = true
                 self.latestDeviceInfo = nil
                 self.deviceInfoItem.title = host.isEmpty ? "设备：未设置地址或 USB 未连接"
                     : "设备：\(host)（无法连接）"
                 self.modeItems.values.forEach { $0.state = .off }
-                // self-heal: the device may have moved to a new DHCP address;
-                // if it recently polled us from a different IP, adopt that.
+                self.autoRotateItem.isHidden = true
+                self.autoRotateItem.state = .off
+                // Keep a single-device installation self-healing. With multiple
+                // devices, the latest poll may belong to a different clock.
                 let seen = DeviceClient.lastSeenIP
-                if !seen.isEmpty, !host.hasPrefix(seen) {
+                if addresses.count <= 1, !seen.isEmpty, !host.hasPrefix(seen) {
                     DeviceClient.verifyDevice(ip: seen) { ok in
                         if ok {
                             DeviceClient.host = seen
@@ -292,15 +269,32 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func updatePomodoroMenu(_ info: DeviceInfo) {
-        let phase = info.pomodoroPhase == "break" ? "\u{4F11}\u{606F}" : "\u{4E13}\u{6CE8}"
-        let minutes = max(0, info.pomodoroRemainingS) / 60
-        let seconds = max(0, info.pomodoroRemainingS) % 60
-        let state = info.pomodoroRunning ? "\u{8FDB}\u{884C}\u{4E2D}" : "\u{5DF2}\u{6682}\u{505C}"
-        pomodoroStatusItem.title = String(format: "%@ %02d:%02d · %@ · %@ %d",
-                                          phase, minutes, seconds, state,
-                                          "\u{5B8C}\u{6210}", info.pomodoroCompleted)
-        pomodoroToggleItem.title = info.pomodoroRunning ? "\u{6682}\u{505C}" : "\u{5F00}\u{59CB}"
+    private func refreshDeviceSelectionMenu() {
+        deviceSelectionMenu.removeAllItems()
+        let addresses = DeviceClient.deviceAddresses
+        if addresses.isEmpty {
+            let item = NSMenuItem(title: "未发现设备", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            deviceSelectionMenu.addItem(item)
+            return
+        }
+        for address in addresses {
+            let item = NSMenuItem(title: DeviceClient.displayName(for: address),
+                                  action: #selector(selectDevice(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = address
+            item.state = address == DeviceClient.host ? .on : .off
+            deviceSelectionMenu.addItem(item)
+        }
+    }
+
+    private func refreshWeatherLocationItem() {
+        let configuration = weatherMonitor.locationConfiguration
+        let source = configuration.mode == .automatic
+            ? "\u{81EA}\u{52A8}"
+            : "\u{624B}\u{52A8}"
+        weatherLocationItem.title =
+            "\u{5929}\u{6C14}\u{5730}\u{533A}\u{FF1A}\(configuration.location.city)\u{FF08}\(source)\u{FF09}\u{2026}"
     }
 
     // MARK: - pairing
@@ -315,7 +309,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 self?.refreshDeviceSection()
             } else {
                 Self.toast("未找到设备", """
-                局域网内没有发现 ESP8266 时钟。请确认：
+                局域网内没有发现小屏幕设备。请确认：
                 1. 设备已通电并连上同一个 WiFi（首次使用需通过 AI-Clock-Setup 热点配网）
                 2. 路由器未开启"客户端隔离"
                 """)
@@ -344,7 +338,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         featureConfigurationChanged()
 
         guard !enabled, latestDeviceInfo?.mode == mode else { return }
-        DeviceClient.setDisplayMode("auto") { [weak self] error in
+        DeviceClient.setDisplayMode("weather") { [weak self] error in
             if let error = error {
                 Self.toast("\u{5207}\u{6362}\u{5931}\u{8D25}", error.localizedDescription)
             } else {
@@ -354,15 +348,13 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func refreshAction() {
-        usage.refresh()
-        refreshUsageLines()
         refreshDeviceSection()
     }
 
     @objc private func setDeviceAddress() {
         let alert = NSAlert()
-        alert.messageText = "设备地址"
-        alert.informativeText = "ESP8266 时钟的 IP（设备开机时屏幕上会显示，例如 192.168.1.50）"
+        alert.messageText = "添加设备地址"
+        alert.informativeText = "小屏幕设备的 IP（设备开机时屏幕上会显示，例如 192.168.1.50）"
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
         input.stringValue = DeviceClient.host
         input.placeholderString = "192.168.1.50"
@@ -376,12 +368,41 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
+    @objc private func selectDevice(_ sender: NSMenuItem) {
+        guard let address = sender.representedObject as? String else { return }
+        DeviceClient.selectDevice(address)
+        latestDeviceInfo = nil
+        refreshDeviceSection()
+    }
+
+    @objc private func removeCurrentDevice() {
+        let address = DeviceClient.host
+        guard !address.isEmpty else { return }
+        DeviceClient.removeDevice(address)
+        latestDeviceInfo = nil
+        refreshDeviceSection()
+    }
+
     @objc private func openDevicePage() {
         guard let url = DeviceClient.baseURL else {
             setDeviceAddress()
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openPrinterSettings() {
+        if latestDeviceInfo?.printer.supported == true,
+           latestDeviceInfo?.printer.native == false {
+            PrinterBridgeSettings.show()
+            return
+        }
+        guard latestDeviceInfo?.printer.supported == true,
+              let baseURL = DeviceClient.baseURL else {
+            Self.toast("打印机设置", "请先选择已连接 Wi-Fi 的 ESP32-S3 设备。")
+            return
+        }
+        NSWorkspace.shared.open(baseURL.appendingPathComponent("printer"))
     }
 
     @objc private func openFirmwareUpdater() {
@@ -399,62 +420,93 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func controlPomodoro(_ sender: NSMenuItem) {
-        guard let action = sender.representedObject as? String else { return }
-        DeviceClient.controlPomodoro(action) { [weak self] error in
+    @objc private func toggleAutoRotate() {
+        guard let info = latestDeviceInfo, info.autoRotateSupported else { return }
+        DeviceClient.setAutoRotate(!info.autoRotateEnabled) { [weak self] error in
             if let error = error {
-                Self.toast("\u{64CD}\u{4F5C}\u{5931}\u{8D25}", error.localizedDescription)
+                Self.toast("设置失败", error.localizedDescription)
             } else {
                 self?.refreshDeviceSection()
             }
         }
     }
 
-    @objc private func configurePomodoro() {
+    @objc private func configureSalary() {
         let info = latestDeviceInfo
         let alert = NSAlert()
-        alert.messageText = "\u{8BBE}\u{7F6E}\u{756A}\u{8304}\u{65F6}\u{949F}"
-        alert.informativeText = "\u{4FDD}\u{5B58}\u{540E}\u{4F1A}\u{91CD}\u{7F6E}\u{5F53}\u{524D}\u{8BA1}\u{65F6}\u{FF0C}\u{5E76}\u{5207}\u{6362}\u{5230}\u{4E13}\u{6CE8}\u{9636}\u{6BB5}\u{3002}"
-        let focusInput = NSTextField(string: String(info?.pomodoroFocusMinutes ?? 25))
-        let breakInput = NSTextField(string: String(info?.pomodoroBreakMinutes ?? 5))
-        let focusRow = NSStackView(views: [NSTextField(labelWithString: "\u{4E13}\u{6CE8}\u{5206}\u{949F}"),
-                                           focusInput])
-        let breakRow = NSStackView(views: [NSTextField(labelWithString: "\u{4F11}\u{606F}\u{5206}\u{949F}"),
-                                           breakInput])
-        for row in [focusRow, breakRow] {
+        alert.messageText = "工资进账设置"
+        alert.informativeText = "按中国标准月工作日 21.75 天计算：月薪 ÷ 21.75 ÷ 每日净工作秒数。午休时暂停计薪。"
+
+        let monthlyInput = NSTextField(string: String(format: "%.2f", info?.salaryMonthlyYuan ?? 0))
+        let startInput = NSTextField(string: Self.salaryTimeText(info?.salaryStartMin ?? 9 * 60))
+        let endInput = NSTextField(string: Self.salaryTimeText(info?.salaryEndMin ?? 18 * 60))
+        let lunchStartInput = NSTextField(string: Self.salaryTimeText(info?.salaryLunchStartMin ?? 12 * 60))
+        let lunchEndInput = NSTextField(string: Self.salaryTimeText(info?.salaryLunchEndMin ?? 13 * 60))
+        let rows: [(String, NSTextField)] = [
+            ("月薪（元）", monthlyInput),
+            ("上班时间（HH:mm）", startInput),
+            ("下班时间（HH:mm）", endInput),
+            ("午休开始（HH:mm）", lunchStartInput),
+            ("午休结束（HH:mm）", lunchEndInput),
+        ]
+        let stack = NSStackView(views: rows.map { title, input in
+            let label = NSTextField(labelWithString: title)
+            let row = NSStackView(views: [label, input])
             row.orientation = .horizontal
-            row.distribution = .fillEqually
+            row.distribution = .fill
             row.spacing = 10
-        }
-        let stack = NSStackView(views: [focusRow, breakRow])
+            // NSTextField(string:) 没有 intrinsic size，.fill 行会把输入框压成 0 宽，需钉住宽度
+            label.widthAnchor.constraint(equalToConstant: 132).isActive = true
+            input.widthAnchor.constraint(equalToConstant: 110).isActive = true
+            return row
+        })
         stack.orientation = .vertical
         stack.spacing = 8
-        stack.frame = NSRect(x: 0, y: 0, width: 260, height: 56)
+        stack.frame = NSRect(x: 0, y: 0, width: 320, height: 5 * 26 + 4 * 8)
         alert.accessoryView = stack
-        alert.addButton(withTitle: "\u{4FDD}\u{5B58}")
-        alert.addButton(withTitle: "\u{53D6}\u{6D88}")
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        guard let focusMinutes = Int(focusInput.stringValue), (1...120).contains(focusMinutes),
-              let breakMinutes = Int(breakInput.stringValue), (1...60).contains(breakMinutes) else {
-            Self.toast("\u{65F6}\u{957F}\u{65E0}\u{6548}",
-                       "\u{4E13}\u{6CE8}\u{9700}\u{4E3A} 1–120 \u{5206}\u{949F}\u{FF0C}\u{4F11}\u{606F}\u{9700}\u{4E3A} 1–60 \u{5206}\u{949F}\u{3002}")
+
+        func parseTime(_ value: String) -> Int? {
+            let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+            guard parts.count == 2, let hour = Int(parts[0]), let minute = Int(parts[1]),
+                  (0...23).contains(hour), (0...59).contains(minute) else { return nil }
+            return hour * 60 + minute
+        }
+        let normalizedSalary = monthlyInput.stringValue.replacingOccurrences(of: ",", with: ".")
+        guard let monthlyYuan = Double(normalizedSalary), monthlyYuan >= 0,
+              monthlyYuan <= 10_000_000,
+              let startMin = parseTime(startInput.stringValue),
+              let endMin = parseTime(endInput.stringValue),
+              let lunchStartMin = parseTime(lunchStartInput.stringValue),
+              let lunchEndMin = parseTime(lunchEndInput.stringValue),
+              startMin < endMin,
+              lunchStartMin >= startMin, lunchEndMin <= endMin,
+              lunchStartMin <= lunchEndMin else {
+            Self.toast("设置无效", "请检查月薪和时间：午休必须位于上班到下班之间。")
             return
         }
-        DeviceClient.controlPomodoro("configure", focusMinutes: focusMinutes,
-                                     breakMinutes: breakMinutes) { [weak self] error in
+        DeviceClient.configureSalary(monthlyYuan: monthlyYuan, startMin: startMin,
+                                     endMin: endMin, lunchStartMin: lunchStartMin,
+                                     lunchEndMin: lunchEndMin) { [weak self] error in
             if let error = error {
-                Self.toast("\u{4FDD}\u{5B58}\u{5931}\u{8D25}", error.localizedDescription)
+                Self.toast("保存失败", error.localizedDescription)
             } else {
                 self?.refreshDeviceSection()
             }
         }
+    }
+
+    private static func salaryTimeText(_ minute: Int) -> String {
+        String(format: "%02d:%02d", minute / 60, minute % 60)
     }
 
     @objc private func setStockSymbols() {
         let alert = NSAlert()
         alert.messageText = "自选股"
-        alert.informativeText = "逗号分隔的腾讯行情代码：sh/sz=A股、hk=港股、us=美股\n例如 sh600519,hk00700,usAAPL（设备最多显示 4 只）"
+        alert.informativeText = "逗号分隔的腾讯行情代码：sh/sz=A股、hk=港股、us=美股\n例如 sh600519,hk00700,usAAPL（设备最多显示 5 只）"
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         input.stringValue = StockMonitor.symbols.joined(separator: ",")
         input.placeholderString = "sh000001,usAAPL"
@@ -463,24 +515,79 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
-            StockMonitor.symbols = input.stringValue.split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            stockMonitor.updateSymbols(input.stringValue.replacingOccurrences(of: "，", with: ",")
+                .split(separator: ",").map { String($0) })
         }
     }
 
-    @objc private func openPetPicker() {
-        if DeviceClient.host.isEmpty { setDeviceAddress() }
-        PetPickerWindowController.shared.show()
+    @objc private func configureWeatherLocation() {
+        let configuration = weatherMonitor.locationConfiguration
+        let alert = NSAlert()
+        alert.messageText = "\u{5929}\u{6C14}\u{5730}\u{533A}"
+        alert.informativeText =
+            "\u{81EA}\u{52A8}\u{6A21}\u{5F0F}\u{4F7F}\u{7528} macOS \u{7CFB}\u{7EDF}\u{5B9A}\u{4F4D}\u{FF08}\u{5305}\u{62EC} Wi-Fi \u{5B9A}\u{4F4D}\u{FF09}\u{3002}\u{624B}\u{52A8}\u{6A21}\u{5F0F}\u{8F93}\u{5165}\u{57CE}\u{5E02}\u{540D}\u{5373}\u{53EF}\u{3002}"
+
+        let mode = NSPopUpButton(frame: .zero, pullsDown: false)
+        mode.addItems(withTitles: [
+            "\u{81EA}\u{52A8}\u{5B9A}\u{4F4D}",
+            "\u{624B}\u{52A8}\u{57CE}\u{5E02}",
+        ])
+        mode.selectItem(at: configuration.mode == .automatic ? 0 : 1)
+
+        let input = NSTextField(string: configuration.location.city)
+        input.placeholderString = "\u{4F8B}\u{5982}\u{FF1A}\u{4E0A}\u{6D77}\u{3001}\u{82CF}\u{5DDE}\u{3001}\u{5317}\u{4EAC}"
+        let modeRow = NSStackView(views: [
+            NSTextField(labelWithString: "\u{6A21}\u{5F0F}"),
+            mode,
+        ])
+        let cityRow = NSStackView(views: [
+            NSTextField(labelWithString: "\u{57CE}\u{5E02}"),
+            input,
+        ])
+        for row in [modeRow, cityRow] {
+            row.orientation = .horizontal
+            row.distribution = .fill
+            row.spacing = 10
+            row.views.first?.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        }
+        let stack = NSStackView(views: [modeRow, cityRow])
+        stack.orientation = .vertical
+        stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 300, height: 58)
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "\u{4FDD}\u{5B58}")
+        alert.addButton(withTitle: "\u{53D6}\u{6D88}")
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        weatherLocationItem.title =
+            "\u{5929}\u{6C14}\u{5730}\u{533A}\u{FF1A}\u{6B63}\u{5728}\u{66F4}\u{65B0}\u{2026}"
+
+        if mode.indexOfSelectedItem == 0 {
+            weatherMonitor.useAutomaticLocation { [weak self] result in
+                self?.handleWeatherLocationResult(result)
+            }
+        } else {
+            let city = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            weatherMonitor.setManualCity(city) { [weak self] result in
+                self?.handleWeatherLocationResult(result)
+            }
+        }
     }
 
-    @objc private func resetSprite(_ sender: NSMenuItem) {
-        guard let slot = sender.representedObject as? String else { return }
-        DeviceClient.resetSprite(slot: slot) { [weak self] error in
-            if let error = error {
-                Self.toast("恢复失败", error.localizedDescription)
-            } else {
-                self?.refreshDeviceSection()
-            }
+    private func handleWeatherLocationResult(_ result: Result<WeatherLocation, Error>) {
+        refreshWeatherLocationItem()
+        switch result {
+        case let .success(location):
+            Self.toast(
+                "\u{5929}\u{6C14}\u{5730}\u{533A}\u{5DF2}\u{66F4}\u{65B0}",
+                "\u{5DF2}\u{5207}\u{6362}\u{5230}\u{FF1A}\(location.city)"
+            )
+        case let .failure(error):
+            Self.toast(
+                "\u{5929}\u{6C14}\u{5730}\u{533A}\u{66F4}\u{65B0}\u{5931}\u{8D25}",
+                error.localizedDescription
+            )
         }
     }
 

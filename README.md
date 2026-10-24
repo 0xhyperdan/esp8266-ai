@@ -4,11 +4,10 @@
 
 <h1 align="center">AI Mac 小屏幕</h1>
 
-<p align="center">桌上的一台 AI 状态小电脑 —— ESP8266 · 开源硬件 · 桌面伴侣</p>
+<p align="center">桌上的 240×240 天气与桌面信息屏 —— ESP8266 / ESP32-S3 · 开源硬件</p>
 
 <p align="center">
-  中文 ·
-  <a href="README.en.md">English</a>
+  中文 · <a href="README.en.md">English</a>
 </p>
 
 <p align="center">
@@ -21,105 +20,48 @@
   <img src="docs/images/hero.jpg" width="640" alt="AI Mac 小屏幕">
 </p>
 
-一块 240×240 的复古小电视，放在桌上实时显示 **Claude Code / Codex CLI 在干什么、额度还剩多少**。不需要任何 API key：数据来自本机已有的 CLI 登录凭据和会话日志，由配套的 Mac / Windows 桥接程序在局域网内提供给设备。
+一块复古小电视，默认显示天气时钟，也能切换音乐、股票和薪资进账页面。Mac 桥接支持 Wi-Fi 和 USB；Windows 桥接目前仅支持 Wi-Fi，且不提供天气数据与定位。设备自己保留配网、网页管理、亮度、OTA、电池和 IMU 旋转能力，Mac 桥接支持多设备。
 
 ## 功能
 
 | | |
 |---|---|
-| <img src="docs/images/feature1.jpg" width="360" alt="AI 工作状态"> | **AI 工作状态与额度**<br>桌宠动起来 = AI 正在干活。方形进度环 + 大字显示 5 小时 / 周额度的真实用量；额度用满自动换成重置倒计时，等你审批时整圈边框红闪提醒。 |
-| <img src="docs/images/feature2.jpg" width="360" alt="网速监视"> | **网速实时监视**<br>任务管理器风格的上下行曲线，56 秒滚动窗口，量程自动调整。 |
-| <img src="docs/images/music.jpg" width="360" alt="音乐播放"> | **音乐播放显示**<br>专辑封面、歌名、歌手、进度条实时同步；音乐响起自动切入，停止自动切回。 |
-| <img src="docs/images/feature3.jpg" width="360" alt="桌宠可换"> | **可换桌宠**<br>内置 [petdex.dev](https://petdex.dev) 画廊 3300+ 开源桌宠，电脑端直接生成设备原生动画可靠上传；也可从设备网页上传任意 GIF，无需重烧固件。 |
+| <img src="docs/images/weather-clock.png" width="240" alt="天气时钟"> | **FuBoTV 原厂天气时钟**<br>复用原厂天气、温湿度和宇航员素材，显示天气、空气质量、时间日期、温度与湿度；支持 macOS 自动定位或手动城市，设备本地每秒更新秒针。 |
+| <img src="docs/images/music.jpg" width="360" alt="音乐播放"> | **音乐播放显示**<br>专辑封面、歌名、歌手和进度实时同步；天气页播放音乐时自动切入，停止后自动返回。 |
 
-还内置了**番茄时钟**：默认专注 25 分钟、休息 5 分钟，可从菜单栏、Windows 托盘或设备
-网页开始/暂停、重置、跳过和修改时长。计时状态由 ESP8266 自己维护，开始后拔掉电脑
-数据线也会继续运行，阶段结束自动切换专注/休息。
+还内置：
+
+- **股票行情**：Mac 拉取腾讯行情，设备显示最多 5 只自选股的价格和涨跌幅，中文股票名走压缩二进制传输。
+- **薪资时钟**：按 21.75 个法定计薪日折算每秒进账，支持月薪、上下班和午休设置，午休与周末自动暂停。
+- **设备管理**：多设备记忆与自动配对、亮度、Wi-Fi 桥接地址、Web OTA、ESP32-S3 电池指示和 IMU 自动旋转。
 
 ## 快速上手
 
-需要的东西：一台「SD2 小电视」开发板（[开源硬件](https://oshwhub.com/q21182889/sd2)，也可[直接购买成品](https://mobile.yangkeduo.com/goods.html?ps=OuBjGMWE82)）、一根 USB **数据**线。
+需要一台「SD2 小电视」开发板（[开源硬件](https://oshwhub.com/q21182889/sd2)，也可[购买成品](https://mobile.yangkeduo.com/goods.html?ps=OuPjGMWE82)）和一根 USB **数据**线。
 
-### 第 1 步 · 刷固件（约 30 秒）
+1. 用 Chrome / Edge 打开 [网页刷机](https://mac.qust.me/#flash)，连接并烧录设备。
+2. 首次开机连接热点 `AI-Clock-Setup`，在 `192.168.4.1` 选择家里 Wi-Fi。
+3. 从 [Releases](https://github.com/pengchujin/esp8266-ai/releases/latest) 安装 macOS 或 Windows 桥接程序。
 
-用 Chrome / Edge 打开 **[mac.qust.me/#flash](https://mac.qust.me/#flash)**，USB 连接设备，点「连接设备并烧录」，选择串口等待完成即可，无需安装任何工具。
+macOS 菜单栏左键打开实时镜像和亮度控制，右键打开设备选择、屏幕切换、功能开关、天气城市、自选股、薪资设置、桥接地址和 OTA 菜单。Windows 托盘提供设备发现与控制、屏幕切换、自选股和桥接设置。
 
-> 弹窗里看不到串口？Windows 需要装 [CH340 驱动](https://www.wch.cn/downloads/CH341SER_EXE.html)，Mac 系统自带无需安装；换根 USB 线（很多线只能充电）；更多排查见[官网 FAQ](https://mac.qust.me/#flash-faq)。
->
-> 命令行党也可以用 esptool 把 [Releases](https://github.com/pengchujin/esp8266-ai/releases/latest) 里的 `esp8266-ai-firmware-*.bin` 刷到 `0x0`。
+同一局域网内设备会被自动发现并配对；Mac 的 USB 连接使用串口推送，适合开启客户端隔离的路由器或不想配置 Wi-Fi 的场景。桥接程序保留一个最小 `/status` 心跳，只包含时间戳和音乐播放状态；旧的 `auto`、`claude`、`codex`、`home`、`usage`、`info`、`net`、`pomodoro` 显示模式会安全迁移到默认天气页。
 
-### 第 2 步 · 配 WiFi
+Mac 睡眠时桥接程序会暂停媒体、股票和天气轮询，唤醒后自动恢复。ESP32-S3 版本支持电池电量显示和 IMU 自动旋转，固件网页提供密码保护的 OTA 更新。
 
-设备首次开机会开热点 **`AI-Clock-Setup`**：手机连上后自动弹出配网页（没弹就用浏览器打开 `192.168.4.1`），选择家里 WiFi、输入密码，完成。
+更多硬件、API 和构建细节见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)，Windows 说明见 [windows-app/README.md](windows-app/README.md)。
 
-### 第 3 步 · 装桥接程序
+## 拓竹打印机状态（ESP8266 / ESP32-S3）
 
-从 [Releases](https://github.com/pengchujin/esp8266-ai/releases/latest) 下载并打开：
+微雪 ESP32-S3-Touch-LCD-1.54 新增原生 LAN MQTT 打印机页，不依赖电脑保持运行。
+这是本地源码新增功能，需要使用本项目构建的 App 和对应固件；上游网页刷机及 Releases 尚未包含本次改动。
+显示进度、剩余时间、层数、喷嘴和热床温度，并适配 X2D 的左右喷嘴温度数据格式。
+ESP8266 使用 Mac 桥接：Mac 连接打印机，通过 Wi-Fi 或 USB 发送精简状态给小电视。
+电脑需保持开机且 App 正在运行；关闭监控或 Mac 睡眠时会断开打印机连接。
+在 Mac 菜单栏右键选择 **打印机设置…**，填写打印机 IP、序列号和 LAN Access Code。
+ESP8266 的访问码只存入 Mac 钥匙串；ESP32-S3 的配置页使用设备现有 OTA 认证，访问码存于设备。
+访问码不要发到聊天或提交到 Git。首次配置需要明确确认是否信任打印机的自签名 TLS 证书。
 
-- **macOS**：`AIClockBridge-*-macOS.dmg`，拖入 Applications（ad-hoc 签名，首次启动需在「系统设置 → 隐私与安全性」允许，并同意本地网络权限）
-- **Windows**：`AIClockBridge-*-Windows-x64.exe`，双击即用
-
-桥接程序常驻菜单栏 / 托盘，会**自动发现并配对**同一局域网内的设备——到这里屏幕就活了。
-
-<p align="center">
-  <img src="docs/images/working.jpg" width="640" alt="工作演示">
-</p>
-
-日常使用都在托盘图标上：**左键**打开设备画面的实时镜像（底部有屏幕亮度滑条），**右键**是完整菜单（额度详情、屏幕切换、番茄时钟、更换桌宠、音乐/网速页等）。
-
-## 常见问题
-
-- **屏幕边框红色闪烁**：设备连不上桥接程序——确认电脑端程序在运行、和设备在同一 WiFi。
-- **额度一直显示 `-`**：本机没有登录过 Claude Code / Codex CLI，桥接程序读不到凭据。
-- **想换桌宠**：右键托盘图标 → 「更换桌宠动画…」，挑一个点上传就行。
-
-## 开发
-
-```
-firmware/     ESP8266 固件（PlatformIO + Arduino，含原生动画上传与 GIF 兼容解码）
-mac-app/      macOS 菜单栏桥接（Swift/SPM，零第三方依赖）
-windows-app/  Windows 托盘桥接（C# / .NET 8 WinForms）
-tools/        GIF → RGB565 内置精灵图转换脚本
-docs/         开发文档（硬件引脚、HTTP API、架构细节）
-```
-
-```bash
-cd firmware && pio run -t upload   # 固件：编译 + USB 烧录
-cd mac-app && swift run            # Mac 桥接：本地跑起来
-```
-
-只通过 USB 显示 Claude / Codex 状态时，使用纯 USB 构建目标。该版本不会启动 Wi-Fi、配网热点和板载 Web 服务：
-
-```bash
-cd firmware && pio run -e fubotv-usb -t upload
-cd ../mac-app && AICLOCK_SERIAL_PORT=/dev/cu.usbserial-XXXX swift run
-```
-
-需要登录后自动启动和异常退出自动恢复时，运行 `mac-app/install-launch-agent.sh`。
-脚本会构建 release 版本并安装为用户级 LaunchAgent；日志写入
-`~/Library/Logs/AIClockBridge/`。更新源码后重新运行安装脚本即可部署新版本。
-
-希望像普通应用一样手动双击启动时，可以构建并安装 `AIClockBridge.app`：
-
-```bash
-cd mac-app
-./build-app.sh
-./install-app.sh
-open "$HOME/Applications/AIClockBridge.app"
-```
-
-应用图标使用本 README 顶部的笑脸图标。安装脚本会卸载旧的
-`local.AIClockBridge` LaunchAgent，避免自动启动版本和手动启动版本重复运行。
-
-纯 USB 模式也支持菜单栏里的「更换桌宠动画…」。选择宠物和目标槽位后，Mac 会自动通过
-串口分块上传，设备校验后立即应用；动画保存在 LittleFS 中，重启后仍然有效。
-
-混合版首次通过 USB 刷入支持 Web OTA 的固件后，后续可打开
-`http://<设备IP>/update`，使用本机 `firmware/include/ota_secrets.h` 中的独立凭据登录并
-上传 `firmware.bin`。OTA 只更新程序分区，不会清除 Wi-Fi 设置、亮度或 LittleFS 桌宠数据。
-macOS 菜单栏也提供「Wi-Fi 更新固件…」入口：选择 `.bin` 后首次输入凭据，密码保存在
-macOS Keychain；上传期间显示进度，完成后自动等待设备重启并核对设备重新上线。
-
-硬件引脚表、屏幕驱动的坑、设备 HTTP API、GIF 板上解码架构等细节见 **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**。
-
-硬件、固件、软件全部开源，拿去改、拿去做、拿去卖都行。
+仅支持局域网只读监控，不包含云账号登录、摄像头或打印控制。Windows 尚未实现打印机桥接。
+番茄时钟已从固件、Mac 和 Windows 桥接中移除。完整配置、安全边界和参考来源见
+[打印机说明](docs/PRINTER.md)。实际 X2D 连接与实体屏显示仍需使用你的设备验证。

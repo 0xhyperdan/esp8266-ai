@@ -1,156 +1,73 @@
-// ESP8266 WiFi clock: shows local time plus live Claude Code / Codex CLI
-// working status and usage quota, polled from a small bridge service that
-// runs on the developer's Mac (see ../bridge/bridge.py).
+// ESP8266/ESP32 WiFi clock with weather, music, stocks, salary, and device
+// administration pages.
 //
 // Display: 240x240 SPI ST7789 (TFT_eSPI). Pin mapping is set via build_flags
 // in platformio.ini - edit those if your wiring differs.
 
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266HTTPClient.h>
-#include <WiFiClient.h>
 #include <WiFiManager.h>
-#include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
-#include <AnimatedGIF.h>
+#if defined(ESP32)
+#include <Update.h>
+#else
 #include <Updater.h>
+#endif
 
 #include "config.h"
-#include "img/claude_sprite.h"
-#include "img/codex_sprite.h"
-#include "img/claude_logo.h"
-#include "img/codex_logo.h"
+#include "hardware_features.h"
+#include "platform_compat.h"
+#include "printer_monitor.h"
 #include "img/ui_labels_zh.h"
 
 TFT_eSPI tft = TFT_eSPI();
-ESP8266WebServer webServer(80);
+AIClockWebServer webServer(80);
+void drawBatteryIndicator();
+#include "printer_screen.h"
+void fillPrinterInfo(JsonObject object);
 
-// ---------- custom sprite storage (LittleFS) ----------
-// Custom uploads replace the compiled-in default animation without needing a
-// firmware rebuild. You POST a raw .gif straight to /sprite/claude or
-// /sprite/codex (the device serves its own upload page at "/"); the ESP8266
-// decodes and rescales the GIF *on-device* (AnimatedGIF, line-by-line so it
-// never needs a full-canvas buffer) into the wire format below, which the
-// display path then reads back frame-by-frame:
-//   [1 byte frame count][frame0 bytes][frame1 bytes]...
-// Each frame is exactly CLAUDE_SPRITE_W x H (or CODEX_SPRITE_W x H) RGB565
-// pixels, byte order matching tools/convert_sprites.py's to_rgb565() so the
-// compiled-in defaults and custom uploads share one draw path.
-const char *CLAUDE_SPRITE_FILE = "/c.bin";
-const char *CODEX_SPRITE_FILE = "/x.bin";
-const char *CLAUDE_SPRITE_TEMP_FILE = "/c.tmp";
-const char *CODEX_SPRITE_TEMP_FILE = "/x.tmp";
-const char *CLAUDE_SPRITE_BACKUP_FILE = "/c.bak";
-const char *CODEX_SPRITE_BACKUP_FILE = "/x.bak";
-const char *CLAUDE_GIF_FILE = "/c.gif"; // raw upload, decoded then removed
-const char *CODEX_GIF_FILE = "/x.gif";
-const int MAX_CUSTOM_FRAMES = 8;
-const size_t CLAUDE_FRAME_BYTES = (size_t)CLAUDE_SPRITE_W * CLAUDE_SPRITE_H * 2;
-const size_t CODEX_FRAME_BYTES = (size_t)CODEX_SPRITE_W * CODEX_SPRITE_H * 2;
-
-// We never hold a whole sprite frame in RAM. Decoding a GIF needs ~24KB of
-// heap for AnimatedGIF's own buffers, which wouldn't fit alongside a static
-// full-frame buffer (a 120x120 frame is ~28KB) on the ESP8266's ~80KB. So both
-// the display path and the decoder work one screen-row at a time through these
-// two small scratch rows (SCREEN_W is the widest we ever need).
-uint16_t rowBuf[SCREEN_W];     // current row being drawn / decoded
-uint16_t prevRowBuf[SCREEN_W]; // decode only: same row from the previous frame
-
-bool claudeCustom = false;
-int claudeCustomFrames = 0;
-bool codexCustom = false;
-int codexCustomFrames = 0;
-uint32_t spriteRev = 0; // bumped on upload/reset so the Mac mirror re-fetches
-bool fileSystemReady = false;
-const char *lastSpriteUploadError = "none";
-
-enum SpriteUploadState {
-  SPRITE_UPLOAD_IDLE,
-  SPRITE_UPLOAD_PENDING,
-  SPRITE_UPLOAD_PROCESSING,
-  SPRITE_UPLOAD_SUCCEEDED,
-  SPRITE_UPLOAD_FAILED
-};
-SpriteUploadState spriteUploadState = SPRITE_UPLOAD_IDLE;
-unsigned long spriteUploadReadyMs = 0;
-
+// Shared one-row scratch buffer for the music, weather and stock binary transports.
 const int SCREEN_CX = 120, SCREEN_CY = 120;
-const int SPRITE_SCALE_NUM = 11, SPRITE_SCALE_DEN = 10;
-const int RING_MARGIN = 4;      // inset from screen edge
-const int RING_THICKNESS = 2;   // ring bar thickness
-const unsigned long ANIM_INTERVAL_MS = 120;  // sprite frame advance
-const unsigned long FLASH_INTERVAL_MS = 400; // "urgent" flash speed
-const unsigned long SWITCH_BOTH_MS = 2000;   // both apps working: alternate fast
-const unsigned long SWITCH_IDLE_MS = 6000;   // neither working: alternate slow
+uint16_t rowBuf[SCREEN_W];
 
-enum ActiveApp { APP_CLAUDE, APP_CODEX };
-ActiveApp currentApp = APP_CLAUDE;
-ActiveApp spriteUploadSlot = APP_CLAUDE;
-unsigned long lastSwitchMs = 0;
+bool fileSystemReady = false;
 
-// Display override, settable from the Mac app via POST /api/display:
-// auto = follow working status, claude/codex = pin that app on screen,
-// net/music/stock = show bridge-fed pages; pomodoro is fully device-owned.
+// Display override, settable from the Mac app via POST /api/display. Weather is
+// the default; music/stock are bridge-fed; salary is device-owned (it receives
+// the bridge clock timestamp).
 enum DisplayMode {
-  MODE_AUTO,
-  MODE_CLAUDE,
-  MODE_CODEX,
-  MODE_NET,
   MODE_MUSIC,
   MODE_STOCK,
-  MODE_POMODORO
+  MODE_WEATHER,
+  MODE_SALARY,
+  MODE_PRINTER
 };
-DisplayMode displayMode = MODE_AUTO;
+DisplayMode displayMode = MODE_WEATHER;
+DisplayMode effectiveMode();
+bool wiredActive();
+void drawSquareRing(float pct, uint16_t color);
 
-// When AUTO and the Mac reports audio playing, the screen auto-switches to the
-// music page and back when it stops — same spirit as the Claude/Codex auto
-// switch. Only AUTO does this; a pinned mode is always honored as-is.
+// When the default weather page is active and the Mac reports audio playing,
+// the screen temporarily promotes to music and returns when playback stops.
 bool statusMusicPlaying = false;
-DisplayMode lastEffectiveMode = MODE_AUTO;
+unsigned long bridgeEpoch = 0;
+unsigned long bridgeEpochReceivedAtMs = 0;
+DisplayMode lastEffectiveMode = MODE_WEATHER;
 
-// ---------- device-owned Pomodoro timer ----------
-// The ESP8266 is the source of truth so timing continues without USB or a
-// desktop bridge. Only the configured durations are persisted; a reboot starts
-// a fresh, paused focus session to avoid reconstructing elapsed wall time.
-enum PomodoroPhase { POMODORO_FOCUS, POMODORO_BREAK };
-PomodoroPhase pomodoroPhase = POMODORO_FOCUS;
-int pomodoroFocusMin = POMODORO_FOCUS_DEFAULT_MIN;
-int pomodoroBreakMin = POMODORO_BREAK_DEFAULT_MIN;
-unsigned long pomodoroRemainingS = POMODORO_FOCUS_DEFAULT_MIN * 60UL;
-unsigned long pomodoroLastTickMs = 0;
-unsigned long pomodoroCompleted = 0;
-bool pomodoroRunning = false;
-bool pomodoroChromeDrawn = false;
-String pomodoroLastTime;
-
-// ---------- net speed mode state ----------
-// Rendering is decoupled from the network: pollNet() fetches every 2s and
-// only refills a queue of 250ms samples (the bridge samples at 4Hz and tags
-// them with a running seq, so nothing is drawn twice or skipped). The sweep
-// itself consumes exactly one queued sample every NET_DRAW_INTERVAL_MS, so
-// the trace advances at a constant rate no matter how long HTTP takes.
-const unsigned long NET_POLL_INTERVAL_MS = 2000; // queue refill cadence
-const unsigned long NET_DRAW_INTERVAL_MS = 250;  // one chart step per bridge sample
-const int NET_QUEUE = 32;
-long netQRx[NET_QUEUE], netQTx[NET_QUEUE]; // ring buffer of pending samples
-int netQHead = 0, netQCount = 0;
-long netSeq = -1;                          // last bridge sample seq consumed into the queue
-long netCurRx = 0, netCurTx = 0;           // smoothed readout for the header
-int netCpuPct = -1, netMemPct = -1;        // Mac CPU/MEM row; -1 = bridge sends none (hidden)
-String netLastCpuVal, netLastMemVal;       // change detection for the CPU/MEM values
-bool netSysLabelsDrawn = false;
-unsigned long lastNetPollMs = 0;
-unsigned long lastNetDrawMs = 0;
-bool netChromeDrawn = false;
-bool netHeaderDirty = false;
-
-// Chart layout (task-manager style scrolling area chart, newest at the right)
-const int NET_CHART_X = 8, NET_CHART_Y = 60, NET_CHART_W = 224, NET_CHART_H = 128;
-long netHistRx[NET_CHART_W], netHistTx[NET_CHART_W]; // one 250ms sample per column
-long netScale = 10240;    // current "nice" full-scale value (whole chart shares it)
-String netLastDl, netLastUl, netLastScaleText; // change detection for partial redraws
+// ---------- salary clock ----------
+// Values are stored in fen/minutes so configuration is deterministic on both
+// ESP8266 and ESP32. A zero monthly salary keeps the page in setup state.
+struct SalaryConfig {
+  long monthlyFen = 0;
+  int startMin = SALARY_DEFAULT_START_MIN;
+  int endMin = SALARY_DEFAULT_END_MIN;
+  int lunchStartMin = SALARY_DEFAULT_LUNCH_START_MIN;
+  int lunchEndMin = SALARY_DEFAULT_LUNCH_END_MIN;
+};
+SalaryConfig salaryConfig;
+bool salaryChromeDrawn = false;
+String salaryLastEarned;
+String salaryLastStatus;
 
 // ---------- music mode state ----------
 const int MUSIC_COVER_W = 128;
@@ -165,24 +82,34 @@ const unsigned long MUSIC_POLL_INTERVAL_MS = 2000;
 // Rows come pre-formatted from the bridge (GET /stock or serial #STOCK):
 // ASCII code + price/pct strings + up flag, so the firmware just paints.
 const unsigned long STOCK_POLL_INTERVAL_MS = 5000;
-const int MAX_STOCKS = 4;
+const int MAX_STOCKS = 5;
+const int STOCK_ROW_Y = 4;
 struct StockRow {
   String code, price, pct;
   int up = 0; // 1 rising (red, CN convention) / -1 falling (green) / 0 flat
 };
 StockRow stocks[MAX_STOCKS];
 int stockCount = 0;
+int stockRowHeight() { return 220 / max(1, stockCount); }
+int stockRowTop(int index) {
+  return STOCK_ROW_Y + index * stockRowHeight() + (stockRowHeight() - 44) / 2;
+}
 bool stockEverLoaded = false;
 bool stockDirty = false;
 bool stockChromeDrawn = false;
 String stockLastCode[MAX_STOCKS]; // top line (CJK name strip + code)
 String stockLastVal[MAX_STOCKS];  // value line (price + pct)
+int ringLastPct = -1000;
+String pctText(float pct) { return pct >= 0 ? String((int)pct) + "%" : "-"; }
 unsigned long lastStockPollMs = 0;
 // CJK names come as bridge-rendered RGB565 strips (GET /stock/names-v2.raw, one
 // 156x16 strip per row) - names_rev says when to re-fetch. -1 = not drawn.
 const int STOCK_NAME_W = 156, STOCK_NAME_H = 16;
+const char *STOCK_NAMES_SERIAL_FILE = "/stock_names.raw";
+const char *STOCK_NAMES_SERIAL_TEMP_FILE = "/stock_names.tmp";
 int stockNamesRev = -1;
 int stockNamesDrawnRev = -1;
+int serialStockNamesRev = -1;
 
 String musicTitle, musicArtist, musicAlbum;
 bool musicPlaying = false;
@@ -193,41 +120,53 @@ bool musicHasArtwork = false;
 bool musicChromeDrawn = false;
 unsigned long lastMusicPollMs = 0;
 
-int claudeFrame = 0;
-int codexFrame = 0;
-unsigned long lastAnimMs = 0;
+// ---------- FuBoTV-style weather clock state ----------
+// The Mac renders the Chinese chrome and weather artwork as one RGB565 frame.
+// The device streams it row-by-row, then owns the seconds field locally so a
+// full 115 KB image is only fetched when the minute or weather data changes.
+const unsigned long WEATHER_POLL_INTERVAL_MS = 5000;
+const int WEATHER_SECONDS_X = 211;
+const int WEATHER_SECONDS_Y = 120;
+const int WEATHER_SECONDS_OWNER_X = 196;
+const int WEATHER_SECONDS_OWNER_Y = 101;
+const int WEATHER_SECONDS_OWNER_W = 40;
+const int WEATHER_SECONDS_OWNER_H = 38;
+const char *WEATHER_ASTRONAUT_FILE = "/wa.bin";
+const char *WEATHER_ASTRONAUT_TEMP_FILE = "/wa.tmp";
+const char *WEATHER_ASTRONAUT_BACKUP_FILE = "/wa.bak";
+const int WEATHER_ASTRONAUT_X = 168;
+const int WEATHER_ASTRONAUT_Y = 168;
+const int WEATHER_ASTRONAUT_W = 72;
+const int WEATHER_ASTRONAUT_H = 72;
+const int WEATHER_ASTRONAUT_FRAME_COUNT = 20;
+const size_t WEATHER_ASTRONAUT_FRAME_BYTES =
+    (size_t)WEATHER_ASTRONAUT_W * WEATHER_ASTRONAUT_H * 2;
+const size_t WEATHER_ASTRONAUT_PACK_BYTES =
+    2 + (size_t)WEATHER_ASTRONAUT_FRAME_COUNT * WEATHER_ASTRONAUT_FRAME_BYTES;
+const unsigned long WEATHER_ASTRONAUT_INTERVAL_MS = 30;
+const unsigned long WEATHER_ASTRONAUT_RETRY_MS = 60000;
+unsigned long lastWeatherPollMs = 0;
+unsigned long weatherEpoch = 0;
+unsigned long weatherEpochReceivedAtMs = 0;
+long weatherScreenRev = -1;
+long weatherScreenDrawnRev = -1;
+int weatherAstronautRevision = -1;
+int weatherAstronautLoadedRevision = -1;
+int weatherAstronautFrames = 0;
+int weatherAstronautFrame = 0;
+unsigned long lastWeatherAstronautMs = 0;
+unsigned long lastWeatherAstronautDownloadMs = 0;
+int weatherLastSecond = -1;
+bool weatherChromeDrawn = false;
+bool weatherBaseCacheValid = false;
+uint32_t weatherRowFingerprints[SCREEN_H];
+uint32_t updateCrc32(uint32_t crc, const uint8_t *data, size_t length);
+void renderWeatherBaseRow(int row, bool forceFullRepaint);
 
-bool flashOn = true;
-unsigned long lastFlashMs = 0;
 
 // Bridge host is not asked for during first-time WiFi setup: the Mac/Windows
 // bridge discovers the device and pairs automatically (or set via /api/bridge).
 String bridgeHost;
-
-struct ClaudeStatus {
-  String status = "unknown";
-  long tokensToday = 0;
-  int sessionMin = 0;
-  int sessionWindowMin = 300;
-  float fiveHourPct = -1; // real OAuth quota from the bridge, -1 = unknown
-  int fiveHourResetMin = -1; // minutes until the 5h window resets
-  float sevenDayPct = -1;
-  int sevenDayResetMin = -1; // minutes until the 7-day window resets
-  bool needsInput = false; // waiting on a permission/approval prompt
-};
-
-struct CodexStatus {
-  String status = "unknown";
-  long tokensToday = 0;
-  float primaryPct = -1;
-  int primaryResetMin = -1;
-  float weeklyPct = -1;
-  int weeklyResetMin = -1;
-  bool needsInput = false;
-};
-
-ClaudeStatus claudeStatus;
-CodexStatus codexStatus;
 
 unsigned long lastPollMs = 0;
 unsigned long lastSuccessMs = 0;
@@ -240,11 +179,11 @@ bool webServerStarted = false; // deferred: port 80 clashes with the portal
 // firmware does the same. 0 = off, 100 = full. Persisted so it survives reboot.
 
 int brightness = BRIGHTNESS_DEFAULT; // 0-100
+bool autoRotateEnabled = true;
+uint8_t screenRotation = 0;
 
 void applyBrightness() {
-  // analogWriteRange(100) is set in setup(), so the duty value is just the
-  // inverted percentage (active LOW: 0 duty = always LOW = full on).
-  analogWrite(TFT_BL, 100 - brightness);
+  platformWriteBacklight(brightness);
 }
 
 void loadBrightness() {
@@ -260,6 +199,27 @@ void saveBrightness() {
   File f = LittleFS.open(BRIGHTNESS_FILE, "w");
   if (!f) return;
   f.println(brightness);
+  f.close();
+}
+
+void applyExplicitBrightness(int level) {
+  brightness = constrain(level, 0, 100);
+  applyBrightness();
+}
+
+void loadOrientationConfig() {
+  if (!LittleFS.exists(ORIENTATION_CONFIG_FILE)) return;
+  File f = LittleFS.open(ORIENTATION_CONFIG_FILE, "r");
+  if (!f) return;
+  autoRotateEnabled = f.readStringUntil('\n').toInt() != 0;
+  f.close();
+}
+
+void saveOrientationConfig() {
+  if (!fileSystemReady) return;
+  File f = LittleFS.open(ORIENTATION_CONFIG_FILE, "w");
+  if (!f) return;
+  f.println(autoRotateEnabled ? 1 : 0);
   f.close();
 }
 
@@ -280,38 +240,62 @@ void saveBridgeHost(const String &host) {
   f.close();
 }
 
-// ---------- persistence for Pomodoro durations ----------
+// ---------- persistence for salary clock ----------
 
-void loadPomodoroConfig() {
-  if (LittleFS.exists(POMODORO_CONFIG_FILE)) {
-    File f = LittleFS.open(POMODORO_CONFIG_FILE, "r");
+bool validSalaryConfig(const SalaryConfig &value) {
+  if (value.monthlyFen < 0 || value.monthlyFen > 1000000000L) return false;
+  if (value.startMin < 0 || value.endMin > 1439 || value.startMin >= value.endMin) return false;
+  bool hasLunch = value.lunchStartMin != value.lunchEndMin;
+  if (!hasLunch) return true;
+  return value.lunchStartMin >= value.startMin &&
+         value.lunchEndMin <= value.endMin &&
+         value.lunchStartMin < value.lunchEndMin;
+}
+
+bool configureSalary(long monthlyFen, int startMin, int endMin,
+                     int lunchStartMin, int lunchEndMin) {
+  SalaryConfig next;
+  next.monthlyFen = monthlyFen;
+  next.startMin = startMin;
+  next.endMin = endMin;
+  next.lunchStartMin = lunchStartMin;
+  next.lunchEndMin = lunchEndMin;
+  if (!validSalaryConfig(next)) return false;
+  salaryConfig = next;
+  salaryChromeDrawn = false;
+  salaryLastEarned = "";
+  salaryLastStatus = "";
+  if (fileSystemReady) {
+    File f = LittleFS.open(SALARY_CONFIG_FILE, "w");
     if (f) {
-      int focus = f.readStringUntil(',').toInt();
-      int rest = f.readStringUntil('\n').toInt();
+      f.printf("%ld,%d,%d,%d,%d\n", salaryConfig.monthlyFen,
+               salaryConfig.startMin, salaryConfig.endMin,
+               salaryConfig.lunchStartMin, salaryConfig.lunchEndMin);
       f.close();
-      if (focus >= POMODORO_FOCUS_MIN && focus <= POMODORO_FOCUS_MAX)
-        pomodoroFocusMin = focus;
-      if (rest >= POMODORO_BREAK_MIN && rest <= POMODORO_BREAK_MAX)
-        pomodoroBreakMin = rest;
     }
   }
-  pomodoroPhase = POMODORO_FOCUS;
-  pomodoroRemainingS = (unsigned long)pomodoroFocusMin * 60UL;
-  pomodoroRunning = false;
-  pomodoroCompleted = 0;
+  return true;
 }
 
-void savePomodoroConfig() {
-  if (!fileSystemReady) return;
-  File f = LittleFS.open(POMODORO_CONFIG_FILE, "w");
-  if (!f) return;
-  f.printf("%d,%d\n", pomodoroFocusMin, pomodoroBreakMin);
-  f.close();
+void loadSalaryConfig() {
+  if (LittleFS.exists(SALARY_CONFIG_FILE)) {
+    File f = LittleFS.open(SALARY_CONFIG_FILE, "r");
+    if (f) {
+      SalaryConfig loaded;
+      loaded.monthlyFen = f.readStringUntil(',').toInt();
+      loaded.startMin = f.readStringUntil(',').toInt();
+      loaded.endMin = f.readStringUntil(',').toInt();
+      loaded.lunchStartMin = f.readStringUntil(',').toInt();
+      loaded.lunchEndMin = f.readStringUntil('\n').toInt();
+      f.close();
+      if (validSalaryConfig(loaded)) salaryConfig = loaded;
+    }
+  }
 }
 
-// ---------- custom sprite loading ----------
+// ---------- atomic binary transfer recovery ----------
 
-void recoverSpriteSwap(const char *binPath, const char *tempPath, const char *backupPath) {
+void recoverAtomicTransfer(const char *binPath, const char *tempPath, const char *backupPath) {
   if (!LittleFS.exists(binPath) && LittleFS.exists(backupPath)) {
     LittleFS.rename(backupPath, binPath);
   } else {
@@ -332,219 +316,42 @@ bool ensureFileSystem(bool formatOnFailure) {
   return fileSystemReady;
 }
 
-// Checks LittleFS for a previously-uploaded custom sprite and validates its
-// size before trusting it (frame count byte + exact expected byte length).
-void loadCustomSpriteState() {
-  recoverSpriteSwap(CLAUDE_SPRITE_FILE, CLAUDE_SPRITE_TEMP_FILE, CLAUDE_SPRITE_BACKUP_FILE);
-  recoverSpriteSwap(CODEX_SPRITE_FILE, CODEX_SPRITE_TEMP_FILE, CODEX_SPRITE_BACKUP_FILE);
-  LittleFS.remove(CLAUDE_GIF_FILE);
-  LittleFS.remove(CODEX_GIF_FILE);
-
-  claudeCustom = false;
-  if (LittleFS.exists(CLAUDE_SPRITE_FILE)) {
-    File f = LittleFS.open(CLAUDE_SPRITE_FILE, "r");
-    if (f && f.size() >= 1) {
-      uint8_t cnt = f.read();
-      size_t expected = 1 + (size_t)cnt * CLAUDE_FRAME_BYTES;
-      if (cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
-        claudeCustom = true;
-        claudeCustomFrames = cnt;
-      }
-    }
-    if (f) f.close();
+bool inspectWeatherAstronautFile(const char *path, bool applyState) {
+  if (!fileSystemReady || !LittleFS.exists(path)) return false;
+  File file = LittleFS.open(path, "r");
+  if (!file || file.size() < 2) {
+    if (file) file.close();
+    return false;
   }
 
-  codexCustom = false;
-  if (LittleFS.exists(CODEX_SPRITE_FILE)) {
-    File f = LittleFS.open(CODEX_SPRITE_FILE, "r");
-    if (f && f.size() >= 1) {
-      uint8_t cnt = f.read();
-      size_t expected = 1 + (size_t)cnt * CODEX_FRAME_BYTES;
-      if (cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
-        codexCustom = true;
-        codexCustomFrames = cnt;
-      }
-    }
-    if (f) f.close();
+  const int revision = file.read();
+  const int frameCount = file.read();
+  const size_t expected =
+      2 + (size_t)frameCount * WEATHER_ASTRONAUT_FRAME_BYTES;
+  const bool valid =
+      revision >= 0 && frameCount > 0 &&
+      frameCount <= WEATHER_ASTRONAUT_FRAME_COUNT &&
+      (size_t)file.size() == expected;
+  file.close();
+  if (!valid) return false;
+
+  if (applyState) {
+    weatherAstronautLoadedRevision = revision;
+    weatherAstronautFrames = frameCount;
+    weatherAstronautFrame = 0;
+    Serial.printf("[weather] astronaut revision=%d frames=%d\n", revision, frameCount);
   }
-
-  Serial.printf("[sprite] claude custom=%d frames=%d | codex custom=%d frames=%d\n", claudeCustom,
-                claudeCustomFrames, codexCustom, codexCustomFrames);
+  return true;
 }
 
-int claudeFrameCount() { return claudeCustom ? claudeCustomFrames : CLAUDE_SPRITE_FRAMES; }
-int codexFrameCount() { return codexCustom ? codexCustomFrames : CODEX_SPRITE_FRAMES; }
-
-// Draws one sprite frame 10% larger, centered on the display.
-// Source rows still stream from LittleFS or PROGMEM, so scaling adds no full
-// frame buffer and keeps the stored custom-pet format backward compatible.
-void drawSpriteFrame(bool custom, const char *file, const uint16_t *const *progmemFrames, int frameIdx, int w,
-                     int h, size_t frameBytes) {
-  int displayW = (w * SPRITE_SCALE_NUM + SPRITE_SCALE_DEN / 2) / SPRITE_SCALE_DEN;
-  int displayH = (h * SPRITE_SCALE_NUM + SPRITE_SCALE_DEN / 2) / SPRITE_SCALE_DEN;
-  int x0 = SCREEN_CX - displayW / 2, y0 = SCREEN_CY - displayH / 2;
-  size_t rowBytes = (size_t)w * 2;
-  File f;
-  if (custom) {
-    f = LittleFS.open(file, "r");
-    if (!f) return;
-  }
-  const uint16_t *frame = custom ? nullptr : progmemFrames[frameIdx];
-  int loadedSourceRow = -1;
-  for (int y = 0; y < displayH; y++) {
-    int sourceY = y * h / displayH;
-    if (sourceY != loadedSourceRow) {
-      if (custom) {
-        f.seek(1 + (size_t)frameIdx * frameBytes + (size_t)sourceY * rowBytes);
-        if (f.read((uint8_t *)prevRowBuf, rowBytes) != (int)rowBytes) break;
-      } else {
-        memcpy_P(prevRowBuf, frame + (size_t)sourceY * w, rowBytes);
-      }
-      loadedSourceRow = sourceY;
-    }
-    for (int x = 0; x < displayW; x++) {
-      rowBuf[x] = prevRowBuf[x * w / displayW];
-    }
-    tft.pushImage(x0, y0 + y, displayW, 1, rowBuf);
-    if ((y & 0x1F) == 0x1F) yield();
-  }
-  if (f) f.close();
-}
-
-// ---------- helpers ----------
-
-String formatTokens(long tokens) {
-  if (tokens >= 1000000) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.1fM", tokens / 1000000.0);
-    return String(buf);
-  }
-  if (tokens >= 1000) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.1fk", tokens / 1000.0);
-    return String(buf);
-  }
-  return String(tokens);
-}
-
-// ---------- drawing ----------
-
-void drawStaticChrome() {
-  tft.fillScreen(TFT_BLACK);
-}
-
-// Bridge unreachable / data stale -> flashing red overrides everything else,
-// matches the "urgent, look now" state from the reference signal-light design.
-bool bridgeStale() {
-  if (!everPolled) return true;
-  return (millis() - lastSuccessMs) >= 2UL * BRIDGE_POLL_INTERVAL_MS;
-}
-
-// True when the app currently on screen is waiting on a permission/approval
-// prompt — drives the red "look now, act" border flash.
-bool currentAppNeedsInput() {
-  return currentApp == APP_CLAUDE ? claudeStatus.needsInput : codexStatus.needsInput;
-}
-
-// Working vs idle is now conveyed by the sprite animation itself (moving vs
-// still), not by ring color. The ring just stays steady green, except
-// bridge-stale which flashes red ("check it now") and overrides everything.
-uint16_t currentStatusColor() {
-  if (bridgeStale()) return flashOn ? TFT_RED : TFT_BLACK;
-  return TFT_GREEN;
-}
-
-// The ring is skipped when nothing changed (see drawSquareRing) so the 5s
-// poll doesn't visibly blank-and-repaint it. Anything that paints over the
-// ring area must invalidate this cache.
-float ringLastPct = -1000;
-uint16_t ringLastColor = 1;
-
-// Paints the full square border in one color (all four sides), used for the
-// attention flash so the whole edge blinks, not just the filled quota arc.
-void drawFullBorder(uint16_t color) {
-  ringLastPct = -1000; // ring got painted over; next ring draw must repaint
-  int x0 = RING_MARGIN, y0 = RING_MARGIN;
-  int side = SCREEN_W - 2 * RING_MARGIN;
-  tft.fillRect(x0, y0, side, RING_THICKNESS, color);                              // top
-  tft.fillRect(x0, SCREEN_H - RING_MARGIN - RING_THICKNESS, side, RING_THICKNESS, color); // bottom
-  tft.fillRect(x0, y0, RING_THICKNESS, side, color);                              // left
-  tft.fillRect(SCREEN_W - RING_MARGIN - RING_THICKNESS, y0, RING_THICKNESS, side, color); // right
-}
-
-// Square progress ring hugging the screen edge. `pct` of the perimeter
-// (clockwise from top-left) is drawn in `color`, the rest in dark grey.
-void drawSquareRing(float pct, uint16_t color) {
-  if (pct < 0) pct = 0;
-  if (pct > 100) pct = 100;
-  if (pct == ringLastPct && color == ringLastColor) return; // nothing changed
-  ringLastPct = pct;
-  ringLastColor = color;
-
-  int x0 = RING_MARGIN, y0 = RING_MARGIN;
-  int x1 = SCREEN_W - RING_MARGIN, y1 = SCREEN_H - RING_MARGIN;
-  int side = x1 - x0;
-  float perimeter = side * 4.0;
-
-  // Unfilled track is drawn black (not grey) so it blends into the background
-  // and only the active quota portion is visible - still needs to be actively
-  // repainted each time though, to erase a previously longer fill if the
-  // percentage drops (e.g. a quota window reset).
-  tft.fillRect(x0, y0, side, RING_THICKNESS, TFT_BLACK);                  // top
-  tft.fillRect(x1 - RING_THICKNESS, y0, RING_THICKNESS, side, TFT_BLACK); // right
-  tft.fillRect(x0, y1 - RING_THICKNESS, side, RING_THICKNESS, TFT_BLACK); // bottom
-  tft.fillRect(x0, y0, RING_THICKNESS, side, TFT_BLACK);                  // left
-
-  // filled portion, clockwise: top -> right -> bottom -> left
-  float remaining = perimeter * (pct / 100.0);
-  if (remaining <= 0) return;
-
-  float seg = min(remaining, (float)side);
-  tft.fillRect(x0, y0, (int)seg, RING_THICKNESS, color);
-  remaining -= side;
-  if (remaining <= 0) return;
-
-  seg = min(remaining, (float)side);
-  tft.fillRect(x1 - RING_THICKNESS, y0, RING_THICKNESS, (int)seg, color);
-  remaining -= side;
-  if (remaining <= 0) return;
-
-  seg = min(remaining, (float)side);
-  tft.fillRect(x1 - (int)seg, y1 - RING_THICKNESS, (int)seg, RING_THICKNESS, color);
-  remaining -= side;
-  if (remaining <= 0) return;
-
-  seg = min(remaining, (float)side);
-  tft.fillRect(x0, y1 - (int)seg, RING_THICKNESS, (int)seg, color);
-}
-
-void drawClaudeSprite(int frameIdx) {
-  drawSpriteFrame(claudeCustom, CLAUDE_SPRITE_FILE, claude_sprite_frames, frameIdx, CLAUDE_SPRITE_W,
-                  CLAUDE_SPRITE_H, CLAUDE_FRAME_BYTES);
-}
-
-void drawCodexSprite(int frameIdx) {
-  drawSpriteFrame(codexCustom, CODEX_SPRITE_FILE, codex_sprite_frames, frameIdx, CODEX_SPRITE_W, CODEX_SPRITE_H,
-                  CODEX_FRAME_BYTES);
-}
-
-String pctText(float pct) {
-  return pct >= 0 ? String((int)pct) + "%" : "-";
-}
-
-// Quota readout below the sprite: two columns (5-hour / weekly), small grey label
-// over a big font-4 percentage. Values repaint only when their text changes
-// (force = after a full-screen clear), so the 5s poll never flashes them.
-const int QUOTA_LABEL_Y = 189, QUOTA_VALUE_Y = 205, QUOTA_INLINE_Y = 198;
-const int QUOTA_COL1_X = 70, QUOTA_COL2_X = 170;
-String lastQuota5h, lastQuotaWk;
-
-// Faux-bold: the packed TFT_eSPI fonts have no bold face, so draw twice with
-// a 1px x offset. Transparent draws - the caller must have cleared the region.
-void drawBoldString(const String &s, int x, int y, int font, uint16_t color) {
-  tft.setTextColor(color);
-  tft.drawString(s, x, y, font);
-  tft.drawString(s, x + 1, y, font);
+void loadWeatherAstronautState() {
+  recoverAtomicTransfer(
+      WEATHER_ASTRONAUT_FILE,
+      WEATHER_ASTRONAUT_TEMP_FILE,
+      WEATHER_ASTRONAUT_BACKUP_FILE);
+  weatherAstronautLoadedRevision = -1;
+  weatherAstronautFrames = 0;
+  inspectWeatherAstronautFile(WEATHER_ASTRONAUT_FILE, true);
 }
 
 void drawCenteredMonoLabel(const uint8_t *bits, int width, int height, int centerX, int y,
@@ -561,664 +368,338 @@ void drawCenteredMonoLabel(const uint8_t *bits, int width, int height, int cente
   }
 }
 
-void drawWeekQuotaLabel(int centerX, int y, uint16_t color) {
-  drawCenteredMonoLabel(week_label_bits, WEEK_LABEL_W, WEEK_LABEL_H, centerX, y, color);
+// ---------- Salary clock ----------
+
+unsigned long salaryCurrentEpoch() {
+  if (bridgeEpoch == 0) return 0;
+  return bridgeEpoch + (millis() - bridgeEpochReceivedAtMs) / 1000UL;
 }
 
-void drawWeekQuotaInline(const String &value, int centerX, int y, uint16_t color) {
-  const int gap = 6;
-  int valueW = tft.textWidth(value, 4);
-  int totalW = WEEK_LABEL_W + gap + valueW + 1;
-  int x0 = centerX - totalW / 2;
-  drawCenteredMonoLabel(week_label_bits, WEEK_LABEL_W, WEEK_LABEL_H,
-                        x0 + WEEK_LABEL_W / 2, y + 5, color);
-  tft.setTextDatum(TL_DATUM);
-  drawBoldString(value, x0 + WEEK_LABEL_W + gap, y, 4, color);
+int salaryWeekday(unsigned long localEpoch) {
+  // Unix day 0 was Thursday; return Sunday = 0 ... Saturday = 6.
+  long days = (long)(localEpoch / 86400UL);
+  int weekday = (int)((days + 4L) % 7L);
+  return weekday < 0 ? weekday + 7 : weekday;
 }
 
-// ---------- Pomodoro timer ----------
-
-unsigned long pomodoroDurationS(PomodoroPhase phase) {
-  int minutes = phase == POMODORO_FOCUS ? pomodoroFocusMin : pomodoroBreakMin;
-  return (unsigned long)minutes * 60UL;
+int salaryDailyWorkSeconds() {
+  int total = (salaryConfig.endMin - salaryConfig.startMin) * 60;
+  if (salaryConfig.lunchStartMin != salaryConfig.lunchEndMin) {
+    total -= (salaryConfig.lunchEndMin - salaryConfig.lunchStartMin) * 60;
+  }
+  return max(1, total);
 }
 
-String pomodoroTimeText() {
-  unsigned long minutes = pomodoroRemainingS / 60UL;
-  unsigned long seconds = pomodoroRemainingS % 60UL;
-  char text[12];
-  snprintf(text, sizeof(text), "%02lu:%02lu", minutes, seconds);
+long salaryElapsedWorkSeconds(unsigned long localEpoch) {
+  if (localEpoch == 0 || salaryWeekday(localEpoch) == 0 || salaryWeekday(localEpoch) == 6) return 0;
+  long daySecond = (long)(localEpoch % 86400UL);
+  long startSecond = (long)salaryConfig.startMin * 60L;
+  long endSecond = (long)salaryConfig.endMin * 60L;
+  long elapsed = constrain(daySecond - startSecond, 0L, endSecond - startSecond);
+  if (salaryConfig.lunchStartMin != salaryConfig.lunchEndMin) {
+    long lunchStart = (long)salaryConfig.lunchStartMin * 60L;
+    long lunchEnd = (long)salaryConfig.lunchEndMin * 60L;
+    elapsed -= constrain(daySecond - lunchStart, 0L, lunchEnd - lunchStart);
+  }
+  return max(0L, min(elapsed, (long)salaryDailyWorkSeconds()));
+}
+
+String salaryTimeInput(int minute) {
+  char text[6];
+  snprintf(text, sizeof(text), "%02d:%02d", minute / 60, minute % 60);
   return String(text);
 }
 
-void beginPomodoroPhase(PomodoroPhase phase) {
-  pomodoroPhase = phase;
-  pomodoroRemainingS = pomodoroDurationS(phase);
-  pomodoroLastTickMs = millis();
-  pomodoroChromeDrawn = false;
-  pomodoroLastTime = "";
+int parseSalaryTime(const String &value) {
+  int separator = value.indexOf(':');
+  if (separator < 0) return value.toInt();
+  int hour = value.substring(0, separator).toInt();
+  int minute = value.substring(separator + 1).toInt();
+  return hour * 60 + minute;
 }
 
-void advancePomodoro(unsigned long nowMs) {
-  if (!pomodoroRunning || pomodoroRemainingS == 0) {
-    pomodoroLastTickMs = nowMs;
-    return;
+String salaryStatusText(unsigned long localEpoch) {
+  if (salaryConfig.monthlyFen <= 0) return "CONFIGURE SALARY";
+  if (localEpoch == 0) return "WAITING FOR CLOCK";
+  int weekday = salaryWeekday(localEpoch);
+  if (weekday == 0 || weekday == 6) return "WEEKEND - PAUSED";
+  int dayMinute = (int)((localEpoch % 86400UL) / 60UL);
+  if (dayMinute < salaryConfig.startMin) return "BEFORE WORK";
+  if (dayMinute >= salaryConfig.endMin) return "WORKDAY COMPLETE";
+  if (salaryConfig.lunchStartMin != salaryConfig.lunchEndMin &&
+      dayMinute >= salaryConfig.lunchStartMin && dayMinute < salaryConfig.lunchEndMin) {
+    return "LUNCH BREAK - PAUSED";
   }
-  unsigned long elapsedS = (nowMs - pomodoroLastTickMs) / 1000UL;
-  if (elapsedS == 0) return;
-  pomodoroLastTickMs += elapsedS * 1000UL;
+  return "EARNING NOW";
+}
 
-  while (elapsedS >= pomodoroRemainingS) {
-    elapsedS -= pomodoroRemainingS;
-    if (pomodoroPhase == POMODORO_FOCUS) {
-      pomodoroCompleted++;
-      pomodoroPhase = POMODORO_BREAK;
-    } else {
-      pomodoroPhase = POMODORO_FOCUS;
+double salaryRatePerSecond() {
+  if (salaryConfig.monthlyFen <= 0) return 0;
+  return (salaryConfig.monthlyFen / 100.0) /
+         (SALARY_MONTHLY_WORKDAYS * salaryDailyWorkSeconds());
+}
+
+// Poster-style palette for the salary page: pure-black sky, gold coins and a
+// gold progress bar, matching the 每秒进账 reference design.
+const uint16_t SALARY_BG = 0x0000;        // TFT_BLACK sky
+const uint16_t SALARY_GOLD = 0xFE69;      // #FFCF4D big number / bar fill
+const uint16_t SALARY_GOLD_MID = 0xF5C7;  // #F5B93E coin face
+const uint16_t SALARY_GOLD_DIM = 0xCCA3;  // #C8971F coin rim / inner ring
+const uint16_t SALARY_COIN_MARK = 0x8AC2; // #8A5A14 ¥ strokes
+const uint16_t SALARY_MUTED = 0x9516;     // #97A0B5 grey-blue captions
+const uint16_t SALARY_TRACK = 0x29AA;     // #2C3550 bar track
+const uint16_t SALARY_SPARK = 0x6AC5;     // #6B5A2A dim gold sparkle dots
+
+String salaryLastPctLine;
+int salaryLastPct = -1;
+
+// Mono label blit with an explicit background so dynamic strips repaint
+// cleanly over the black sky (drawCenteredMonoLabel always paints black).
+void drawSalaryLabel(const uint8_t *bits, int width, int height, int x, int y,
+                     uint16_t color, uint16_t bg) {
+  const int rowBytes = (width + 7) / 8;
+  const uint16_t packedColor = (uint16_t)((color << 8) | (color >> 8));
+  const uint16_t packedBg = (uint16_t)((bg << 8) | (bg >> 8));
+  for (int row = 0; row < height; row++) {
+    const uint8_t *rowPtr = bits + row * rowBytes;
+    for (int col = 0; col < width; col++) {
+      uint8_t packed = pgm_read_byte(rowPtr + col / 8);
+      rowBuf[col] = (packed & (0x80 >> (col & 7))) ? packedColor : packedBg;
     }
-    pomodoroRemainingS = pomodoroDurationS(pomodoroPhase);
-    pomodoroChromeDrawn = false;
+    tft.pushImage(x, y + row, width, 1, rowBuf);
   }
-  pomodoroRemainingS -= elapsedS;
 }
 
-bool controlPomodoro(const String &action, int focusMinutes = -1, int breakMinutes = -1) {
-  unsigned long nowMs = millis();
-  advancePomodoro(nowMs);
-
-  if (action == "toggle") {
-    pomodoroRunning = !pomodoroRunning;
-    pomodoroLastTickMs = nowMs;
-  } else if (action == "start") {
-    pomodoroRunning = true;
-    pomodoroLastTickMs = nowMs;
-  } else if (action == "pause") {
-    pomodoroRunning = false;
-  } else if (action == "reset") {
-    pomodoroRunning = false;
-    pomodoroRemainingS = pomodoroDurationS(pomodoroPhase);
-    pomodoroLastTickMs = nowMs;
-  } else if (action == "skip") {
-    beginPomodoroPhase(pomodoroPhase == POMODORO_FOCUS ? POMODORO_BREAK : POMODORO_FOCUS);
-  } else if (action == "configure") {
-    if (focusMinutes < POMODORO_FOCUS_MIN || focusMinutes > POMODORO_FOCUS_MAX ||
-        breakMinutes < POMODORO_BREAK_MIN || breakMinutes > POMODORO_BREAK_MAX) {
-      return false;
+// Gold coin: dark rim, bright face, inner ring, and a thick ¥ on the big one.
+void drawSalaryCoin(int cx, int cy, int r, bool withMark) {
+  tft.fillCircle(cx, cy, r, SALARY_GOLD_DIM);
+  tft.fillCircle(cx, cy, r - 3, SALARY_GOLD);
+  if (withMark) {
+    tft.drawCircle(cx, cy, (int)(r * 0.70), SALARY_GOLD_DIM);
+    const uint16_t c = SALARY_COIN_MARK;
+    const int half = (int)(r * 0.38), top = cy - (int)(r * 0.44);
+    const int mid = cy - (int)(r * 0.10), bot = cy + (int)(r * 0.46);
+    const int barHalf = (int)(r * 0.34);
+    for (int o = 0; o < 2; o++) { // 2px-thick diagonals meeting at the stem
+      tft.drawLine(cx - half, top + o, cx, mid + o, c);
+      tft.drawLine(cx + half, top + o, cx, mid + o, c);
+      tft.drawLine(cx - 1 + o, mid, cx - 1 + o, bot, c); // stem
     }
-    pomodoroFocusMin = focusMinutes;
-    pomodoroBreakMin = breakMinutes;
-    pomodoroCompleted = 0;
-    pomodoroRunning = false;
-    beginPomodoroPhase(POMODORO_FOCUS);
-    savePomodoroConfig();
-  } else {
-    return false;
-  }
-
-  displayMode = MODE_POMODORO;
-  pomodoroChromeDrawn = false;
-  pomodoroLastTime = "";
-  return true;
-}
-
-void drawTomatoIcon() {
-  const int cx = SCREEN_CX, cy = 61;
-  tft.fillCircle(cx, cy + 2, 21, TFT_RED);
-  tft.drawCircle(cx, cy + 2, 21, 0xFBE0);
-  tft.fillTriangle(cx, cy - 23, cx - 5, cy - 13, cx + 5, cy - 13, TFT_GREEN);
-  tft.fillTriangle(cx - 13, cy - 15, cx - 2, cy - 10, cx - 5, cy - 20, TFT_GREEN);
-  tft.fillTriangle(cx + 13, cy - 15, cx + 2, cy - 10, cx + 5, cy - 20, TFT_GREEN);
-}
-
-void drawPomodoroScreen() {
-  if (!pomodoroChromeDrawn) {
-    tft.fillScreen(TFT_BLACK);
-    ringLastPct = -1000;
-    pomodoroLastTime = "";
-    drawCenteredMonoLabel(pomodoro_label_bits, POMODORO_LABEL_W, POMODORO_LABEL_H,
-                          SCREEN_CX, 17, TFT_LIGHTGREY);
-    drawTomatoIcon();
-    const uint8_t *phaseBits = pomodoroPhase == POMODORO_FOCUS ? focus_label_bits : break_label_bits;
-    drawCenteredMonoLabel(phaseBits, FOCUS_LABEL_W, FOCUS_LABEL_H, SCREEN_CX, 88,
-                          pomodoroPhase == POMODORO_FOCUS ? TFT_RED : TFT_GREEN);
-    const uint8_t *stateBits = pomodoroRunning ? running_label_bits : paused_label_bits;
-    drawCenteredMonoLabel(stateBits, RUNNING_LABEL_W, RUNNING_LABEL_H, SCREEN_CX, 174,
-                          pomodoroRunning ? TFT_WHITE : TFT_LIGHTGREY);
-    drawCenteredMonoLabel(completed_label_bits, COMPLETED_LABEL_W, COMPLETED_LABEL_H,
-                          104, 207, TFT_LIGHTGREY);
-    tft.setTextDatum(ML_DATUM);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(String(pomodoroCompleted), 124, 214, 2);
-    pomodoroChromeDrawn = true;
-  }
-
-  unsigned long duration = pomodoroDurationS(pomodoroPhase);
-  float remainingPct = duration > 0 ? 100.0f * pomodoroRemainingS / duration : 0;
-  uint16_t ringColor = !pomodoroRunning ? 0x4208
-      : pomodoroPhase == POMODORO_FOCUS ? TFT_RED : TFT_GREEN;
-  drawSquareRing(remainingPct, ringColor);
-
-  String time = pomodoroTimeText();
-  if (time != pomodoroLastTime) {
-    pomodoroLastTime = time;
-    tft.fillRect(22, 108, 196, 55, TFT_BLACK);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(time, SCREEN_CX, 135, 7);
+    tft.fillRect(cx - barHalf, cy + (int)(r * 0.08), barHalf * 2, 2, c);
+    tft.fillRect(cx - barHalf, cy + (int)(r * 0.26), barHalf * 2, 2, c);
   }
 }
 
-void drawQuotaText(float hourPct, float weekPct, bool force) {
-  // Codex dropped the 5h window (2026-07): the bridge then sends
-  // primary_pct=null, so collapse to a single centered weekly value.
-  bool single = hourPct < 0 && weekPct >= 0;
-  static int8_t lastSingle = -1;
-  if ((int8_t)single != lastSingle) {
-    lastSingle = (int8_t)single;
-    force = true;
-    // Keep the quota ring intact when switching between one and two columns.
-    // Clearing the full panel width used to erase both vertical ring segments.
-    int contentX = RING_MARGIN + RING_THICKNESS;
-    tft.fillRect(contentX, QUOTA_LABEL_Y, SCREEN_W - 2 * contentX,
-                 QUOTA_VALUE_Y + 26 - QUOTA_LABEL_Y, TFT_BLACK);
+void drawSalaryChrome() {
+  tft.fillScreen(SALARY_BG);
+  ringLastPct = -1000;
+  tft.setTextDatum(TL_DATUM);
+
+  // dim sparkle dots scattered around the bands the dynamic strips never touch
+  const int16_t sparks[][2] = {{14, 20},  {52, 6},   {190, 8},  {226, 26},
+                               {8, 92},   {232, 96}, {6, 162},  {234, 166},
+                               {118, 236}, {64, 234}, {178, 234}};
+  for (auto &xy : sparks) tft.fillRect(xy[0], xy[1], 2, 2, SALARY_SPARK);
+
+  // small floating coins; kept clear of every dynamic strip's worst case
+  drawSalaryCoin(24, 58, 8, false);
+  drawSalaryCoin(214, 52, 6, false);
+  drawSalaryCoin(10, 122, 6, false);
+  drawSalaryCoin(230, 130, 5, false);
+  drawSalaryCoin(26, 224, 7, false);
+  drawSalaryCoin(213, 222, 8, false);
+
+  // hero coin + title
+  drawSalaryCoin(SCREEN_CX, 64, 30, true);
+  drawSalaryLabel(salary_title_bits, SALARY_TITLE_W, SALARY_TITLE_H,
+                  SCREEN_CX - SALARY_TITLE_W / 2, 8, TFT_WHITE, SALARY_BG);
+
+  // rate caption (static per config): 每秒 +0.0142 元
+  const String rateAscii = salaryConfig.monthlyFen > 0
+                               ? "+" + String(salaryRatePerSecond(), 4)
+                               : "--";
+  const bool withYuan = salaryConfig.monthlyFen > 0;
+  const int gap = 5;
+  int lineW = 0;
+  if (withYuan) lineW += SALARY_RATE_PREFIX_W + gap;
+  lineW += tft.textWidth(rateAscii, 2);
+  if (withYuan) lineW += gap + SALARY_YUAN_W;
+  const int rx = SCREEN_CX - lineW / 2;
+  tft.fillRect(rx - 4, 149, lineW + 8, 20, SALARY_BG);
+  int cx1 = rx;
+  if (withYuan) {
+    drawSalaryLabel(salary_rate_prefix_bits, SALARY_RATE_PREFIX_W,
+                    SALARY_RATE_PREFIX_H, cx1, 150, SALARY_MUTED, SALARY_BG);
+    cx1 += SALARY_RATE_PREFIX_W + gap;
   }
-  tft.setTextDatum(TC_DATUM);
-  if (single) {
-    String v = pctText(weekPct);
-    if (force || v != lastQuotaWk) {
-      lastQuotaWk = v;
-      lastQuota5h = "";
-      int contentX = RING_MARGIN + RING_THICKNESS;
-      tft.fillRect(contentX, QUOTA_LABEL_Y, SCREEN_W - 2 * contentX,
-                   QUOTA_VALUE_Y + 26 - QUOTA_LABEL_Y, TFT_BLACK);
-      drawWeekQuotaInline(v, SCREEN_CX, QUOTA_INLINE_Y, TFT_WHITE);
+  tft.setTextColor(SALARY_MUTED, SALARY_BG);
+  tft.drawString(rateAscii, cx1, 151, 2);
+  if (withYuan) {
+    drawSalaryLabel(salary_yuan_bits, SALARY_YUAN_W, SALARY_YUAN_H,
+                    cx1 + tft.textWidth(rateAscii, 2) + gap, 150, SALARY_MUTED,
+                    SALARY_BG);
+  }
+
+  // bar track; the gold fill is repainted whenever the percent moves
+  tft.fillRoundRect(28, 174, 184, 8, 4, SALARY_TRACK);
+
+  salaryChromeDrawn = true;
+  salaryLastEarned = "";
+  salaryLastStatus = "";
+  salaryLastPctLine = "";
+  salaryLastPct = -1;
+}
+
+void drawSalaryScreen() {
+  const unsigned long utcEpoch = salaryCurrentEpoch();
+  const unsigned long localEpoch = utcEpoch == 0 ? 0 : utcEpoch + 8UL * 3600UL;
+  const long earnedSeconds = salaryElapsedWorkSeconds(localEpoch);
+  const double rate = salaryRatePerSecond();
+  const double earned = rate * earnedSeconds;
+  const String earnedText = salaryConfig.monthlyFen > 0 ? String(earned, 2) : "--";
+  const String status = salaryStatusText(localEpoch);
+
+  if (!salaryChromeDrawn) drawSalaryChrome();
+
+  if (earnedText != salaryLastEarned) {
+    salaryLastEarned = earnedText;
+    tft.fillRect(18, 94, 204, 54, SALARY_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(SALARY_GOLD, SALARY_BG);
+    const int numW = tft.textWidth(earnedText, 6);
+    const int x0 = SCREEN_CX - (numW + 5 + SALARY_YUAN_W) / 2;
+    tft.drawString(earnedText, x0, 97, 6);
+    if (salaryConfig.monthlyFen > 0) {
+      drawSalaryLabel(salary_yuan_bits, SALARY_YUAN_W, SALARY_YUAN_H,
+                      x0 + numW + 5, 112, SALARY_GOLD, SALARY_BG);
     }
-    return;
   }
-  if (force) {
-    drawBoldString("5H", QUOTA_COL1_X, QUOTA_LABEL_Y, 2, TFT_LIGHTGREY);
-    drawWeekQuotaLabel(QUOTA_COL2_X, QUOTA_LABEL_Y, TFT_LIGHTGREY);
+
+  const float progress = salaryDailyWorkSeconds() > 0
+      ? 100.0f * earnedSeconds / salaryDailyWorkSeconds() : 0;
+  const int pctInt = (int)(progress + 0.5f);
+  if (pctInt != salaryLastPct) {
+    salaryLastPct = pctInt;
+    tft.fillRoundRect(28, 174, 184, 8, 4, SALARY_TRACK);
+    int fillW = (int)(184.0f * progress / 100.0f + 0.5f);
+    if (fillW > 0) tft.fillRoundRect(28, 174, max(fillW, 8), 8, 4, SALARY_GOLD);
   }
-  String v1 = pctText(hourPct), v2 = pctText(weekPct);
-  if (force || v1 != lastQuota5h) {
-    lastQuota5h = v1;
-    tft.fillRect(QUOTA_COL1_X - 50, QUOTA_VALUE_Y, 100, 26, TFT_BLACK);
-    drawBoldString(v1, QUOTA_COL1_X, QUOTA_VALUE_Y, 4, TFT_WHITE);
-  }
-  if (force || v2 != lastQuotaWk) {
-    lastQuotaWk = v2;
-    tft.fillRect(QUOTA_COL2_X - 50, QUOTA_VALUE_Y, 100, 26, TFT_BLACK);
-    drawBoldString(v2, QUOTA_COL2_X, QUOTA_VALUE_Y, 4, TFT_WHITE);
-  }
-}
 
-// ---------- quota-exhausted countdown ----------
-// When the current app's 5h or weekly window is used up, the pet is replaced
-// by a countdown to that window's reset (bridge sends minutes-until-reset).
-// A spent weekly window blocks usage even after the 5h one resets, so the
-// weekly countdown takes priority when both are exhausted.
-
-enum CdType { CD_NONE, CD_5H, CD_WEEK };
-
-float currentHourPct() {
-  return currentApp == APP_CLAUDE ? claudeStatus.fiveHourPct : codexStatus.primaryPct;
-}
-
-int currentHourResetMin() {
-  return currentApp == APP_CLAUDE ? claudeStatus.fiveHourResetMin : codexStatus.primaryResetMin;
-}
-
-float currentWeekPct() {
-  return currentApp == APP_CLAUDE ? claudeStatus.sevenDayPct : codexStatus.weeklyPct;
-}
-
-int currentWeekResetMin() {
-  return currentApp == APP_CLAUDE ? claudeStatus.sevenDayResetMin : codexStatus.weeklyResetMin;
-}
-
-CdType desiredCountdown() {
-  if (currentWeekPct() >= 99.9f && currentWeekResetMin() >= 0) return CD_WEEK;
-  if (currentHourPct() >= 99.9f && currentHourResetMin() >= 0) return CD_5H;
-  return CD_NONE;
-}
-
-CdType showingCd = CD_NONE; // what's on screen now (vs desiredCountdown())
-String lastCountdown;
-
-// The bridge only reports whole minutes, so the seconds tick locally against
-// a deadline anchored at millis(). Re-anchor only when the bridge disagrees
-// by more than ~a minute (new window, big clock drift), otherwise a poll
-// landing mid-minute would make the seconds jump around.
-unsigned long cdDeadlineMs = 0; // 0 = not anchored
-ActiveApp cdApp = APP_CLAUDE;   // which app/window the anchor belongs to
-CdType cdAnchorType = CD_NONE;
-
-void syncCountdownDeadline() {
-  int m = showingCd == CD_WEEK ? currentWeekResetMin() : currentHourResetMin();
-  if (m < 0) {
-    cdDeadlineMs = 0;
-    return;
-  }
-  long bridgeSec = (long)m * 60 + 30; // bridge floors to minutes: assume mid-minute
-  long ourSec = (long)(cdDeadlineMs - millis()) / 1000;
-  if (cdDeadlineMs == 0 || cdApp != currentApp || cdAnchorType != showingCd || ourSec < 0 ||
-      labs(ourSec - bridgeSec) > 90) {
-    cdDeadlineMs = millis() + (unsigned long)bridgeSec * 1000UL;
-    cdApp = currentApp;
-    cdAnchorType = showingCd;
-  }
-}
-
-void drawCountdown(bool force) {
-  long remain = cdDeadlineMs ? (long)(cdDeadlineMs - millis()) / 1000
-                             : (long)(showingCd == CD_WEEK ? currentWeekResetMin() : currentHourResetMin()) * 60;
-  if (remain < 0) remain = 0;
-  char buf[16];
-  long hours = remain / 3600;
-  if (hours >= 100) // weekly can be up to 168h: h:mm:ss wouldn't fit the ring
-    snprintf(buf, sizeof(buf), "%ld:%02ld", hours, (remain % 3600) / 60);
-  else
-    snprintf(buf, sizeof(buf), "%ld:%02ld:%02ld", hours, (remain % 3600) / 60, remain % 60);
-  String t(buf);
-  if (!force && t == lastCountdown) return;
-  // in-place glyph overwrite can't erase a shrinking string (h:mm:ss width is
-  // constant, but 100:00 -> 99:59:59 changes layout once) - clear on any
-  // length change
-  if (t.length() != lastCountdown.length()) force = true;
-  lastCountdown = t;
-  tft.setTextDatum(TC_DATUM);
-  if (force) {
-    tft.fillRect(SCREEN_CX - 99, 66, 198, 84, TFT_BLACK);
-    if (showingCd == CD_WEEK)
-      drawWeekQuotaLabel(SCREEN_CX, 72, TFT_LIGHTGREY);
-    else
-      drawBoldString("5H RESET IN", SCREEN_CX, 72, 2, TFT_LIGHTGREY);
-  }
-  // Background-color draw overwrites glyphs in place (no clear-then-draw
-  // flash between seconds).
-  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-  tft.drawString(t, SCREEN_CX, 102, 6);
-}
-
-// App logo in the top-left corner (inside the quota ring) so a glance tells
-// which app the screen is currently showing. Drawn row-by-row from PROGMEM
-// through rowBuf, same as the sprite path.
-const int LOGO_X = 14, LOGO_Y = 18, LOGO_DISPLAY_W = 30, LOGO_DISPLAY_H = 30;
-
-void drawAppLogo() {
-  const uint16_t *logo = (currentApp == APP_CLAUDE) ? claude_logo_0 : codex_logo_0;
-  int w = (currentApp == APP_CLAUDE) ? CLAUDE_LOGO_W : CODEX_LOGO_W;
-  int h = (currentApp == APP_CLAUDE) ? CLAUDE_LOGO_H : CODEX_LOGO_H;
-  int loadedSourceRow = -1;
-  for (int y = 0; y < LOGO_DISPLAY_H; y++) {
-    int sourceY = y * h / LOGO_DISPLAY_H;
-    if (sourceY != loadedSourceRow) {
-      memcpy_P(prevRowBuf, logo + (size_t)sourceY * w, (size_t)w * 2);
-      loadedSourceRow = sourceY;
+  // 已挣 NN% — hidden entirely while unconfigured or before the clock syncs
+  const String pctLine =
+      salaryConfig.monthlyFen > 0 && utcEpoch != 0 ? pctText(progress) : "";
+  if (pctLine != salaryLastPctLine) {
+    salaryLastPctLine = pctLine;
+    tft.fillRect(76, 186, 88, 22, SALARY_BG);
+    if (pctLine.length()) {
+      const int lineW = SALARY_EARNED_PREFIX_W + 6 + tft.textWidth(pctLine, 2);
+      const int x0 = SCREEN_CX - lineW / 2;
+      drawSalaryLabel(salary_earned_prefix_bits, SALARY_EARNED_PREFIX_W,
+                      SALARY_EARNED_PREFIX_H, x0, 188, TFT_WHITE, SALARY_BG);
+      tft.setTextColor(TFT_WHITE, SALARY_BG);
+      tft.drawString(pctLine, x0 + SALARY_EARNED_PREFIX_W + 6, 190, 2);
     }
-    for (int x = 0; x < LOGO_DISPLAY_W; x++) {
-      rowBuf[x] = prevRowBuf[x * w / LOGO_DISPLAY_W];
-    }
-    tft.pushImage(LOGO_X, LOGO_Y + y, LOGO_DISPLAY_W, 1, rowBuf);
   }
-}
 
-// Codex's ring percentage: the 5h window when it exists, otherwise the
-// weekly one (Codex removed the 5h limit in 2026-07).
-float codexRingPct() {
-  if (codexStatus.primaryPct >= 0) return codexStatus.primaryPct;
-  return max(codexStatus.weeklyPct, 0.0f);
-}
-
-// Claude's ring percentage: real 5h OAuth quota from the bridge when known,
-// otherwise fall back to elapsed session time as a rough stand-in.
-float claudeRingPct() {
-  if (claudeStatus.fiveHourPct >= 0) return claudeStatus.fiveHourPct;
-  return claudeStatus.sessionWindowMin > 0
-             ? (100.0 * claudeStatus.sessionMin / claudeStatus.sessionWindowMin)
-             : 0;
-}
-
-// Redraws whichever app is currently active, full screen: quota ring +
-// sprite (or the reset countdown while the 5h window is exhausted).
-// Full clear + repaint - only for real transitions (app switch, mode return,
-// sprite change); steady-state data updates go through refreshActiveApp().
-void drawActiveApp() {
-  tft.fillScreen(TFT_BLACK);
-  ringLastPct = -1000; // screen was cleared: force the ring repaint
-  showingCd = desiredCountdown();
-  if (showingCd != CD_NONE) syncCountdownDeadline();
-  else cdDeadlineMs = 0;
-  if (currentApp == APP_CLAUDE) {
-    drawSquareRing(claudeRingPct(), currentStatusColor());
-    if (showingCd == CD_NONE) drawClaudeSprite(claudeFrame);
-    drawQuotaText(claudeRingPct(), claudeStatus.sevenDayPct, true);
-  } else {
-    drawSquareRing(codexRingPct(), currentStatusColor());
-    if (showingCd == CD_NONE) drawCodexSprite(codexFrame);
-    drawQuotaText(codexStatus.primaryPct, codexStatus.weeklyPct, true);
-  }
-  if (showingCd != CD_NONE) drawCountdown(true);
-  drawAppLogo();
-}
-
-// In-place refresh after a bridge poll: ring repaint + only the text that
-// actually changed. No fillScreen, so the 5s poll doesn't blank the screen.
-void refreshActiveApp() {
-  if (desiredCountdown() != showingCd) { // pet <-> countdown (or 5h <-> weekly) swap
-    drawActiveApp();
-    return;
-  }
-  if (currentApp == APP_CLAUDE) {
-    drawSquareRing(claudeRingPct(), currentStatusColor());
-    drawQuotaText(claudeRingPct(), claudeStatus.sevenDayPct, false);
-  } else {
-    drawSquareRing(codexRingPct(), currentStatusColor());
-    drawQuotaText(codexStatus.primaryPct, codexStatus.weeklyPct, false);
-  }
-  if (showingCd != CD_NONE) {
-    syncCountdownDeadline();
-    drawCountdown(false);
-  }
-}
-
-// Redraws just the ring (cheap) - used for status color animation ticks
-// between full redraws.
-void redrawRingOnly() {
-  if (currentApp == APP_CLAUDE) {
-    drawSquareRing(claudeRingPct(), currentStatusColor());
-  } else {
-    drawSquareRing(codexRingPct(), currentStatusColor());
-  }
-}
-
-// Who gets the screen:
-//   - display mode pinned (Mac app) -> that app, always
-//   - exactly one app working       -> that app, immediately
-//   - both working                  -> alternate every SWITCH_BOTH_MS (2s)
-//   - neither working               -> alternate slowly (SWITCH_IDLE_MS)
-bool updateActiveApp() {
-  ActiveApp desired = currentApp;
-
-  if (displayMode == MODE_CLAUDE) {
-    desired = APP_CLAUDE;
-  } else if (displayMode == MODE_CODEX) {
-    desired = APP_CODEX;
-  } else if (claudeStatus.needsInput && !codexStatus.needsInput) {
-    desired = APP_CLAUDE; // approval prompt wins the screen
-  } else if (codexStatus.needsInput && !claudeStatus.needsInput) {
-    desired = APP_CODEX;
-  } else {
-    bool claudeWorking = claudeStatus.status == "working";
-    bool codexWorking = codexStatus.status == "working";
-    if (claudeWorking && !codexWorking) {
-      desired = APP_CLAUDE;
-    } else if (codexWorking && !claudeWorking) {
-      desired = APP_CODEX;
-    } else {
-      unsigned long interval = (claudeWorking && codexWorking) ? SWITCH_BOTH_MS : SWITCH_IDLE_MS;
-      if (millis() - lastSwitchMs >= interval) {
-        lastSwitchMs = millis();
-        desired = (currentApp == APP_CLAUDE) ? APP_CODEX : APP_CLAUDE;
+  if (status != salaryLastStatus) {
+    salaryLastStatus = status;
+    tft.fillRect(60, 212, 120, 18, SALARY_BG);
+    struct SalaryStatusArt {
+      const char *key;
+      const uint8_t *bits;
+      int width;
+    };
+    const SalaryStatusArt art[] = {
+        {"EARNING NOW", salary_status_earning_bits, SALARY_STATUS_EARNING_W},
+        {"LUNCH BREAK - PAUSED", salary_status_lunch_bits, SALARY_STATUS_LUNCH_W},
+        {"WEEKEND - PAUSED", salary_status_weekend_bits, SALARY_STATUS_WEEKEND_W},
+        {"BEFORE WORK", salary_status_before_bits, SALARY_STATUS_BEFORE_W},
+        {"WORKDAY COMPLETE", salary_status_after_bits, SALARY_STATUS_AFTER_W},
+        {"CONFIGURE SALARY", salary_status_config_bits, SALARY_STATUS_CONFIG_W},
+        {"WAITING FOR CLOCK", salary_status_clock_bits, SALARY_STATUS_CLOCK_W},
+    };
+    const uint16_t color = status == "EARNING NOW" ? SALARY_GOLD : SALARY_MUTED;
+    for (const auto &entry : art) {
+      if (status == entry.key) {
+        drawSalaryLabel(entry.bits, entry.width, SALARY_STATUS_EARNING_H,
+                        SCREEN_CX - entry.width / 2, 213, color, SALARY_BG);
+        break;
       }
     }
   }
-
-  if (desired != currentApp) {
-    currentApp = desired;
-    lastSwitchMs = millis();
-    return true;
-  }
-  return false;
 }
 
-// ---------- net speed screen ----------
+void drawSquareRing(float pct, uint16_t color) {
+  const int margin = 4;
+  const int thickness = 2;
+  const int side = SCREEN_W - margin * 2;
+  int remaining = (int)(side * 4L * constrain(pct, 0.0f, 100.0f) / 100.0f);
+  tft.fillRect(margin, margin, side, thickness, color);
+  remaining -= side;
+  if (remaining <= 0) return;
+  int segment = min(remaining, side);
+  tft.fillRect(SCREEN_W - margin - thickness, margin, thickness, segment, color);
+  remaining -= side;
+  if (remaining <= 0) return;
+  segment = min(remaining, side);
+  tft.fillRect(SCREEN_W - margin - segment, SCREEN_H - margin - thickness, segment, thickness, color);
+  remaining -= side;
+  if (remaining <= 0) return;
+  segment = min(remaining, side);
+  tft.fillRect(margin, SCREEN_H - margin - segment, thickness, segment, color);
+}
 
-String speedText(long bps) {
-  char buf[16];
-  if (bps >= 1000000) snprintf(buf, sizeof(buf), "%.1fM", bps / 1000000.0);
-  else if (bps >= 1000) snprintf(buf, sizeof(buf), "%.0fK", bps / 1000.0);
-  else snprintf(buf, sizeof(buf), "%ldB", bps);
-  return String(buf);
+void drawBatteryIndicator() {
+  const HardwareFeatures::BatteryState &battery = HardwareFeatures::battery();
+  const int areaX = 174, areaY = 18, areaW = 54, areaH = 15;
+  tft.fillRect(areaX, areaY, areaW, areaH, TFT_BLACK);
+  if (!battery.supported || !battery.present) return;
+
+  const uint16_t color = battery.charging ? TFT_CYAN
+                         : battery.level <= 15 ? TFT_RED
+                                               : TFT_LIGHTGREY;
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(String(battery.level) + "%", 203, areaY + 3, 1);
+
+  const int batteryX = 208, batteryY = areaY + 2, batteryW = 17, batteryH = 10;
+  tft.drawRect(batteryX, batteryY, batteryW, batteryH, color);
+  tft.fillRect(batteryX + batteryW, batteryY + 3, 2, 4, color);
+  const int fillWidth = max(1, (batteryW - 4) * battery.level / 100);
+  tft.fillRect(batteryX + 2, batteryY + 2, fillWidth, batteryH - 4, color);
+}
+
+void applyScreenRotation(uint8_t rotation) {
+  rotation &= 3;
+  if (rotation == screenRotation) return;
+  screenRotation = rotation;
+  tft.setRotation(screenRotation);
+  tft.fillScreen(TFT_BLACK);
+  musicChromeDrawn = false;
+  stockChromeDrawn = false;
+  stockDirty = true;
+  stockNamesDrawnRev = -1;
+  weatherChromeDrawn = false;
+  weatherScreenDrawnRev = -1;
+  weatherLastSecond = -1;
+  if (!mainUiShown) return;
+  DisplayMode mode = effectiveMode();
+  if (mode == MODE_MUSIC) {
+    lastMusicPollMs = 0;
+  } else if (mode == MODE_STOCK) {
+    lastStockPollMs = 0;
+  } else if (mode == MODE_WEATHER) {
+    lastWeatherPollMs = 0;
+  } else if (mode == MODE_SALARY) {
+    salaryChromeDrawn = false;
+    drawSalaryScreen();
+  }
+  Serial.printf("[hardware] screen rotation=%u\n", screenRotation);
 }
 
 // pushImage() colors must be pre-byte-swapped (this firmware never enables
-// setSwapBytes; see the sprite pipeline). Natural RGB565 -> wire order:
+// setSwapBytes). Natural RGB565 -> wire order:
 inline uint16_t swap565(uint16_t c) { return (uint16_t)((c << 8) | (c >> 8)); }
-
-void resetNetChart() {
-  memset(netHistRx, 0, sizeof(netHistRx));
-  memset(netHistTx, 0, sizeof(netHistTx));
-  netScale = 10240;
-  netLastDl = "";
-  netLastUl = "";
-  netLastScaleText = "";
-  netLastCpuVal = "";
-  netLastMemVal = "";
-  netSysLabelsDrawn = false;
-  netQHead = 0;
-  netQCount = 0;
-  netSeq = -1;
-}
-
-// Adaptive full scale: the window's peak always lands at ~87% of the chart
-// height, so the undulation stays visible no matter the absolute speed.
-// (The old 1/2/5 stepped scale could squash everything to under half height.)
-long adaptiveNetScale(long maxV) {
-  long s = maxV + maxV / 7; // ~1.15x headroom above the peak
-  return s > 10240 ? s : 10240;
-}
-
-// Static chrome: labels that never change while in net mode.
-void drawNetChrome() {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(0x7BEF, TFT_BLACK);
-  tft.drawString("DOWN", 14, 10, 1);
-  tft.drawString("UP", 134, 10, 1);
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("MAC NET  -  56s", SCREEN_CX, 226, 1); // below the CPU/MEM row
-}
-
-// Mac CPU / memory usage row between the chart and the footer: small grey
-// labels at fixed positions, big font-4 values left-aligned at fixed x so a
-// width change (5% -> 30%) never shifts the rest of the row around.
-// Hidden only if an old bridge doesn't send the fields yet.
-const int NET_SYS_Y = 192;                          // row top (26px tall, font 4)
-const int NET_CPU_LABEL_X = 28, NET_CPU_VAL_X = 62; // value region 62..126 ("100%" = 63px)
-const int NET_MEM_LABEL_X = 130, NET_MEM_VAL_X = 164;
-
-void drawNetSysinfoIfChanged() {
-  if (netCpuPct < 0) {
-    if (netSysLabelsDrawn) { // bridge stopped sending: erase the whole row
-      tft.fillRect(0, NET_SYS_Y, SCREEN_W, 26, TFT_BLACK);
-      netSysLabelsDrawn = false;
-      netLastCpuVal = "";
-      netLastMemVal = "";
-    }
-    return;
-  }
-  tft.setTextDatum(TL_DATUM);
-  if (!netSysLabelsDrawn) {
-    netSysLabelsDrawn = true;
-    tft.setTextColor(0x7BEF, TFT_BLACK);
-    tft.drawString("CPU", NET_CPU_LABEL_X, NET_SYS_Y + 6, 2);
-    tft.drawString("MEM", NET_MEM_LABEL_X, NET_SYS_Y + 6, 2);
-  }
-  String c = String(netCpuPct) + "%", m = String(netMemPct) + "%";
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  if (c != netLastCpuVal) {
-    netLastCpuVal = c;
-    tft.fillRect(NET_CPU_VAL_X, NET_SYS_Y, 64, 26, TFT_BLACK);
-    tft.drawString(c, NET_CPU_VAL_X, NET_SYS_Y, 4);
-  }
-  if (m != netLastMemVal) {
-    netLastMemVal = m;
-    tft.fillRect(NET_MEM_VAL_X, NET_SYS_Y, 64, 26, TFT_BLACK);
-    tft.drawString(m, NET_MEM_VAL_X, NET_SYS_Y, 4);
-  }
-}
-
-// Header readouts (1s-averaged), each repainted only when its text changes.
-void drawNetHeaderIfChanged() {
-  String dl = speedText(netCurRx) + "/s";
-  String ul = speedText(netCurTx) + "/s";
-  tft.setTextDatum(TL_DATUM);
-  if (dl != netLastDl) {
-    netLastDl = dl;
-    tft.fillRect(12, 20, 116, 28, TFT_BLACK);
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString(dl, 12, 20, 4);
-  }
-  if (ul != netLastUl) {
-    netLastUl = ul;
-    tft.fillRect(132, 20, 108, 28, TFT_BLACK);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(ul, 132, 20, 4);
-  }
-}
-
-// Repaints the whole chart region from the sample ring, one row at a time
-// through rowBuf (a single pushImage per row = no clear-then-draw flicker).
-// Download is a dim-green filled area with a bright top edge; upload is a
-// 2px yellow line on top; faint gridlines at 25/50/75%.
-void drawNetChart() {
-  static const uint16_t COL_GRID = swap565(0x2104);   // very dark grey
-  static const uint16_t COL_FILL = swap565(0x02A0);   // dim green
-  static const uint16_t COL_EDGE = swap565(TFT_GREEN);
-  static const uint16_t COL_UL = swap565(TFT_YELLOW);
-  static const uint16_t COL_BLACK = swap565(TFT_BLACK);
-
-  long maxV = 0;
-  for (int i = 0; i < NET_CHART_W; i++) {
-    if (netHistRx[i] > maxV) maxV = netHistRx[i];
-    if (netHistTx[i] > maxV) maxV = netHistTx[i];
-  }
-  netScale = adaptiveNetScale(maxV);
-
-  // Per-column heights (3-tap smoothed), then per-column line "bands": each
-  // band spans from the previous column's height to this one's, so steep
-  // rises/falls render as connected vertical strokes instead of detached
-  // stair-step dots — that's what makes the undulation read as a continuous
-  // line, like the Mac mirror's stroked polyline.
-  static uint8_t hRx[NET_CHART_W], hTx[NET_CHART_W];
-  static uint8_t dlLo[NET_CHART_W], dlHi[NET_CHART_W]; // DL edge band, incl. 3px weight
-  static uint8_t ulLo[NET_CHART_W], ulHi[NET_CHART_W]; // UL line band
-  // The panel is physically tiny (2.7cm across), so the stroke must be much
-  // thicker than the Mac mirror's to read at the same visual weight.
-  const int LINE_T = 10; // stroke thickness in px
-  for (int i = 0; i < NET_CHART_W; i++) {
-    int lo = i > 0 ? i - 1 : 0, hi = i < NET_CHART_W - 1 ? i + 1 : NET_CHART_W - 1;
-    long rx = (netHistRx[lo] + netHistRx[i] + netHistRx[hi]) / 3;
-    long tx = (netHistTx[lo] + netHistTx[i] + netHistTx[hi]) / 3;
-    int hr = (int)((float)rx / netScale * (NET_CHART_H - 2));
-    int ht = (int)((float)tx / netScale * (NET_CHART_H - 2));
-    hRx[i] = (uint8_t)constrain(hr, 0, NET_CHART_H - 1);
-    hTx[i] = (uint8_t)constrain(ht, 0, NET_CHART_H - 1);
-  }
-  for (int i = 0; i < NET_CHART_W; i++) {
-    int prevR = i > 0 ? hRx[i - 1] : hRx[0];
-    int prevT = i > 0 ? hTx[i - 1] : hTx[0];
-    dlHi[i] = (uint8_t)max((int)hRx[i], prevR);
-    dlLo[i] = (uint8_t)max(0, min((int)hRx[i], prevR) - (LINE_T - 1));
-    ulHi[i] = (uint8_t)max((int)hTx[i], prevT);
-    ulLo[i] = (uint8_t)max(0, min((int)hTx[i], prevT) - (LINE_T - 1));
-  }
-
-  for (int row = 0; row < NET_CHART_H; row++) {
-    int yFromBot = NET_CHART_H - 1 - row;
-    bool gridRow = (row == NET_CHART_H / 4 || row == NET_CHART_H / 2 || row == 3 * NET_CHART_H / 4);
-    for (int i = 0; i < NET_CHART_W; i++) {
-      uint16_t c = gridRow ? COL_GRID : COL_BLACK;
-      if (yFromBot <= dlHi[i] && yFromBot >= dlLo[i]) c = COL_EDGE;
-      else if (yFromBot < dlLo[i]) c = COL_FILL;
-      if (ulHi[i] > 0 && yFromBot <= ulHi[i] && yFromBot >= ulLo[i]) c = COL_UL;
-      rowBuf[i] = c;
-    }
-    tft.pushImage(NET_CHART_X, NET_CHART_Y + row, NET_CHART_W, 1, rowBuf);
-    if ((row & 31) == 31) yield();
-  }
-
-  // axis label (outside the chart, so it never gets repainted over)
-  String scaleText = speedText(netScale);
-  if (scaleText != netLastScaleText) {
-    netLastScaleText = scaleText;
-    tft.fillRect(120, 48, 112, 10, TFT_BLACK);
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(0x7BEF, TFT_BLACK);
-    tft.drawString(scaleText, NET_CHART_X + NET_CHART_W, 48, 1);
-    tft.setTextDatum(TL_DATUM);
-  }
-}
-
-// Chart tick, every NET_DRAW_INTERVAL_MS: shift in queued sample(s), then
-// one atomic repaint. If the queue backs up after a slow poll, it works off
-// up to three samples per tick until it's back in step.
-void netDrawTick() {
-  if (!netChromeDrawn) {
-    resetNetChart();
-    drawNetChrome();
-    netChromeDrawn = true;
-    netHeaderDirty = true;
-  }
-  if (netHeaderDirty) {
-    drawNetHeaderIfChanged();
-    drawNetSysinfoIfChanged();
-    netHeaderDirty = false;
-  }
-  if (netQCount == 0) return;
-  int steps = min(netQCount, netQCount > 16 ? 3 : 1);
-  while (steps-- > 0 && netQCount > 0) {
-    memmove(netHistRx, netHistRx + 1, sizeof(long) * (NET_CHART_W - 1));
-    memmove(netHistTx, netHistTx + 1, sizeof(long) * (NET_CHART_W - 1));
-    netHistRx[NET_CHART_W - 1] = netQRx[netQHead];
-    netHistTx[NET_CHART_W - 1] = netQTx[netQHead];
-    netQHead = (netQHead + 1) % NET_QUEUE;
-    netQCount--;
-  }
-  drawNetChart();
-}
-
-// Ingests one /net payload (from HTTP polling or a serial #NET frame) into
-// the sample queue. The seq field tells us which samples we've already
-// queued, so overlapping tails are fine.
-bool handleNetPayload(const String &payload) {
-  JsonDocument doc;
-  if (deserializeJson(doc, payload)) return false;
-  netCurRx = doc["rx_bps"] | 0L;
-  netCurTx = doc["tx_bps"] | 0L;
-  netCpuPct = doc["cpu_pct"] | -1;
-  netMemPct = doc["mem_pct"] | -1;
-  netHeaderDirty = true;
-  long seq = doc["seq"] | -1L;
-  JsonArray rx = doc["rx"], tx = doc["tx"];
-  int n = min(rx.size(), tx.size());
-  // how many of the tail samples are new to us
-  int fresh = (netSeq < 0) ? min(n, 8) : (int)min((long)n, seq - netSeq);
-  if (fresh < 0) fresh = 0;
-  for (int i = n - fresh; i < n; i++) {
-    if (netQCount >= NET_QUEUE) break; // queue full: drop the excess
-    int tail = (netQHead + netQCount) % NET_QUEUE;
-    netQRx[tail] = rx[i].as<long>();
-    netQTx[tail] = tx[i].as<long>();
-    netQCount++;
-  }
-  if (seq >= 0) netSeq = seq;
-  return true;
-}
-
-// Refills the sample queue from the bridge's /net endpoint.
-void pollNet() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
-  WiFiClient client;
-  HTTPClient http;
-  String url = "http://" + bridgeHost + "/net";
-  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return;
-  int code = http.GET();
-  if (code == HTTP_CODE_OK) handleNetPayload(http.getString());
-  http.end();
-}
 
 String timeText(int sec) {
   if (sec < 0) sec = 0;
@@ -1378,12 +859,268 @@ void pollMusic() {
   http.end();
 }
 
+// ---------- FuBoTV-style weather clock screen ----------
+
+unsigned long weatherCurrentEpoch() {
+  if (weatherEpoch == 0) return 0;
+  return weatherEpoch + (millis() - weatherEpochReceivedAtMs) / 1000UL;
+}
+
+void drawWeatherSeconds(bool force = false) {
+  const unsigned long epoch = weatherCurrentEpoch();
+  if (epoch == 0) return;
+  const int second = epoch % 60UL;
+  if (!force && second == weatherLastSecond) return;
+  weatherLastSecond = second;
+
+  char value[3] = {};
+  snprintf(value, sizeof(value), "%02d", second);
+  tft.fillRect(196, 101, 40, 38, TFT_BLACK);
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(value, WEATHER_SECONDS_X + 23, WEATHER_SECONDS_Y, 4);
+}
+
+void drawWeatherAstronautFrame(int frameIndex) {
+  if (!fileSystemReady || weatherAstronautFrames <= 0) return;
+  frameIndex %= weatherAstronautFrames;
+  if (frameIndex < 0) frameIndex += weatherAstronautFrames;
+
+  File file = LittleFS.open(WEATHER_ASTRONAUT_FILE, "r");
+  if (!file) return;
+  const size_t rowBytes = (size_t)WEATHER_ASTRONAUT_W * 2;
+  const size_t frameOffset =
+      2 + (size_t)frameIndex * WEATHER_ASTRONAUT_FRAME_BYTES;
+  if (!file.seek(frameOffset)) {
+    file.close();
+    return;
+  }
+
+  for (int row = 0; row < WEATHER_ASTRONAUT_H; ++row) {
+    if (file.read((uint8_t *)rowBuf, rowBytes) != (int)rowBytes) break;
+    tft.pushImage(
+        WEATHER_ASTRONAUT_X,
+        WEATHER_ASTRONAUT_Y + row,
+        WEATHER_ASTRONAUT_W,
+        1,
+        rowBuf);
+    if ((row & 0x0F) == 0x0F) yield();
+  }
+  file.close();
+}
+
+bool installWeatherAstronautPack() {
+  if (!inspectWeatherAstronautFile(WEATHER_ASTRONAUT_TEMP_FILE, false)) {
+    LittleFS.remove(WEATHER_ASTRONAUT_TEMP_FILE);
+    return false;
+  }
+
+  LittleFS.remove(WEATHER_ASTRONAUT_BACKUP_FILE);
+  const bool hadCurrent = LittleFS.exists(WEATHER_ASTRONAUT_FILE);
+  if (hadCurrent &&
+      !LittleFS.rename(WEATHER_ASTRONAUT_FILE, WEATHER_ASTRONAUT_BACKUP_FILE)) {
+    LittleFS.remove(WEATHER_ASTRONAUT_TEMP_FILE);
+    return false;
+  }
+  if (!LittleFS.rename(WEATHER_ASTRONAUT_TEMP_FILE, WEATHER_ASTRONAUT_FILE)) {
+    if (hadCurrent) {
+      LittleFS.rename(WEATHER_ASTRONAUT_BACKUP_FILE, WEATHER_ASTRONAUT_FILE);
+    }
+    return false;
+  }
+  if (!inspectWeatherAstronautFile(WEATHER_ASTRONAUT_FILE, true)) {
+    LittleFS.remove(WEATHER_ASTRONAUT_FILE);
+    if (hadCurrent) {
+      LittleFS.rename(WEATHER_ASTRONAUT_BACKUP_FILE, WEATHER_ASTRONAUT_FILE);
+      inspectWeatherAstronautFile(WEATHER_ASTRONAUT_FILE, true);
+    }
+    return false;
+  }
+  LittleFS.remove(WEATHER_ASTRONAUT_BACKUP_FILE);
+  return true;
+}
+
+bool downloadWeatherAstronautPack() {
+  if (!fileSystemReady || WiFi.status() != WL_CONNECTED ||
+      bridgeHost.length() == 0) {
+    return false;
+  }
+  lastWeatherAstronautDownloadMs = millis();
+
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/weather/astronaut.raw";
+  http.setTimeout(15000);
+  if (!http.begin(client, url)) return false;
+  const int code = http.GET();
+  const int contentLength = http.getSize();
+  if (code != HTTP_CODE_OK ||
+      contentLength != (int)WEATHER_ASTRONAUT_PACK_BYTES) {
+    http.end();
+    return false;
+  }
+
+  LittleFS.remove(WEATHER_ASTRONAUT_TEMP_FILE);
+  File file = LittleFS.open(WEATHER_ASTRONAUT_TEMP_FILE, "w");
+  if (!file) {
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  size_t received = 0;
+  bool ok = true;
+  while (received < WEATHER_ASTRONAUT_PACK_BYTES) {
+    const size_t remaining = WEATHER_ASTRONAUT_PACK_BYTES - received;
+    const size_t chunk = min(remaining, sizeof(rowBuf));
+    const size_t read = stream->readBytes((uint8_t *)rowBuf, chunk);
+    if (read == 0 || file.write((uint8_t *)rowBuf, read) != read) {
+      ok = false;
+      break;
+    }
+    received += read;
+    yield();
+  }
+  file.close();
+  http.end();
+
+  if (!ok || received != WEATHER_ASTRONAUT_PACK_BYTES) {
+    LittleFS.remove(WEATHER_ASTRONAUT_TEMP_FILE);
+    return false;
+  }
+  if (!installWeatherAstronautPack()) return false;
+
+  Serial.printf(
+      "[weather] downloaded astronaut pack revision=%d frames=%d bytes=%u\n",
+      weatherAstronautLoadedRevision,
+      weatherAstronautFrames,
+      (unsigned int)received);
+  return true;
+}
+
+bool drawWeatherFrameFromBridge() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/weather/screen.raw";
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return false;
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK ||
+      (http.getSize() >= 0 && http.getSize() != SCREEN_W * SCREEN_H * 2)) {
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  const size_t rowBytes = (size_t)SCREEN_W * 2;
+  bool ok = true;
+  for (int row = 0; row < SCREEN_H; ++row) {
+    if (stream->readBytes((uint8_t *)rowBuf, rowBytes) != (int)rowBytes) {
+      ok = false;
+      break;
+    }
+    renderWeatherBaseRow(row, !weatherChromeDrawn);
+    yield();
+  }
+  http.end();
+  // A short read may have replaced some panel rows.  Keep the previous
+  // fingerprint cache out of use until a successful transfer repaints in full.
+  if (!ok) {
+    weatherChromeDrawn = false;
+    return false;
+  }
+
+  weatherChromeDrawn = true;
+  weatherScreenDrawnRev = weatherScreenRev;
+  weatherBaseCacheValid = true;
+  weatherLastSecond = -1;
+  drawWeatherSeconds(true);
+  drawWeatherAstronautFrame(weatherAstronautFrame);
+  if (HardwareFeatures::battery().present) drawBatteryIndicator();
+  return true;
+}
+
+void drawWeatherFallback() {
+  if (weatherChromeDrawn) return;
+  weatherBaseCacheValid = false;
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Weather clock", SCREEN_CX, 102, 4);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawString("Connect Wi-Fi bridge", SCREEN_CX, 132, 2);
+  weatherChromeDrawn = true;
+}
+
+bool handleWeatherPayload(const String &payload) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return false;
+  const unsigned long epoch = doc["epoch"] | 0UL;
+  const long rev = doc["screen_rev"] | -1L;
+  if (epoch == 0 || rev < 0) return false;
+  weatherEpoch = epoch;
+  weatherEpochReceivedAtMs = millis();
+  weatherScreenRev = rev;
+  weatherAstronautRevision = doc["astronaut_rev"] | -1;
+  return true;
+}
+
+#if defined(ARDUINO_ARCH_ESP8266) && !AICLOCK_WIRED_ONLY
+unsigned long lastPrinterPollMs = 0;
+void pollPrinterBridge() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(750);
+  if (!http.begin(client, "http://" + bridgeHost + "/printer")) return;
+  const int code = http.GET();
+  const int length = http.getSize();
+  // Require bounded Content-Length; never allocate from an untrusted body size.
+  if (code == HTTP_CODE_OK && length > 0 && length <= 2048) {
+    static char payload[2049];
+    auto *stream = http.getStreamPtr();
+    stream->setTimeout(750);
+    if (stream->readBytes(payload, length) == static_cast<size_t>(length))
+      PrinterMonitor::ingestBridge(payload, length);
+  }
+  http.end();
+}
+#endif
+
+void pollWeather() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) {
+    drawWeatherFallback();
+    return;
+  }
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/weather";
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return;
+  const int code = http.GET();
+  const bool parsed = code == HTTP_CODE_OK && handleWeatherPayload(http.getString());
+  http.end();
+  if (parsed &&
+      weatherAstronautRevision >= 0 &&
+      weatherAstronautLoadedRevision != weatherAstronautRevision &&
+      (lastWeatherAstronautDownloadMs == 0 ||
+       millis() - lastWeatherAstronautDownloadMs >= WEATHER_ASTRONAUT_RETRY_MS)) {
+    downloadWeatherAstronautPack();
+  }
+  if (parsed && (!weatherChromeDrawn || weatherScreenDrawnRev != weatherScreenRev)) {
+    if (!drawWeatherFrameFromBridge()) drawWeatherFallback();
+  }
+}
+
 // ---------- stock watchlist screen ----------
 
 bool handleStockPayload(const String &payload) {
   JsonDocument doc;
   if (deserializeJson(doc, payload)) return false;
   JsonArray arr = doc["stocks"];
+  if (arr.isNull()) return false;
+  int previousCount = stockCount;
   stockCount = 0;
   for (JsonObject s : arr) {
     if (stockCount >= MAX_STOCKS) break;
@@ -1394,6 +1131,7 @@ bool handleStockPayload(const String &payload) {
     stockCount++;
   }
   stockNamesRev = doc["names_rev"] | -1;
+  if (previousCount != stockCount) stockChromeDrawn = false;
   stockEverLoaded = true;
   stockDirty = true;
   return true;
@@ -1401,7 +1139,36 @@ bool handleStockPayload(const String &payload) {
 
 // Streams the Mac-rendered name strips and blits one per row on the left side
 // of the top line. Wired-only mode has no HTTP: codes still show on the right.
-bool drawStockNames() {
+bool drawStockNamesFromSerialCache() {
+  if (!fileSystemReady || serialStockNamesRev != stockNamesRev ||
+      !LittleFS.exists(STOCK_NAMES_SERIAL_FILE)) {
+    return false;
+  }
+  File file = LittleFS.open(STOCK_NAMES_SERIAL_FILE, "r");
+  if (!file) return false;
+  uint8_t cnt = 0;
+  if (file.read(&cnt, 1) != 1 || cnt > MAX_STOCKS) {
+    file.close();
+    return false;
+  }
+  const size_t rowBytes = (size_t)STOCK_NAME_W * 2;
+  bool ok = true;
+  for (int i = 0; i < cnt && ok; i++) {
+    int y0 = stockRowTop(i);
+    for (int r = 0; r < STOCK_NAME_H; r++) {
+      if (file.read((uint8_t *)rowBuf, rowBytes) != (int)rowBytes) {
+        ok = false;
+        break;
+      }
+      if (i < stockCount) tft.pushImage(14, y0 + r, STOCK_NAME_W, 1, rowBuf);
+      yield();
+    }
+  }
+  file.close();
+  return ok;
+}
+
+bool drawStockNamesFromBridge() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
   WiFiClient client;
   HTTPClient http;
@@ -1422,7 +1189,7 @@ bool drawStockNames() {
   const size_t rowBytes = (size_t)STOCK_NAME_W * 2;
   bool ok = true;
   for (int i = 0; i < cnt && ok; i++) {
-    int y0 = 10 + i * 54;
+    int y0 = stockRowTop(i);
     for (int r = 0; r < STOCK_NAME_H; r++) {
       if (stream->readBytes((uint8_t *)rowBuf, rowBytes) != (int)rowBytes) {
         ok = false;
@@ -1434,6 +1201,11 @@ bool drawStockNames() {
   }
   http.end();
   return ok;
+}
+
+bool drawStockNames() {
+  if (drawStockNamesFromSerialCache()) return true;
+  return drawStockNamesFromBridge();
 }
 
 void pollStock() {
@@ -1481,8 +1253,8 @@ void drawStockScreen() {
     return;
   }
 
-  for (int i = 0; i < MAX_STOCKS; i++) {
-    int y0 = 10 + i * 54;
+  for (int i = 0; i < stockCount; i++) {
+    int y0 = stockRowTop(i);
     bool has = i < stockCount;
     // top line (name strip + code) and value line refresh independently, so
     // a price tick never wipes the name bitmap
@@ -1500,7 +1272,7 @@ void drawStockScreen() {
     String valKey = has ? stocks[i].price + "|" + stocks[i].pct + "|" + String(stocks[i].up) : "";
     if (valKey != stockLastVal[i]) {
       stockLastVal[i] = valKey;
-      tft.fillRect(0, y0 + 18, SCREEN_W, 36, TFT_BLACK); // value line + inter-row gap
+      tft.fillRect(0, y0 + 18, SCREEN_W, 26, TFT_BLACK);
       if (has) {
         tft.setTextDatum(TL_DATUM);
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -1561,10 +1333,7 @@ void setupWiFi() {
 }
 
 void setupWiredOnly() {
-  WiFi.persistent(false);
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  WiFi.forceSleepBegin();
+  platformDisableWiFi();
   delay(1);
 
   tft.fillScreen(TFT_BLACK);
@@ -1584,49 +1353,31 @@ bool parseStatusJson(const String &payload) {
   DeserializationError err = deserializeJson(doc, payload);
   if (err) return false;
 
-  JsonObject c = doc["claude"];
-  if (!c.isNull()) {
-    claudeStatus.status = c["status"] | "unknown";
-    claudeStatus.tokensToday = c["tokens_today"] | 0;
-    claudeStatus.sessionMin = c["session_min"] | 0;
-    claudeStatus.sessionWindowMin = c["session_window_min"] | 300;
-    claudeStatus.fiveHourPct = c["five_hour_pct"] | -1.0;
-    claudeStatus.fiveHourResetMin = c["five_hour_reset_min"] | -1;
-    claudeStatus.sevenDayPct = c["seven_day_pct"] | -1.0;
-    claudeStatus.sevenDayResetMin = c["seven_day_reset_min"] | -1;
-    claudeStatus.needsInput = c["needs_input"] | false;
-  }
+  if (!doc["music_playing"].is<bool>()) return false;
+  const bool musicPlaying = doc["music_playing"].as<bool>();
+  const unsigned long timestamp = doc["ts"] | 0UL;
+  if (timestamp == 0) return false;
 
-  JsonObject x = doc["codex"];
-  if (!x.isNull()) {
-    codexStatus.status = x["status"] | "unknown";
-    codexStatus.tokensToday = x["tokens_today"] | 0;
-    codexStatus.primaryPct = x["primary_pct"] | -1.0;
-    codexStatus.primaryResetMin = x["primary_reset_min"] | -1;
-    codexStatus.weeklyPct = x["weekly_pct"] | -1.0;
-    codexStatus.weeklyResetMin = x["weekly_reset_min"] | -1;
-    codexStatus.needsInput = x["needs_input"] | false;
-  }
-  statusMusicPlaying = doc["music_playing"] | false;
+  statusMusicPlaying = musicPlaying;
+  bridgeEpoch = timestamp;
+  bridgeEpochReceivedAtMs = millis();
   return true;
 }
 
-// The mode actually rendered. In AUTO: a pending approval prompt wins (stay on
-// the pet so its border can flash red at you), otherwise audio promotes to the
-// music page.
+// The mode actually rendered. While weather is selected, currently-playing
+// audio promotes to music; every pinned page keeps its own renderer.
 DisplayMode effectiveMode() {
-  if (displayMode == MODE_AUTO) {
-    if (claudeStatus.needsInput || codexStatus.needsInput) return MODE_AUTO;
-    // music page needs HTTP for cover/text bitmaps, so don't auto-promote
-    // when running wired-only (no WiFi)
-    if (statusMusicPlaying && WiFi.status() == WL_CONNECTED) return MODE_MUSIC;
+  if (displayMode == MODE_WEATHER && statusMusicPlaying &&
+      (wiredActive() || WiFi.status() == WL_CONNECTED)) {
+    return MODE_MUSIC;
   }
   return displayMode;
 }
 
 void pollBridge() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) {
-    Serial.printf("[bridge] skip poll: wifi=%d host='%s'\n", WiFi.status() == WL_CONNECTED, bridgeHost.c_str());
+    Serial.printf("[bridge] skip poll: wifi=%d host='%s'\n",
+                  WiFi.status() == WL_CONNECTED, bridgeHost.c_str());
     return;
   }
 
@@ -1634,11 +1385,11 @@ void pollBridge() {
   HTTPClient http;
   String url = "http://" + bridgeHost + BRIDGE_DEFAULT_PATH;
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-
   if (!http.begin(client, url)) {
     Serial.println("[bridge] http.begin() failed");
     return;
   }
+
   int code = http.GET();
   Serial.printf("[bridge] GET %s -> %d\n", url.c_str(), code);
   if (code == HTTP_CODE_OK) {
@@ -1646,54 +1397,75 @@ void pollBridge() {
     if (parseStatusJson(payload)) {
       lastSuccessMs = millis();
       everPolled = true;
-      Serial.printf("[bridge] claude=%s tok=%ld | codex=%s tok=%ld primary=%.0f%%\n",
-                    claudeStatus.status.c_str(), claudeStatus.tokensToday,
-                    codexStatus.status.c_str(), codexStatus.tokensToday, codexStatus.primaryPct);
+      Serial.printf("[bridge] heartbeat music=%d\n", statusMusicPlaying ? 1 : 0);
     } else {
-      Serial.println("[bridge] JSON parse failed");
+      Serial.println("[bridge] invalid status envelope");
     }
-  } else {
-    claudeStatus.status = "offline";
-    codexStatus.status = "offline";
   }
   http.end();
-  DisplayMode eff = effectiveMode();
-  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_POMODORO) {
-    // Only a real app switch clears the screen; a plain data refresh paints
-    // in place so the poll doesn't flash the whole display.
-    if (updateActiveApp()) drawActiveApp();
-    else refreshActiveApp();
-  }
 }
 
 // ---------- wired (USB serial) bridge link ----------
 // Fallback for WiFi networks with client isolation (device can't reach the
 // bridge over LAN) - or for skipping WiFi setup entirely: when the clock is
-// plugged into the computer over USB, the bridge pushes the same /status and
-// /net payloads down the CH340 serial line as newline-terminated frames:
-//   bridge -> device:  #HELLO   #STATUS {json}   #NET {json}   #CMD {json}
+// plugged into the computer over USB, the bridge pushes the same /status
+// payloads down the CH340 serial line as newline-terminated frames:
+//   bridge -> device:  #HELLO   #STATUS {json}   #CMD {json}
 //   device -> bridge:  #DEVICE {"name":"aiclock","fw":"x.y.z"}
 // Everything else the device prints (logs) is ignored by the bridge.
 unsigned long lastSerialFrameMs = 0;
 bool wiredEverLinked = false;
-char serialLine[1600]; // biggest frame is #STATUS at ~600 bytes
+char serialLine[2059]; // 2 KiB printer snapshot plus prefix and terminator
 size_t serialLineLen = 0;
 
-const size_t SERIAL_PET_CHUNK_BYTES = 384;
-const size_t SERIAL_PET_MAX_BYTES = 384 * 1024;
-uint8_t serialPetChunk[SERIAL_PET_CHUNK_BYTES];
-File serialPetFile;
-bool serialPetActive = false;
-ActiveApp serialPetSlot = APP_CLAUDE;
-bool serialPetRaw = false;
-size_t serialPetExpectedSize = 0;
-size_t serialPetReceived = 0;
-uint32_t serialPetExpectedCrc = 0;
-uint32_t serialPetRunningCrc = 0xFFFFFFFFUL;
-unsigned long serialPetNextSequence = 0;
+const size_t SERIAL_TRANSFER_CHUNK_BYTES = 768;
+const size_t SERIAL_STOCK_NAMES_MAX_BYTES =
+    1 + (size_t)MAX_STOCKS * STOCK_NAME_W * STOCK_NAME_H * 2;
+uint8_t serialTransferChunk[SERIAL_TRANSFER_CHUNK_BYTES];
+File serialStockNamesFile;
+bool serialStockNamesActive = false;
+size_t serialStockNamesExpectedSize = 0;
+size_t serialStockNamesReceived = 0;
+uint32_t serialStockNamesExpectedCrc = 0;
+uint32_t serialStockNamesRunningCrc = 0xFFFFFFFFUL;
+unsigned long serialStockNamesNextSequence = 0;
+int serialStockNamesPendingRev = -1;
 
-bool applyUploadedGif(ActiveApp slot);
-bool applyUploadedRaw(ActiveApp slot);
+enum SerialWeatherAssetKind {
+  SERIAL_WEATHER_NONE,
+  SERIAL_WEATHER_SCREEN,
+  SERIAL_WEATHER_ASTRONAUT,
+};
+enum SerialRLEState {
+  SERIAL_RLE_CONTROL,
+  SERIAL_RLE_RUN_HIGH,
+  SERIAL_RLE_RUN_LOW,
+  SERIAL_RLE_LITERAL_HIGH,
+  SERIAL_RLE_LITERAL_LOW,
+};
+const size_t SERIAL_WEATHER_ASSET_MAX_BYTES = 256 * 1024;
+bool serialWeatherAssetActive = false;
+unsigned long serialWeatherLastProgressMs = 0;
+unsigned long lastWeatherScreenRequestMs = 0;
+SerialWeatherAssetKind serialWeatherAssetKind = SERIAL_WEATHER_NONE;
+size_t serialWeatherExpectedSize = 0;
+size_t serialWeatherReceived = 0;
+size_t serialWeatherDecodedExpected = 0;
+size_t serialWeatherDecoded = 0;
+uint32_t serialWeatherExpectedCrc = 0;
+uint32_t serialWeatherRunningCrc = 0xFFFFFFFFUL;
+unsigned long serialWeatherNextSequence = 0;
+long serialWeatherPendingRev = -1;
+int serialWeatherPendingFrames = 0;
+SerialRLEState serialWeatherRLEState = SERIAL_RLE_CONTROL;
+int serialWeatherRLERemaining = 0;
+uint8_t serialWeatherRLEHigh = 0;
+size_t serialWeatherScreenPixels = 0;
+size_t serialWeatherFileBufferBytes = 0;
+uint8_t *serialWeatherEncodedBuffer = nullptr;
+size_t serialWeatherEncodedCapacity = 0;
+File serialWeatherFile;
+
 void sendSerialDeviceInfo();
 
 bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 15000UL; }
@@ -1702,28 +1474,58 @@ bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 
 void showMainUiIfNeeded() {
   if (mainUiShown) return;
   mainUiShown = true;
-  drawStaticChrome();
-  updateActiveApp();
-  drawActiveApp();
+  displayMode = MODE_WEATHER;
+  const auto printer = PrinterMonitor::snapshot();
+  if (printer.supported && printer.configured && printer.enabled)
+    displayMode = MODE_PRINTER;
+  lastEffectiveMode = displayMode;
+  weatherChromeDrawn = false;
+  weatherScreenDrawnRev = -1;
+  weatherLastSecond = -1;
+  lastWeatherPollMs = 0;
+  tft.fillScreen(TFT_BLACK);
 }
 
-const char *serialPetUploadPath() {
-  if (serialPetRaw) {
-    return serialPetSlot == APP_CLAUDE ? CLAUDE_SPRITE_TEMP_FILE : CODEX_SPRITE_TEMP_FILE;
+void clearSerialStockNamesUpload(bool removeFile) {
+  if (serialStockNamesFile) serialStockNamesFile.close();
+  if (removeFile && fileSystemReady) LittleFS.remove(STOCK_NAMES_SERIAL_TEMP_FILE);
+  serialStockNamesActive = false;
+  serialStockNamesExpectedSize = 0;
+  serialStockNamesReceived = 0;
+  serialStockNamesExpectedCrc = 0;
+  serialStockNamesRunningCrc = 0xFFFFFFFFUL;
+  serialStockNamesNextSequence = 0;
+  serialStockNamesPendingRev = -1;
+}
+
+void clearSerialWeatherAssetUpload(bool removeTemporaryFile) {
+  if (serialWeatherEncodedBuffer) {
+    free(serialWeatherEncodedBuffer);
+    serialWeatherEncodedBuffer = nullptr;
   }
-  return serialPetSlot == APP_CLAUDE ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
-}
-
-void clearSerialPetUpload(bool removeTemporaryFile) {
-  if (serialPetFile) serialPetFile.close();
-  if (removeTemporaryFile && fileSystemReady) LittleFS.remove(serialPetUploadPath());
-  serialPetActive = false;
-  serialPetRaw = false;
-  serialPetExpectedSize = 0;
-  serialPetReceived = 0;
-  serialPetExpectedCrc = 0;
-  serialPetRunningCrc = 0xFFFFFFFFUL;
-  serialPetNextSequence = 0;
+  serialWeatherEncodedCapacity = 0;
+  if (serialWeatherFile) serialWeatherFile.close();
+  if (removeTemporaryFile && fileSystemReady &&
+      serialWeatherAssetKind == SERIAL_WEATHER_ASTRONAUT) {
+    LittleFS.remove(WEATHER_ASTRONAUT_TEMP_FILE);
+  }
+  serialWeatherAssetActive = false;
+  serialWeatherLastProgressMs = 0;
+  serialWeatherAssetKind = SERIAL_WEATHER_NONE;
+  serialWeatherExpectedSize = 0;
+  serialWeatherReceived = 0;
+  serialWeatherDecodedExpected = 0;
+  serialWeatherDecoded = 0;
+  serialWeatherExpectedCrc = 0;
+  serialWeatherRunningCrc = 0xFFFFFFFFUL;
+  serialWeatherNextSequence = 0;
+  serialWeatherPendingRev = -1;
+  serialWeatherPendingFrames = 0;
+  serialWeatherRLEState = SERIAL_RLE_CONTROL;
+  serialWeatherRLERemaining = 0;
+  serialWeatherRLEHigh = 0;
+  serialWeatherScreenPixels = 0;
+  serialWeatherFileBufferBytes = 0;
 }
 
 uint32_t updateCrc32(uint32_t crc, const uint8_t *data, size_t length) {
@@ -1734,6 +1536,42 @@ uint32_t updateCrc32(uint32_t crc, const uint8_t *data, size_t length) {
     }
   }
   return crc;
+}
+
+// The bridge frame is a base layer.  Seconds and the file-backed astronaut are
+// owned by the firmware, so a row update must never blit through either rect.
+// Row CRCs give a 960-byte change cache without retaining a full framebuffer.
+void renderWeatherBaseRow(int row, bool forceFullRepaint) {
+  if (row < 0 || row >= SCREEN_H) return;
+
+  const uint32_t fingerprint = ~updateCrc32(
+      0xFFFFFFFFUL,
+      (const uint8_t *)rowBuf,
+      (size_t)SCREEN_W * sizeof(uint16_t));
+  if (!forceFullRepaint && weatherChromeDrawn && weatherBaseCacheValid &&
+      fingerprint == weatherRowFingerprints[row]) {
+    return;
+  }
+  weatherRowFingerprints[row] = fingerprint;
+
+  const bool secondsRow = row >= WEATHER_SECONDS_OWNER_Y &&
+                          row < WEATHER_SECONDS_OWNER_Y + WEATHER_SECONDS_OWNER_H;
+  const bool astronautRow = weatherAstronautFrames > 0 &&
+                            row >= WEATHER_ASTRONAUT_Y &&
+                            row < WEATHER_ASTRONAUT_Y + WEATHER_ASTRONAUT_H;
+  if (secondsRow) {
+    tft.pushImage(0, row, WEATHER_SECONDS_OWNER_X, 1, rowBuf);
+    tft.pushImage(
+        WEATHER_SECONDS_OWNER_X + WEATHER_SECONDS_OWNER_W,
+        row,
+        SCREEN_W - WEATHER_SECONDS_OWNER_X - WEATHER_SECONDS_OWNER_W,
+        1,
+        rowBuf + WEATHER_SECONDS_OWNER_X + WEATHER_SECONDS_OWNER_W);
+  } else if (astronautRow) {
+    tft.pushImage(0, row, WEATHER_ASTRONAUT_X, 1, rowBuf);
+  } else {
+    tft.pushImage(0, row, SCREEN_W, 1, rowBuf);
+  }
 }
 
 int base64Value(char ch) {
@@ -1771,127 +1609,438 @@ bool decodeBase64Chunk(const char *input, size_t length, uint8_t *output, size_t
   return true;
 }
 
-void handleSerialPetBegin(const char *payload) {
-  if (serialPetActive) {
-    Serial.println("#PET_ERR busy");
+bool flushSerialWeatherFileBuffer() {
+  if (serialWeatherFileBufferBytes == 0) return true;
+  if (!serialWeatherFile ||
+      serialWeatherFile.write((uint8_t *)rowBuf, serialWeatherFileBufferBytes) !=
+          serialWeatherFileBufferBytes) {
+    return false;
+  }
+  serialWeatherFileBufferBytes = 0;
+  return true;
+}
+
+bool emitSerialWeatherPixel(uint8_t high, uint8_t low, bool renderScreenRows) {
+  if (serialWeatherDecoded + 2 > serialWeatherDecodedExpected) return false;
+  if (serialWeatherAssetKind == SERIAL_WEATHER_SCREEN) {
+    const size_t column = serialWeatherScreenPixels % SCREEN_W;
+    rowBuf[column] = ((uint16_t)low << 8) | high;
+    serialWeatherScreenPixels++;
+    if (renderScreenRows && column + 1 == SCREEN_W) {
+      renderWeatherBaseRow(
+          serialWeatherScreenPixels / SCREEN_W - 1, !weatherChromeDrawn);
+    }
+  } else if (serialWeatherAssetKind == SERIAL_WEATHER_ASTRONAUT) {
+    uint8_t *output = (uint8_t *)rowBuf;
+    if (serialWeatherFileBufferBytes + 2 > sizeof(rowBuf) &&
+        !flushSerialWeatherFileBuffer()) {
+      return false;
+    }
+    output[serialWeatherFileBufferBytes++] = high;
+    output[serialWeatherFileBufferBytes++] = low;
+  } else {
+    return false;
+  }
+  serialWeatherDecoded += 2;
+  return true;
+}
+
+bool decodeSerialWeatherRLE565(
+    const uint8_t *data, size_t length, bool renderScreenRows = false) {
+  for (size_t index = 0; index < length; ++index) {
+    const uint8_t value = data[index];
+    switch (serialWeatherRLEState) {
+      case SERIAL_RLE_CONTROL:
+        serialWeatherRLERemaining = (value & 0x7F) + 1;
+        serialWeatherRLEState =
+            (value & 0x80) ? SERIAL_RLE_RUN_HIGH : SERIAL_RLE_LITERAL_HIGH;
+        break;
+      case SERIAL_RLE_RUN_HIGH:
+        serialWeatherRLEHigh = value;
+        serialWeatherRLEState = SERIAL_RLE_RUN_LOW;
+        break;
+      case SERIAL_RLE_RUN_LOW:
+        while (serialWeatherRLERemaining-- > 0) {
+          if (!emitSerialWeatherPixel(
+                  serialWeatherRLEHigh, value, renderScreenRows)) {
+            return false;
+          }
+        }
+        serialWeatherRLEState = SERIAL_RLE_CONTROL;
+        break;
+      case SERIAL_RLE_LITERAL_HIGH:
+        serialWeatherRLEHigh = value;
+        serialWeatherRLEState = SERIAL_RLE_LITERAL_LOW;
+        break;
+      case SERIAL_RLE_LITERAL_LOW:
+        if (!emitSerialWeatherPixel(
+                serialWeatherRLEHigh, value, renderScreenRows)) {
+          return false;
+        }
+        serialWeatherRLERemaining--;
+        serialWeatherRLEState = serialWeatherRLERemaining == 0
+            ? SERIAL_RLE_CONTROL
+            : SERIAL_RLE_LITERAL_HIGH;
+        break;
+    }
+  }
+  return true;
+}
+
+void handleSerialStockNamesBegin(const char *payload) {
+  if (serialStockNamesActive || serialWeatherAssetActive) {
+    Serial.println("#STOCK_NAMES_ERR busy");
     return;
   }
 
   JsonDocument doc;
   if (deserializeJson(doc, payload)) {
-    Serial.println("#PET_ERR invalid_metadata");
+    Serial.println("#STOCK_NAMES_ERR invalid_metadata");
     return;
   }
-  const char *slot = doc["slot"] | (const char *)nullptr;
-  const char *format = doc["format"] | "gif";
   unsigned long size = doc["size"].as<unsigned long>();
   uint32_t crc = doc["crc32"].as<uint32_t>();
-  if (!slot || (strcmp(slot, "claude") && strcmp(slot, "codex"))) {
-    Serial.println("#PET_ERR invalid_slot");
-    return;
-  }
-  if (strcmp(format, "gif") && strcmp(format, "rgb565")) {
-    Serial.println("#PET_ERR unsupported_format");
-    return;
-  }
-  if (size == 0 || size > SERIAL_PET_MAX_BYTES) {
-    Serial.println("#PET_ERR invalid_size");
+  int revision = doc["revision"] | -1;
+  if (size <= 1 || size > SERIAL_STOCK_NAMES_MAX_BYTES || revision < 0) {
+    Serial.println("#STOCK_NAMES_ERR invalid_metadata");
     return;
   }
   if (!ensureFileSystem(true)) {
-    Serial.println("#PET_ERR filesystem_unavailable");
+    Serial.println("#STOCK_NAMES_ERR filesystem_unavailable");
     return;
   }
 
-  serialPetSlot = !strcmp(slot, "claude") ? APP_CLAUDE : APP_CODEX;
-  serialPetRaw = !strcmp(format, "rgb565");
-  LittleFS.remove(serialPetUploadPath());
-  serialPetFile = LittleFS.open(serialPetUploadPath(), "w");
-  if (!serialPetFile) {
-    Serial.println("#PET_ERR file_open_failed");
+  LittleFS.remove(STOCK_NAMES_SERIAL_TEMP_FILE);
+  serialStockNamesFile = LittleFS.open(STOCK_NAMES_SERIAL_TEMP_FILE, "w");
+  if (!serialStockNamesFile) {
+    Serial.println("#STOCK_NAMES_ERR file_open_failed");
     return;
   }
-  serialPetActive = true;
-  serialPetExpectedSize = size;
-  serialPetReceived = 0;
-  serialPetExpectedCrc = crc;
-  serialPetRunningCrc = 0xFFFFFFFFUL;
-  serialPetNextSequence = 0;
-  Serial.println("#PET_READY");
+  serialStockNamesActive = true;
+  serialStockNamesExpectedSize = size;
+  serialStockNamesReceived = 0;
+  serialStockNamesExpectedCrc = crc;
+  serialStockNamesRunningCrc = 0xFFFFFFFFUL;
+  serialStockNamesNextSequence = 0;
+  serialStockNamesPendingRev = revision;
+  Serial.println("#STOCK_NAMES_READY");
 }
 
-void handleSerialPetChunk(char *payload) {
-  if (!serialPetActive) {
-    Serial.println("#PET_ERR no_upload");
+void handleSerialStockNamesChunk(char *payload) {
+  if (!serialStockNamesActive) {
+    Serial.println("#STOCK_NAMES_ERR no_upload");
     return;
   }
   char *separator = strchr(payload, ' ');
   if (!separator) {
-    clearSerialPetUpload(true);
-    Serial.println("#PET_ERR invalid_chunk");
+    clearSerialStockNamesUpload(true);
+    Serial.println("#STOCK_NAMES_ERR invalid_chunk");
     return;
   }
   *separator = 0;
   char *end = nullptr;
   unsigned long sequence = strtoul(payload, &end, 10);
-  if (!end || *end || sequence != serialPetNextSequence) {
-    clearSerialPetUpload(true);
-    Serial.println("#PET_ERR sequence_mismatch");
+  if (!end || *end || sequence != serialStockNamesNextSequence) {
+    clearSerialStockNamesUpload(true);
+    Serial.println("#STOCK_NAMES_ERR sequence_mismatch");
     return;
   }
 
   size_t decodedLength = 0;
   const char *encoded = separator + 1;
-  if (!decodeBase64Chunk(encoded, strlen(encoded), serialPetChunk, sizeof(serialPetChunk),
+  if (!decodeBase64Chunk(encoded, strlen(encoded), serialTransferChunk,
+                         sizeof(serialTransferChunk),
                          decodedLength) ||
-      serialPetReceived + decodedLength > serialPetExpectedSize) {
-    clearSerialPetUpload(true);
-    Serial.println("#PET_ERR invalid_chunk_data");
+      serialStockNamesReceived + decodedLength > serialStockNamesExpectedSize) {
+    clearSerialStockNamesUpload(true);
+    Serial.println("#STOCK_NAMES_ERR invalid_chunk_data");
     return;
   }
-  if (serialPetFile.write(serialPetChunk, decodedLength) != decodedLength) {
-    clearSerialPetUpload(true);
-    Serial.println("#PET_ERR file_write_failed");
+  if (serialStockNamesFile.write(serialTransferChunk, decodedLength) != decodedLength) {
+    clearSerialStockNamesUpload(true);
+    Serial.println("#STOCK_NAMES_ERR file_write_failed");
     return;
   }
-  serialPetRunningCrc = updateCrc32(serialPetRunningCrc, serialPetChunk, decodedLength);
-  serialPetReceived += decodedLength;
-  serialPetNextSequence++;
-  Serial.printf("#PET_ACK %lu\n", sequence);
+  serialStockNamesRunningCrc =
+      updateCrc32(serialStockNamesRunningCrc, serialTransferChunk, decodedLength);
+  serialStockNamesReceived += decodedLength;
+  serialStockNamesNextSequence++;
+  Serial.printf("#STOCK_NAMES_ACK %lu\n", sequence);
   yield();
 }
 
-void handleSerialPetEnd() {
-  if (!serialPetActive) {
-    Serial.println("#PET_ERR no_upload");
+void handleSerialStockNamesEnd() {
+  if (!serialStockNamesActive) {
+    Serial.println("#STOCK_NAMES_ERR no_upload");
     return;
   }
-  if (serialPetFile) {
-    serialPetFile.flush();
-    serialPetFile.close();
+  if (serialStockNamesFile) {
+    serialStockNamesFile.flush();
+    serialStockNamesFile.close();
   }
-  if (serialPetReceived != serialPetExpectedSize) {
-    clearSerialPetUpload(true);
-    Serial.println("#PET_ERR size_mismatch");
+  if (serialStockNamesReceived != serialStockNamesExpectedSize) {
+    clearSerialStockNamesUpload(true);
+    Serial.println("#STOCK_NAMES_ERR size_mismatch");
     return;
   }
-  if ((~serialPetRunningCrc) != serialPetExpectedCrc) {
-    clearSerialPetUpload(true);
-    Serial.println("#PET_ERR crc_mismatch");
+  if ((~serialStockNamesRunningCrc) != serialStockNamesExpectedCrc) {
+    clearSerialStockNamesUpload(true);
+    Serial.println("#STOCK_NAMES_ERR crc_mismatch");
     return;
   }
 
-  ActiveApp slot = serialPetSlot;
-  bool raw = serialPetRaw;
-  Serial.println("#PET_PROCESSING");
-  Serial.flush();
-  bool ok = raw ? applyUploadedRaw(slot) : applyUploadedGif(slot);
-  clearSerialPetUpload(false);
-  if (ok) {
-    Serial.println("#PET_DONE");
-  } else {
-    Serial.printf("#PET_ERR %s\n", lastSpriteUploadError);
+  File uploaded = LittleFS.open(STOCK_NAMES_SERIAL_TEMP_FILE, "r");
+  uint8_t count = 0;
+  const bool validHeader = uploaded && uploaded.read(&count, 1) == 1 &&
+      count > 0 && count <= MAX_STOCKS;
+  const size_t expectedSize =
+      validHeader ? 1 + (size_t)count * STOCK_NAME_W * STOCK_NAME_H * 2 : 0;
+  const bool validSize = validHeader && uploaded.size() == expectedSize;
+  if (uploaded) uploaded.close();
+  if (!validSize) {
+    clearSerialStockNamesUpload(true);
+    Serial.println("#STOCK_NAMES_ERR invalid_payload");
+    return;
   }
+
+  int revision = serialStockNamesPendingRev;
+  LittleFS.remove(STOCK_NAMES_SERIAL_FILE);
+  if (!LittleFS.rename(STOCK_NAMES_SERIAL_TEMP_FILE, STOCK_NAMES_SERIAL_FILE)) {
+    clearSerialStockNamesUpload(true);
+    Serial.println("#STOCK_NAMES_ERR file_commit_failed");
+    return;
+  }
+  clearSerialStockNamesUpload(false);
+  serialStockNamesRev = revision;
+  stockNamesDrawnRev = -1;
+  stockDirty = true;
+  Serial.println("#STOCK_NAMES_DONE");
+}
+
+void handleSerialWeatherAssetBegin(const char *payload) {
+  if (serialStockNamesActive || serialWeatherAssetActive) {
+    Serial.println("#WEATHER_ASSET_ERR busy");
+    return;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) {
+    Serial.println("#WEATHER_ASSET_ERR invalid_metadata");
+    return;
+  }
+  const char *kindValue = doc["kind"] | "";
+  const char *encoding = doc["encoding"] | "";
+  const unsigned long size = doc["size"].as<unsigned long>();
+  const unsigned long decodedSize = doc["decoded_size"].as<unsigned long>();
+  const uint32_t crc = doc["crc32"].as<uint32_t>();
+  const long revision = doc["revision"] | -1L;
+  const int frames = doc["frames"] | 0;
+  const SerialWeatherAssetKind kind = !strcmp(kindValue, "screen")
+      ? SERIAL_WEATHER_SCREEN
+      : (!strcmp(kindValue, "astronaut") ? SERIAL_WEATHER_ASTRONAUT
+                                           : SERIAL_WEATHER_NONE);
+  if (kind == SERIAL_WEATHER_NONE || strcmp(encoding, "rle565") ||
+      size == 0 || size > SERIAL_WEATHER_ASSET_MAX_BYTES || revision < 0) {
+    Serial.println("#WEATHER_ASSET_ERR invalid_metadata");
+    return;
+  }
+  if (kind == SERIAL_WEATHER_SCREEN &&
+      (decodedSize != (unsigned long)SCREEN_W * SCREEN_H * 2 ||
+       effectiveMode() != MODE_WEATHER)) {
+    Serial.println("#WEATHER_ASSET_ERR invalid_screen");
+    return;
+  }
+  if (kind == SERIAL_WEATHER_ASTRONAUT &&
+      (revision > 255 || frames <= 0 || frames > WEATHER_ASTRONAUT_FRAME_COUNT ||
+       decodedSize != 2 + (unsigned long)frames * WEATHER_ASTRONAUT_FRAME_BYTES)) {
+    Serial.println("#WEATHER_ASSET_ERR invalid_astronaut");
+    return;
+  }
+
+  if (kind == SERIAL_WEATHER_SCREEN) {
+    serialWeatherEncodedBuffer = (uint8_t *)malloc(size);
+    if (!serialWeatherEncodedBuffer) {
+      Serial.println("#WEATHER_ASSET_ERR buffer_alloc_failed");
+      return;
+    }
+    serialWeatherEncodedCapacity = size;
+  } else if (kind == SERIAL_WEATHER_ASTRONAUT) {
+    if (!ensureFileSystem(true)) {
+      Serial.println("#WEATHER_ASSET_ERR filesystem_unavailable");
+      return;
+    }
+    LittleFS.remove(WEATHER_ASTRONAUT_TEMP_FILE);
+    serialWeatherFile = LittleFS.open(WEATHER_ASTRONAUT_TEMP_FILE, "w");
+    uint8_t header[2] = {(uint8_t)revision, (uint8_t)frames};
+    if (!serialWeatherFile || serialWeatherFile.write(header, sizeof(header)) != sizeof(header)) {
+      if (serialWeatherFile) serialWeatherFile.close();
+      LittleFS.remove(WEATHER_ASTRONAUT_TEMP_FILE);
+      Serial.println("#WEATHER_ASSET_ERR file_open_failed");
+      return;
+    }
+  }
+
+  serialWeatherAssetActive = true;
+  serialWeatherLastProgressMs = millis();
+  serialWeatherAssetKind = kind;
+  serialWeatherExpectedSize = size;
+  serialWeatherReceived = 0;
+  serialWeatherDecodedExpected =
+      kind == SERIAL_WEATHER_ASTRONAUT ? decodedSize - 2 : decodedSize;
+  serialWeatherDecoded = 0;
+  serialWeatherExpectedCrc = crc;
+  serialWeatherRunningCrc = 0xFFFFFFFFUL;
+  serialWeatherNextSequence = 0;
+  serialWeatherPendingRev = revision;
+  serialWeatherPendingFrames = frames;
+  serialWeatherRLEState = SERIAL_RLE_CONTROL;
+  serialWeatherRLERemaining = 0;
+  serialWeatherScreenPixels = 0;
+  serialWeatherFileBufferBytes = 0;
+  Serial.println("#WEATHER_ASSET_READY");
+}
+
+void handleSerialWeatherAssetChunk(char *payload) {
+  if (!serialWeatherAssetActive) {
+    Serial.println("#WEATHER_ASSET_ERR no_upload");
+    return;
+  }
+  char *separator = strchr(payload, ' ');
+  if (!separator) {
+    clearSerialWeatherAssetUpload(true);
+    Serial.println("#WEATHER_ASSET_ERR invalid_chunk");
+    return;
+  }
+  *separator = 0;
+  char *end = nullptr;
+  const unsigned long sequence = strtoul(payload, &end, 10);
+  if (!end || *end || sequence != serialWeatherNextSequence) {
+    clearSerialWeatherAssetUpload(true);
+    Serial.println("#WEATHER_ASSET_ERR sequence_mismatch");
+    return;
+  }
+
+  size_t decodedLength = 0;
+  const char *encoded = separator + 1;
+  if (!decodeBase64Chunk(encoded, strlen(encoded), serialTransferChunk,
+                         sizeof(serialTransferChunk), decodedLength) ||
+      serialWeatherReceived + decodedLength > serialWeatherExpectedSize) {
+    clearSerialWeatherAssetUpload(true);
+    Serial.println("#WEATHER_ASSET_ERR invalid_chunk_data");
+    return;
+  }
+  serialWeatherRunningCrc =
+      updateCrc32(serialWeatherRunningCrc, serialTransferChunk, decodedLength);
+  serialWeatherReceived += decodedLength;
+  if (serialWeatherAssetKind == SERIAL_WEATHER_SCREEN) {
+    if (!serialWeatherEncodedBuffer ||
+        serialWeatherReceived > serialWeatherEncodedCapacity) {
+      clearSerialWeatherAssetUpload(true);
+      Serial.println("#WEATHER_ASSET_ERR buffer_overflow");
+      return;
+    }
+    memcpy(serialWeatherEncodedBuffer + serialWeatherReceived - decodedLength,
+           serialTransferChunk, decodedLength);
+  } else if (!decodeSerialWeatherRLE565(serialTransferChunk, decodedLength)) {
+    clearSerialWeatherAssetUpload(true);
+    Serial.println("#WEATHER_ASSET_ERR decode_failed");
+    return;
+  }
+  serialWeatherNextSequence++;
+  serialWeatherLastProgressMs = millis();
+  Serial.printf("#WEATHER_ASSET_ACK %lu\n", sequence);
+  yield();
+}
+
+void handleSerialWeatherAssetEnd() {
+  if (!serialWeatherAssetActive) {
+    Serial.println("#WEATHER_ASSET_ERR no_upload");
+    return;
+  }
+  const SerialWeatherAssetKind kind = serialWeatherAssetKind;
+  const long revision = serialWeatherPendingRev;
+  if (kind == SERIAL_WEATHER_SCREEN) {
+    // Decode once without painting.  CRC and RLE validation must both pass
+    // before any row can affect either the panel or the fingerprint cache.
+    serialWeatherRLEState = SERIAL_RLE_CONTROL;
+    serialWeatherRLERemaining = 0;
+    serialWeatherDecoded = 0;
+    serialWeatherScreenPixels = 0;
+    if (!serialWeatherEncodedBuffer ||
+        !decodeSerialWeatherRLE565(
+            serialWeatherEncodedBuffer, serialWeatherReceived, false)) {
+      clearSerialWeatherAssetUpload(true);
+      Serial.println("#WEATHER_ASSET_ERR decode_failed");
+      return;
+    }
+  }
+  const bool transferValid =
+      serialWeatherReceived == serialWeatherExpectedSize &&
+      (~serialWeatherRunningCrc) == serialWeatherExpectedCrc &&
+      serialWeatherRLEState == SERIAL_RLE_CONTROL &&
+      serialWeatherDecoded == serialWeatherDecodedExpected;
+  if (!transferValid ||
+      (kind == SERIAL_WEATHER_SCREEN &&
+       (serialWeatherScreenPixels != (size_t)SCREEN_W * SCREEN_H ||
+        effectiveMode() != MODE_WEATHER))) {
+    Serial.printf(
+        "[weather] asset validation failed kind=%d received=%u/%u crc=%08lx/%08lx "
+        "state=%d decoded=%u/%u pixels=%u mode=%d\n",
+        (int)kind,
+        (unsigned int)serialWeatherReceived,
+        (unsigned int)serialWeatherExpectedSize,
+        (unsigned long)(~serialWeatherRunningCrc),
+        (unsigned long)serialWeatherExpectedCrc,
+        (int)serialWeatherRLEState,
+        (unsigned int)serialWeatherDecoded,
+        (unsigned int)serialWeatherDecodedExpected,
+        (unsigned int)serialWeatherScreenPixels,
+        (int)effectiveMode());
+    clearSerialWeatherAssetUpload(true);
+    Serial.println("#WEATHER_ASSET_ERR validation_failed");
+    return;
+  }
+
+  if (kind == SERIAL_WEATHER_ASTRONAUT) {
+    if (!flushSerialWeatherFileBuffer()) {
+      clearSerialWeatherAssetUpload(true);
+      Serial.println("#WEATHER_ASSET_ERR file_write_failed");
+      return;
+    }
+    if (serialWeatherFile) {
+      serialWeatherFile.flush();
+      serialWeatherFile.close();
+    }
+    if (!installWeatherAstronautPack() || weatherAstronautLoadedRevision != revision) {
+      clearSerialWeatherAssetUpload(true);
+      Serial.println("#WEATHER_ASSET_ERR install_failed");
+      return;
+    }
+    weatherAstronautRevision = revision;
+  } else {
+    serialWeatherRLEState = SERIAL_RLE_CONTROL;
+    serialWeatherRLERemaining = 0;
+    serialWeatherDecoded = 0;
+    serialWeatherScreenPixels = 0;
+    if (!decodeSerialWeatherRLE565(
+            serialWeatherEncodedBuffer, serialWeatherReceived, true)) {
+      clearSerialWeatherAssetUpload(true);
+      weatherChromeDrawn = false;
+      Serial.println("#WEATHER_ASSET_ERR decode_failed");
+      return;
+    }
+    weatherScreenRev = revision;
+    weatherScreenDrawnRev = revision;
+    weatherChromeDrawn = true;
+    weatherBaseCacheValid = true;
+    weatherLastSecond = -1;
+    drawWeatherSeconds(true);
+    drawWeatherAstronautFrame(weatherAstronautFrame);
+    if (HardwareFeatures::battery().present) drawBatteryIndicator();
+  }
+
+  clearSerialWeatherAssetUpload(false);
+  Serial.println("#WEATHER_ASSET_DONE");
 }
 
 void handleSerialFrame(char *line) {
@@ -1901,16 +2050,28 @@ void handleSerialFrame(char *line) {
     sendSerialDeviceInfo();
     return;
   }
-  if (!strncmp(line, "#PET_BEGIN ", 11)) {
-    handleSerialPetBegin(line + 11);
+  if (!strncmp(line, "#STOCK_NAMES_BEGIN ", 19)) {
+    handleSerialStockNamesBegin(line + 19);
     return;
   }
-  if (!strncmp(line, "#PET_CHUNK ", 11)) {
-    handleSerialPetChunk(line + 11);
+  if (!strncmp(line, "#STOCK_NAMES_CHUNK ", 19)) {
+    handleSerialStockNamesChunk(line + 19);
     return;
   }
-  if (!strcmp(line, "#PET_END")) {
-    handleSerialPetEnd();
+  if (!strcmp(line, "#STOCK_NAMES_END")) {
+    handleSerialStockNamesEnd();
+    return;
+  }
+  if (!strncmp(line, "#WEATHER_ASSET_BEGIN ", 21)) {
+    handleSerialWeatherAssetBegin(line + 21);
+    return;
+  }
+  if (!strncmp(line, "#WEATHER_ASSET_CHUNK ", 21)) {
+    handleSerialWeatherAssetChunk(line + 21);
+    return;
+  }
+  if (!strcmp(line, "#WEATHER_ASSET_END")) {
+    handleSerialWeatherAssetEnd();
     return;
   }
   if (!strncmp(line, "#STATUS ", 8)) {
@@ -1918,53 +2079,64 @@ void handleSerialFrame(char *line) {
       lastSuccessMs = millis();
       everPolled = true;
       showMainUiIfNeeded();
-      DisplayMode eff = effectiveMode();
-      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_POMODORO) {
-        if (updateActiveApp()) drawActiveApp();
-        else refreshActiveApp();
-      }
       Serial.println("#ACK status");
     }
-    return;
-  }
-  if (!strncmp(line, "#NET ", 5)) {
-    handleNetPayload(String(line + 5));
     return;
   }
   if (!strncmp(line, "#STOCK ", 7)) {
     handleStockPayload(String(line + 7));
     return;
   }
+  if (!strncmp(line, "#WEATHER ", 9)) {
+    handleWeatherPayload(String(line + 9));
+    return;
+  }
+  if (!strncmp(line, "#PRINTER ", 9)) {
+    PrinterMonitor::ingestBridge(line + 9, strlen(line + 9));
+    return;
+  }
   if (!strncmp(line, "#CMD ", 5)) {
     JsonDocument doc;
     if (deserializeJson(doc, line + 5)) return;
     if (doc["brightness"].is<int>()) {
-      brightness = constrain(doc["brightness"].as<int>(), 0, 100);
-      applyBrightness();
+      applyExplicitBrightness(doc["brightness"].as<int>());
 #if !AICLOCK_WIRED_ONLY
       saveBrightness();
 #endif
     }
+    if (doc["auto_rotate"].is<bool>() && HardwareFeatures::imuAvailable()) {
+      autoRotateEnabled = doc["auto_rotate"].as<bool>();
+      saveOrientationConfig();
+      Serial.printf("#ACK auto_rotate %d\n", autoRotateEnabled);
+    }
     const char *mode = doc["display"] | (const char *)nullptr;
     if (mode) {
       String m(mode);
-      if (m == "auto") displayMode = MODE_AUTO;
-      else if (m == "claude") displayMode = MODE_CLAUDE;
-      else if (m == "codex") displayMode = MODE_CODEX;
-      else if (m == "net") displayMode = MODE_NET;
+      // Legacy Agent modes no longer have a renderer; migrate them to weather.
+      if (m == "auto" || m == "home" || m == "usage" || m == "info" ||
+          m == "claude" || m == "codex" || m == "net" || m == "pomodoro") {
+        displayMode = MODE_WEATHER;
+      }
       else if (m == "music") displayMode = MODE_MUSIC;
       else if (m == "stock") displayMode = MODE_STOCK;
-      else if (m == "pomodoro") displayMode = MODE_POMODORO;
+      else if (m == "weather") displayMode = MODE_WEATHER;
+      else if (m == "salary") displayMode = MODE_SALARY;
+      else if (m == "printer" && PrinterMonitor::snapshot().supported)
+        displayMode = MODE_PRINTER;
       // the effectiveMode transition handler in loop() repaints the chrome
     }
-    const char *pomodoroAction = doc["pomodoro"] | (const char *)nullptr;
-    if (pomodoroAction) {
-      int focusMinutes = doc["focus_min"] | -1;
-      int breakMinutes = doc["break_min"] | -1;
-      if (!controlPomodoro(String(pomodoroAction), focusMinutes, breakMinutes)) {
-        Serial.println("#ACK pomodoro error");
+    JsonObject salary = doc["salary"];
+    if (!salary.isNull()) {
+      long monthlyFen = salary["monthly_fen"] | -1L;
+      int startMin = salary["start_min"] | -1;
+      int endMin = salary["end_min"] | -1;
+      int lunchStartMin = salary["lunch_start_min"] | -1;
+      int lunchEndMin = salary["lunch_end_min"] | -1;
+      if (!configureSalary(monthlyFen, startMin, endMin, lunchStartMin, lunchEndMin)) {
+        Serial.println("#ACK salary error");
       } else {
-        Serial.println("#ACK pomodoro");
+        displayMode = MODE_SALARY;
+        Serial.println("#ACK salary");
       }
     }
     return;
@@ -2018,6 +2190,10 @@ void handleRoot() {
           ".dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}"
           "</style></head><body>";
   html += "<h1>AI Clock 设置</h1>";
+#if defined(ESP32)
+  if (PrinterMonitor::snapshot().supported)
+    html += "<p><a href='/printer'>拓竹打印机设置（LAN Direct）</a></p>";
+#endif
 
   html += "<form method='POST' action='/save'>";
   html += "<label>Bridge host (ip:port)</label>";
@@ -2034,57 +2210,26 @@ void handleRoot() {
   html += "<div style='font-size:13px;color:#555'>当前：<span id='briv'>" + String(brightness) +
           "%</span>（0 = 熄屏，设置立即生效并记住）</div>";
 
-  advancePomodoro(millis());
-  html += "<h2 style='font-size:16px;margin-top:28px'>&#30058;&#33540;&#26102;&#38047;</h2>";
-  html += "<p style='font-size:13px;color:#555'>";
-  html += pomodoroPhase == POMODORO_FOCUS ? "&#19987;&#27880; " : "&#20241;&#24687; ";
-  html += pomodoroTimeText();
-  html += pomodoroRunning ? " · &#36827;&#34892;&#20013;" : " · &#24050;&#26242;&#20572;";
-  html += " · &#23436;&#25104; " + String(pomodoroCompleted) + "</p>";
-  html += "<form method='POST' action='/api/pomodoro' style='display:inline'>"
-          "<input type='hidden' name='return' value='1'><input type='hidden' name='action' value='toggle'>"
-          "<button type='submit'>";
-  html += pomodoroRunning ? "&#26242;&#20572;" : "&#24320;&#22987;";
-  html += "</button></form>";
-  html += "<form method='POST' action='/api/pomodoro' style='display:inline;margin-left:8px'>"
-          "<input type='hidden' name='return' value='1'><input type='hidden' name='action' value='reset'>"
-          "<button type='submit'>&#37325;&#32622;</button></form>";
-  html += "<form method='POST' action='/api/pomodoro' style='display:inline;margin-left:8px'>"
-          "<input type='hidden' name='return' value='1'><input type='hidden' name='action' value='skip'>"
-          "<button type='submit'>&#36339;&#36807;</button></form>";
-  html += "<form method='POST' action='/api/pomodoro'>"
-          "<input type='hidden' name='return' value='1'><input type='hidden' name='action' value='configure'>"
-          "<label>&#19987;&#27880;&#20998;&#38047;</label><input type='number' name='focus_min' min='1' max='120' value='" +
-          String(pomodoroFocusMin) + "'>"
-          "<label>&#20241;&#24687;&#20998;&#38047;</label><input type='number' name='break_min' min='1' max='60' value='" +
-          String(pomodoroBreakMin) + "'>"
-          "<button type='submit'>&#20445;&#23384;&#26102;&#38271;</button></form>";
-
-  // On-device GIF upload: replaces a character's animation without reflashing.
-  html += "<h2 style='font-size:16px;margin-top:28px'>桌宠动画（上传 GIF）</h2>";
-  html += "<p style='font-size:13px;color:#555'>上传一个 .gif，设备会在板上解码并缩放到对应角色的尺寸，"
-          "立刻替换动画，无需重新编译或烧录。GIF 太大可能因内存不足解码失败，换小一点的即可。</p>";
-  html += "<form id='gifForm' method='POST' enctype='multipart/form-data' onsubmit='return setGifAction()'>";
-  html += "<label>角色</label>";
-  html += "<select id='gifTarget'><option value='claude'>Claude</option><option value='codex'>Codex</option></select>";
-  html += "<label>GIF 文件</label><input type='file' name='file' accept='.gif' required>";
-  html += "<button type='submit'>上传并应用</button>";
-  html += "</form>";
-  html += "<script>function setGifAction(){"
-          "document.getElementById('gifForm').action='/sprite/'+document.getElementById('gifTarget').value;"
-          "return true;}</script>";
+  html += "<h2 style='font-size:16px;margin-top:28px'>薪资时钟</h2>";
+  html += "<p style='font-size:13px;color:#555'>按中国标准月工作日 21.75 天计算，午休不计薪。保存后立即切换到薪资页面。</p>";
+  html += "<form method='POST' action='/api/salary'>";
+  html += "<input type='hidden' name='return' value='1'>";
+  html += "<label>月薪（元）</label><input type='number' step='0.01' min='0' max='10000000' name='monthly_yuan' value='" +
+          String(salaryConfig.monthlyFen / 100.0, 2) + "'>";
+  html += "<label>上班时间</label><input type='time' name='start_min' value='" +
+          salaryTimeInput(salaryConfig.startMin) + "'>";
+  html += "<label>下班时间</label><input type='time' name='end_min' value='" +
+          salaryTimeInput(salaryConfig.endMin) + "'>";
+  html += "<label>午休开始</label><input type='time' name='lunch_start_min' value='" +
+          salaryTimeInput(salaryConfig.lunchStartMin) + "'>";
+  html += "<label>午休结束</label><input type='time' name='lunch_end_min' value='" +
+          salaryTimeInput(salaryConfig.lunchEndMin) + "'>";
+  html += "<button type='submit'>保存薪资设置</button></form>";
 
   html += "<table>";
   html += "<tr><td>WiFi SSID</td><td>" + htmlEscape(WiFi.SSID()) + "</td></tr>";
   html += "<tr><td>设备 IP</td><td>" + WiFi.localIP().toString() + "</td></tr>";
   html += "<tr><td>上次桥接更新</td><td>" + age + "</td></tr>";
-  html += "<tr><td>Claude</td><td>" + htmlEscape(claudeStatus.status) + ", " +
-          formatTokens(claudeStatus.tokensToday) + " tok</td></tr>";
-  html += "<tr><td>Codex</td><td>" + htmlEscape(codexStatus.status) + ", " +
-          formatTokens(codexStatus.tokensToday) + " tok, " +
-          (codexStatus.primaryPct >= 0 ? "5H " + String(codexStatus.primaryPct, 0) + "%"
-           : codexStatus.weeklyPct >= 0 ? "\xE5\x91\xA8 " + String(codexStatus.weeklyPct, 0) + "%"
-                                        : "5H ?") + "</td></tr>";
   html += "</table>";
 
 #if AICLOCK_OTA_AVAILABLE
@@ -2114,26 +2259,18 @@ void handleSave() {
 // ---------- JSON API for the Mac app ----------
 
 const char *displayModeName(DisplayMode m) {
-  if (m == MODE_CLAUDE) return "claude";
-  if (m == MODE_CODEX) return "codex";
-  if (m == MODE_NET) return "net";
+  if (m == MODE_PRINTER) return "printer";
   if (m == MODE_MUSIC) return "music";
   if (m == MODE_STOCK) return "stock";
-  if (m == MODE_POMODORO) return "pomodoro";
-  return "auto";
-}
-
-const char *spriteUploadStateName() {
-  if (spriteUploadState == SPRITE_UPLOAD_PENDING) return "pending";
-  if (spriteUploadState == SPRITE_UPLOAD_PROCESSING) return "processing";
-  if (spriteUploadState == SPRITE_UPLOAD_SUCCEEDED) return "succeeded";
-  if (spriteUploadState == SPRITE_UPLOAD_FAILED) return "failed";
-  return "idle";
+  if (m == MODE_WEATHER) return "weather";
+  if (m == MODE_SALARY) return "salary";
+  return "weather";
 }
 
 void fillDeviceInfo(JsonDocument &doc) {
-  advancePomodoro(millis());
+  fillPrinterInfo(doc["printer"].to<JsonObject>());
   doc["name"] = "aiclock";
+  doc["board"] = AICLOCK_BOARD_ID;
   doc["transport"] = AICLOCK_WIRED_ONLY ? "usb" : "hybrid";
   doc["ip"] = WiFi.localIP().toString();
   doc["ssid"] = WiFi.SSID();
@@ -2141,38 +2278,45 @@ void fillDeviceInfo(JsonDocument &doc) {
   doc["mode"] = displayModeName(displayMode);           // configured mode
   doc["effective"] = displayModeName(effectiveMode());   // what's on screen now
   doc["music_playing"] = statusMusicPlaying;
-  doc["showing"] = (currentApp == APP_CLAUDE) ? "claude" : "codex";
+  doc["showing"] = displayModeName(effectiveMode());
   doc["last_update_s"] = everPolled ? (long)((millis() - lastSuccessMs) / 1000) : -1;
-  doc["sprite_rev"] = spriteRev;
   doc["brightness"] = brightness;
   doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
   doc["fw"] = FW_VERSION;
   doc["ota"] = (bool)AICLOCK_OTA_AVAILABLE;
-  doc["reset_reason"] = ESP.getResetReason();
+  doc["reset_reason"] = platformResetReason();
   doc["free_heap"] = ESP.getFreeHeap();
-  doc["max_free_block"] = ESP.getMaxFreeBlockSize();
-  JsonObject upload = doc["sprite_upload"].to<JsonObject>();
-  upload["state"] = spriteUploadStateName();
-  upload["slot"] = (spriteUploadSlot == APP_CLAUDE) ? "claude" : "codex";
-  upload["error"] = (spriteUploadState == SPRITE_UPLOAD_FAILED) ? lastSpriteUploadError : "";
-  JsonObject pomodoro = doc["pomodoro"].to<JsonObject>();
-  pomodoro["phase"] = pomodoroPhase == POMODORO_FOCUS ? "focus" : "break";
-  pomodoro["running"] = pomodoroRunning;
-  pomodoro["remaining_s"] = pomodoroRemainingS;
-  pomodoro["duration_s"] = pomodoroDurationS(pomodoroPhase);
-  pomodoro["completed"] = pomodoroCompleted;
-  pomodoro["focus_min"] = pomodoroFocusMin;
-  pomodoro["break_min"] = pomodoroBreakMin;
-  JsonObject c = doc["claude"].to<JsonObject>();
-  c["status"] = claudeStatus.status;
-  c["custom_sprite"] = claudeCustom;
-  c["w"] = CLAUDE_SPRITE_W;
-  c["h"] = CLAUDE_SPRITE_H;
-  JsonObject x = doc["codex"].to<JsonObject>();
-  x["status"] = codexStatus.status;
-  x["custom_sprite"] = codexCustom;
-  x["w"] = CODEX_SPRITE_W;
-  x["h"] = CODEX_SPRITE_H;
+  doc["max_free_block"] = platformMaxFreeBlockSize();
+  JsonObject weatherAnimation = doc["weather_animation"].to<JsonObject>();
+  weatherAnimation["revision"] = weatherAstronautLoadedRevision;
+  weatherAnimation["frames"] = weatherAstronautFrames;
+  JsonObject orientation = doc["orientation"].to<JsonObject>();
+  orientation["supported"] = HardwareFeatures::imuAvailable();
+  orientation["auto"] = autoRotateEnabled;
+  orientation["rotation"] = screenRotation;
+  const HardwareFeatures::BatteryState &batteryState = HardwareFeatures::battery();
+  JsonObject battery = doc["battery"].to<JsonObject>();
+  battery["supported"] = batteryState.supported;
+  battery["present"] = batteryState.present;
+  battery["charging"] = batteryState.charging;
+  battery["level"] = batteryState.level;
+  battery["voltage_mv"] = batteryState.voltageMv;
+  const unsigned long salaryUtcEpoch = salaryCurrentEpoch();
+  const unsigned long salaryLocalEpoch = salaryUtcEpoch == 0
+      ? 0 : salaryUtcEpoch + 8UL * 3600UL;
+  const long salaryElapsed = salaryElapsedWorkSeconds(salaryLocalEpoch);
+  JsonObject salary = doc["salary"].to<JsonObject>();
+  salary["monthly_fen"] = salaryConfig.monthlyFen;
+  salary["start_min"] = salaryConfig.startMin;
+  salary["end_min"] = salaryConfig.endMin;
+  salary["lunch_start_min"] = salaryConfig.lunchStartMin;
+  salary["lunch_end_min"] = salaryConfig.lunchEndMin;
+  salary["elapsed_s"] = salaryElapsed;
+  salary["daily_work_s"] = salaryDailyWorkSeconds();
+  salary["earned_yuan"] = salaryRatePerSecond() * salaryElapsed;
+  salary["rate_yuan_per_second"] = salaryRatePerSecond();
+  salary["status"] = salaryStatusText(salaryLocalEpoch);
+  salary["weekday"] = salaryLocalEpoch == 0 ? -1 : salaryWeekday(salaryLocalEpoch);
 }
 
 void sendSerialDeviceInfo() {
@@ -2193,47 +2337,62 @@ void handleApiInfo() {
 
 void handleApiDisplay() {
   String mode = webServer.arg("mode");
-  if (mode == "auto") displayMode = MODE_AUTO;
-  else if (mode == "claude") displayMode = MODE_CLAUDE;
-  else if (mode == "codex") displayMode = MODE_CODEX;
-  else if (mode == "net") displayMode = MODE_NET;
+  if (mode == "auto" || mode == "home" || mode == "usage" || mode == "info" ||
+      mode == "claude" || mode == "codex" || mode == "net" || mode == "pomodoro") {
+    displayMode = MODE_WEATHER;
+  }
   else if (mode == "music") displayMode = MODE_MUSIC;
   else if (mode == "stock") displayMode = MODE_STOCK;
-  else if (mode == "pomodoro") displayMode = MODE_POMODORO;
+  else if (mode == "weather") displayMode = MODE_WEATHER;
+  else if (mode == "salary") displayMode = MODE_SALARY;
+  else if (mode == "printer" && PrinterMonitor::snapshot().supported)
+    displayMode = MODE_PRINTER;
   else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock|pomodoro");
+    webServer.send(
+        400, "text/plain",
+        "mode must be weather|music|stock|salary|printer");
     return;
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
-  if (displayMode == MODE_NET) {
-    netChromeDrawn = false;
-    lastNetPollMs = 0; // poll + draw on the next loop tick
-  } else if (displayMode == MODE_MUSIC) {
+  if (displayMode == MODE_MUSIC) {
     musicChromeDrawn = false;
     lastMusicPollMs = 0; // poll + draw on the next loop tick
   } else if (displayMode == MODE_STOCK) {
     stockChromeDrawn = false;
     lastStockPollMs = 0; // poll + draw on the next loop tick
-  } else if (displayMode == MODE_POMODORO) {
-    pomodoroChromeDrawn = false;
-  } else {
-    updateActiveApp();
-    drawActiveApp(); // unconditional: also repaints over a previous net chart
+  } else if (displayMode == MODE_WEATHER) {
+    weatherChromeDrawn = false;
+    weatherScreenDrawnRev = -1;
+    weatherLastSecond = -1;
+    weatherAstronautFrame = 0;
+    lastWeatherAstronautMs = 0;
+    lastWeatherPollMs = 0;
+  } else if (displayMode == MODE_SALARY) {
+    salaryChromeDrawn = false;
   }
   webServer.send(200, "text/plain", "ok");
 }
 
-void handleApiPomodoro() {
-  String action = webServer.arg("action");
-  int focusMinutes = webServer.hasArg("focus_min") ? webServer.arg("focus_min").toInt() : -1;
-  int breakMinutes = webServer.hasArg("break_min") ? webServer.arg("break_min").toInt() : -1;
-  if (!controlPomodoro(action, focusMinutes, breakMinutes)) {
-    webServer.send(400, "text/plain",
-                   "invalid action or duration (focus 1-120, break 1-60 minutes)");
+void handleApiSalary() {
+  String monthlyArg = webServer.arg("monthly_yuan");
+  String startArg = webServer.arg("start_min");
+  String endArg = webServer.arg("end_min");
+  String lunchStartArg = webServer.arg("lunch_start_min");
+  String lunchEndArg = webServer.arg("lunch_end_min");
+  if (monthlyArg.length() == 0 || startArg.length() == 0 || endArg.length() == 0 ||
+      lunchStartArg.length() == 0 || lunchEndArg.length() == 0) {
+    webServer.send(400, "text/plain", "monthly_yuan and all time fields are required");
     return;
   }
-  Serial.printf("[api] pomodoro action=%s focus=%d break=%d\n", action.c_str(),
-                pomodoroFocusMin, pomodoroBreakMin);
+  const float monthlyYuan = monthlyArg.toFloat();
+  const long monthlyFen = monthlyYuan <= 0 ? 0 : (long)(monthlyYuan * 100.0f + 0.5f);
+  if (!configureSalary(monthlyFen, parseSalaryTime(startArg), parseSalaryTime(endArg),
+                       parseSalaryTime(lunchStartArg), parseSalaryTime(lunchEndArg))) {
+    webServer.send(400, "text/plain", "invalid salary or schedule (salary 0-10000000, times within workday)");
+    return;
+  }
+  displayMode = MODE_SALARY;
+  salaryChromeDrawn = false;
   if (webServer.hasArg("return")) {
     webServer.sendHeader("Location", "/");
     webServer.send(303);
@@ -2249,12 +2408,26 @@ void handleApiBrightness() {
     return;
   }
   int level = levelArg.toInt();
-  if (level < 0) level = 0;
-  if (level > 100) level = 100;
-  brightness = level;
-  applyBrightness();
+  applyExplicitBrightness(level);
   saveBrightness();
   Serial.printf("[api] brightness = %d\n", brightness);
+  webServer.send(200, "text/plain", "ok");
+}
+
+void handleApiOrientation() {
+  if (!HardwareFeatures::imuAvailable()) {
+    webServer.send(501, "text/plain", "auto rotation is not supported by this device");
+    return;
+  }
+  String value = webServer.arg("auto");
+  value.toLowerCase();
+  if (value != "1" && value != "0" && value != "true" && value != "false") {
+    webServer.send(400, "text/plain", "auto must be 1|0|true|false");
+    return;
+  }
+  autoRotateEnabled = value == "1" || value == "true";
+  saveOrientationConfig();
+  Serial.printf("[api] auto rotation = %d\n", autoRotateEnabled);
   webServer.send(200, "text/plain", "ok");
 }
 
@@ -2272,47 +2445,6 @@ void handleApiBridge() {
   lastPollMs = 0; // poll the new bridge on the next loop tick
 }
 
-// Streams the animation currently in use for a slot, in the same wire format
-// as the custom .bin: [1 byte frame count][RGB565 frames...]. Lets the Mac
-// app mirror exactly what the device is showing (custom upload or built-in).
-void handleSpriteRaw(ActiveApp slot) {
-  bool custom = (slot == APP_CLAUDE) ? claudeCustom : codexCustom;
-  const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
-  if (custom) {
-    File f = LittleFS.open(binPath, "r");
-    if (f) {
-      webServer.streamFile(f, "application/octet-stream");
-      f.close();
-      return;
-    }
-  }
-  int frames = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FRAMES : CODEX_SPRITE_FRAMES;
-  int w = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_W : CODEX_SPRITE_W;
-  int h = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_H : CODEX_SPRITE_H;
-  const uint16_t *const *arr = (slot == APP_CLAUDE) ? claude_sprite_frames : codex_sprite_frames;
-  size_t frameBytes = (size_t)w * h * 2;
-  webServer.setContentLength(1 + (size_t)frames * frameBytes);
-  webServer.send(200, "application/octet-stream", "");
-  uint8_t cnt = (uint8_t)frames;
-  webServer.sendContent((const char *)&cnt, 1);
-  for (int i = 0; i < frames; i++) {
-    webServer.sendContent_P((PGM_P)arr[i], frameBytes);
-    yield();
-  }
-}
-
-// Removes a custom sprite so the compiled-in default animation comes back.
-void handleSpriteReset(ActiveApp slot) {
-  const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
-  LittleFS.remove(binPath);
-  spriteRev++;
-  loadCustomSpriteState();
-  if (slot == APP_CLAUDE) claudeFrame = 0;
-  else codexFrame = 0;
-  if (currentApp == slot) drawActiveApp();
-  webServer.send(200, "text/plain", "ok");
-}
-
 void handleResetWifi() {
   webServer.send(200, "text/html", "<html><body>Resetting WiFi, device will restart...</body></html>");
   delay(200);
@@ -2320,300 +2452,6 @@ void handleResetWifi() {
   wm.resetSettings();
   ESP.restart();
 }
-
-// ---------- on-device GIF decode (AnimatedGIF) ----------
-// AnimatedGIF hands us the image one horizontal line at a time (via the draw
-// callback) at the GIF's native resolution, so we never need a full-canvas
-// buffer. We nearest-neighbour rescale into the target slot size and stream the
-// result straight to the .bin one target row at a time. Because the .bin can't
-// hold a whole frame in RAM to composite against, GIFs that only re-encode a
-// changed sub-rectangle (the common optimizer output, disposal method 1) are
-// composited by reading the *previous frame's* rows back out of the .bin we're
-// writing. (Disposal method 2 "restore to background" isn't distinguished -
-// uncovered pixels keep the previous frame instead of clearing; fine for the
-// looping character animations this is for.)
-
-struct GifDecodeCtx {
-  int canvasW, canvasH; // GIF native size
-  int targetW, targetH; // slot size we're rescaling down to
-  size_t rowBytes;      // targetW * 2
-  File out;             // output .bin, written sequentially
-  File prevFile;        // previous frame in the .bin, read sequentially for compositing
-  bool hasPrev;         // false for frame 0 (nothing to composite over -> black)
-  int producedRow;      // next target row still owed for the current frame
-  bool failed;          // set by the callback when LittleFS I/O is incomplete
-};
-
-static File gifReadFile; // one decode runs at a time, so a single handle is fine
-
-void *gifOpenCB(const char *fname, int32_t *pSize) {
-  gifReadFile = LittleFS.open(fname, "r");
-  if (!gifReadFile) return nullptr;
-  *pSize = (int32_t)gifReadFile.size();
-  return (void *)&gifReadFile;
-}
-
-void gifCloseCB(void *) {
-  if (gifReadFile) gifReadFile.close();
-}
-
-int32_t gifReadCB(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen) {
-  File *f = (File *)pFile->fHandle;
-  // AnimatedGIF's own SD example keeps this one-byte-short guard near EOF.
-  if ((pFile->iSize - pFile->iPos) < iLen) iLen = pFile->iSize - pFile->iPos - 1;
-  if (iLen <= 0) return 0;
-  int32_t n = (int32_t)f->read(pBuf, iLen);
-  pFile->iPos = (int32_t)f->position();
-  return n;
-}
-
-int32_t gifSeekCB(GIFFILE *pFile, int32_t iPosition) {
-  File *f = (File *)pFile->fHandle;
-  f->seek(iPosition);
-  pFile->iPos = iPosition;
-  return iPosition;
-}
-
-// Loads the next previous-frame row into prevRowBuf (black if there's no
-// previous frame). Reads are sequential and stay aligned with producedRow.
-static bool readPrevRow(GifDecodeCtx *ctx) {
-  if (ctx->hasPrev) {
-    int readBytes = ctx->prevFile.read((uint8_t *)prevRowBuf, ctx->rowBytes);
-    if (readBytes < 0 || (size_t)readBytes != ctx->rowBytes) {
-      ctx->failed = true;
-      return false;
-    }
-  } else {
-    memset(prevRowBuf, 0, ctx->rowBytes);
-  }
-  return true;
-}
-
-// Appends the current rowBuf as the next output row.
-static bool emitRow(GifDecodeCtx *ctx) {
-  if (ctx->out.write((const uint8_t *)rowBuf, ctx->rowBytes) != ctx->rowBytes) {
-    ctx->failed = true;
-    return false;
-  }
-  ctx->producedRow++;
-  if ((ctx->producedRow & 0x07) == 0) yield();
-  return true;
-}
-
-// Emits a row that this frame doesn't touch: a straight copy of the previous
-// frame (top/bottom gaps of a partial frame).
-static bool emitPrevRow(GifDecodeCtx *ctx) {
-  if (!readPrevRow(ctx)) return false;
-  memcpy(rowBuf, prevRowBuf, ctx->rowBytes);
-  return emitRow(ctx);
-}
-
-// Rescales one decoded native line into target rows, compositing over the
-// previous frame, and streams every target row it can now finalize.
-void gifDrawCB(GIFDRAW *pDraw) {
-  GifDecodeCtx *ctx = (GifDecodeCtx *)pDraw->pUser;
-  if (ctx->failed) return;
-  if ((pDraw->y & 0x0F) == 0) yield();
-  int sy = pDraw->iY + pDraw->y; // absolute source line on the GIF canvas
-  if (sy < 0 || sy >= ctx->canvasH) return;
-
-  const uint8_t *pal = pDraw->pPalette24; // RGB888, 256 entries
-  const uint8_t *src = pDraw->pPixels;    // palette indices, one per pixel of this line
-  bool hasTrans = pDraw->ucHasTransparency;
-  uint8_t transIdx = pDraw->ucTransparent;
-
-  // Emit every target row whose nearest source line is <= sy and isn't done yet.
-  while (ctx->producedRow < ctx->targetH) {
-    int ty = ctx->producedRow;
-    int srcRow = (int)((long)ty * ctx->canvasH / ctx->targetH);
-    if (srcRow > sy) break;                       // needs a later source line
-    if (srcRow < sy) {
-      if (!emitPrevRow(ctx)) return;
-      continue;
-    } // source line was skipped -> previous frame
-
-    // srcRow == sy: composite this source line over the previous frame's row.
-    if (!readPrevRow(ctx)) return;
-    memcpy(rowBuf, prevRowBuf, ctx->rowBytes);
-    for (int tx = 0; tx < ctx->targetW; tx++) {
-      int sx = (int)((long)tx * ctx->canvasW / ctx->targetW);
-      int rel = sx - pDraw->iX;
-      if (rel < 0 || rel >= pDraw->iWidth) continue; // outside this frame's rect: keep previous pixel
-      uint8_t idx = src[rel];
-      if (hasTrans && idx == transIdx) continue;     // transparent: keep previous pixel
-      uint8_t r = pal[idx * 3 + 0], g = pal[idx * 3 + 1], b = pal[idx * 3 + 2];
-      uint16_t val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-      rowBuf[tx] = (uint16_t)(((val & 0xFF) << 8) | (val >> 8)); // byte-swap to match convert_sprites.py
-    }
-    if (!emitRow(ctx)) return;
-  }
-}
-
-// Decodes gifPath into binPath in the [count][frames...] wire format the
-// display path reads. Returns false on open/decode failure.
-bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int targetH) {
-  lastSpriteUploadError = "unknown";
-  if (!fileSystemReady || targetW <= 0 || targetW > SCREEN_W || targetH <= 0) {
-    lastSpriteUploadError = "invalid decoder state";
-    return false;
-  }
-
-  // AnimatedGIF's internal state (~24KB of LZW/line/palette buffers) is big, so
-  // allocate it on the heap only for the duration of a decode rather than
-  // paying for it in .bss for the whole uptime.
-  uint32_t decoderBytes = sizeof(AnimatedGIF);
-  uint32_t maxBlock = ESP.getMaxFreeBlockSize();
-  Serial.printf("[gif] start heap=%u max_block=%u decoder=%u\n", ESP.getFreeHeap(), maxBlock,
-                decoderBytes);
-  if (maxBlock < decoderBytes) {
-    lastSpriteUploadError = "insufficient contiguous heap";
-    return false;
-  }
-  AnimatedGIF *gif = new AnimatedGIF();
-  if (!gif) {
-    lastSpriteUploadError = "decoder allocation failed";
-    return false;
-  }
-  gif->begin(GIF_PALETTE_RGB888);
-  if (!gif->open(gifPath, gifOpenCB, gifCloseCB, gifReadCB, gifSeekCB, gifDrawCB)) {
-    Serial.printf("[gif] open failed err=%d\n", gif->getLastError());
-    lastSpriteUploadError = "GIF open failed";
-    delete gif;
-    return false;
-  }
-
-  GifDecodeCtx ctx;
-  ctx.canvasW = gif->getCanvasWidth();
-  ctx.canvasH = gif->getCanvasHeight();
-  ctx.targetW = targetW;
-  ctx.targetH = targetH;
-  ctx.rowBytes = (size_t)targetW * 2;
-  ctx.hasPrev = false;
-  ctx.failed = false;
-  size_t frameBytes = (size_t)targetW * targetH * 2;
-
-  if (ctx.canvasW <= 0 || ctx.canvasH <= 0 || ctx.canvasW > 480) {
-    lastSpriteUploadError = "unsupported GIF dimensions";
-    gif->close();
-    delete gif;
-    return false;
-  }
-
-  ctx.out = LittleFS.open(binPath, "w");
-  if (!ctx.out) {
-    lastSpriteUploadError = "output file open failed";
-    gif->close();
-    delete gif;
-    return false;
-  }
-  if (ctx.out.write((uint8_t)0) != 1) {
-    lastSpriteUploadError = "output file write failed";
-    gif->close();
-    delete gif;
-    ctx.out.close();
-    LittleFS.remove(binPath);
-    return false;
-  }
-
-  uint8_t count = 0;
-  int delayMs = 0, more = 1;
-  while (count < MAX_CUSTOM_FRAMES) {
-    ctx.producedRow = 0;
-    ctx.hasPrev = false;
-    if (count > 0) {
-      ctx.out.flush(); // make the just-written previous frame visible to the read handle
-      ctx.prevFile = LittleFS.open(binPath, "r");
-      ctx.hasPrev = (bool)ctx.prevFile;
-      if (ctx.hasPrev) ctx.prevFile.seek(1 + (size_t)(count - 1) * frameBytes);
-    }
-
-    more = gif->playFrame(false, &delayMs, &ctx);
-
-    if (more >= 0 && !ctx.failed) {
-      // finalize any bottom rows this frame never touched
-      while (ctx.producedRow < ctx.targetH && emitPrevRow(&ctx)) {}
-      if (!ctx.failed) count++;
-    }
-    if (ctx.prevFile) ctx.prevFile.close();
-    if (ctx.failed) break;
-    if (more <= 0) break; // 0 = last frame, <0 = decode error
-    yield();              // feed the WDT between frames
-  }
-  int decodeError = gif->getLastError();
-  gif->close();
-  delete gif;
-  ctx.out.close();
-
-  if (ctx.failed || count == 0 || more < 0) {
-    lastSpriteUploadError = ctx.failed ? "output file I/O failed" : "GIF decode failed";
-    Serial.printf("[gif] failed frames=%u err=%d io=%d\n", count, decodeError, ctx.failed);
-    LittleFS.remove(binPath);
-    return false;
-  }
-  File patch = LittleFS.open(binPath, "r+");
-  if (!patch || !patch.seek(0) || patch.write(count) != 1) {
-    if (patch) patch.close();
-    lastSpriteUploadError = "frame count finalize failed";
-    LittleFS.remove(binPath);
-    return false;
-  }
-  patch.close();
-  lastSpriteUploadError = "none";
-  Serial.printf("[gif] decoded %d frame(s) %dx%d -> %dx%d\n", count, ctx.canvasW, ctx.canvasH, targetW, targetH);
-  return true;
-}
-
-bool replaceSpriteFile(const char *binPath, const char *tempPath, const char *backupPath) {
-  LittleFS.remove(backupPath);
-  bool hadCurrent = LittleFS.exists(binPath);
-  if (hadCurrent && !LittleFS.rename(binPath, backupPath)) return false;
-  if (!LittleFS.rename(tempPath, binPath)) {
-    if (hadCurrent) LittleFS.rename(backupPath, binPath);
-    return false;
-  }
-  LittleFS.remove(backupPath);
-  return true;
-}
-
-bool applyUploadedRaw(ActiveApp slot) {
-  const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
-  const char *tempPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_TEMP_FILE : CODEX_SPRITE_TEMP_FILE;
-  const char *backupPath =
-      (slot == APP_CLAUDE) ? CLAUDE_SPRITE_BACKUP_FILE : CODEX_SPRITE_BACKUP_FILE;
-  size_t frameBytes = (slot == APP_CLAUDE) ? CLAUDE_FRAME_BYTES : CODEX_FRAME_BYTES;
-
-  File raw = LittleFS.open(tempPath, "r");
-  size_t storedSize = raw ? (size_t)raw.size() : 0;
-  int frameCount = raw ? raw.read() : -1;
-  if (raw) raw.close();
-  size_t expectedSize = frameCount > 0 ? 1 + (size_t)frameCount * frameBytes : 0;
-  if (frameCount <= 0 || frameCount > MAX_CUSTOM_FRAMES || storedSize != expectedSize) {
-    lastSpriteUploadError = "invalid RGB565 sprite";
-    LittleFS.remove(tempPath);
-    return false;
-  }
-  if (!replaceSpriteFile(binPath, tempPath, backupPath)) {
-    lastSpriteUploadError = "sprite file swap failed";
-    LittleFS.remove(tempPath);
-    return false;
-  }
-
-  lastSpriteUploadError = "none";
-  spriteRev++;
-  loadCustomSpriteState();
-  if (slot == APP_CLAUDE) claudeFrame = 0;
-  else codexFrame = 0;
-  if (currentApp == slot) drawActiveApp();
-  Serial.printf("[sprite] applied native RGB565 animation, frames=%d\n", frameCount);
-  return true;
-}
-
-// ---------- sprite upload (raw .gif -> on-device decode) ----------
-// ESP8266WebServer fully buffers a plain POST body into a heap String before
-// the handler runs, which a whole GIF would blow RAM on - so we take the
-// upload over its streaming multipart/HTTPUpload path, writing the raw .gif to
-// LittleFS in small chunks, then decode it on the done callback.
-File uploadFile;
 
 #if AICLOCK_OTA_AVAILABLE
 bool otaAuthenticated = false;
@@ -2629,7 +2467,7 @@ const char OTA_UPDATE_PAGE[] PROGMEM = R"HTML(
 <style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:32px auto;padding:0 16px}
 input,button{display:block;margin-top:16px;font-size:16px}button{padding:10px 18px}</style>
 </head><body><h1>Firmware Update</h1>
-<p>Upload a firmware.bin built for this device. Settings and pet data are preserved.</p>
+<p>Upload a firmware.bin built for this device. Device settings are preserved.</p>
 <form method="POST" action="/update" enctype="multipart/form-data">
 <input type="file" name="firmware" accept=".bin,application/octet-stream" required>
 <button type="submit">Upload and restart</button></form></body></html>
@@ -2655,19 +2493,19 @@ void handleOtaUploadChunk() {
     }
     uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
     if (!Update.begin(maxSketchSpace, U_FLASH)) {
-      otaUploadError = Update.getErrorString();
+      otaUploadError = platformUpdateErrorString();
       Serial.printf("[ota] begin failed: %s\n", otaUploadError.c_str());
       return;
     }
     Serial.printf("[ota] receiving %s, max=%u bytes\n", upload.filename.c_str(), maxSketchSpace);
   } else if (otaAuthenticated && upload.status == UPLOAD_FILE_WRITE && otaUploadError.length() == 0) {
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      otaUploadError = Update.getErrorString();
+      otaUploadError = platformUpdateErrorString();
       Serial.printf("[ota] write failed: %s\n", otaUploadError.c_str());
     }
   } else if (otaAuthenticated && upload.status == UPLOAD_FILE_END && otaUploadError.length() == 0) {
     otaUploadSucceeded = Update.end(true);
-    if (!otaUploadSucceeded) otaUploadError = Update.getErrorString();
+    if (!otaUploadSucceeded) otaUploadError = platformUpdateErrorString();
     Serial.printf("[ota] upload %s, bytes=%u\n", otaUploadSucceeded ? "complete" : "failed",
                   upload.totalSize);
   } else if (otaAuthenticated && upload.status == UPLOAD_FILE_ABORTED) {
@@ -2695,152 +2533,19 @@ void handleOtaUploadDone() {
 }
 #endif
 
-void handleSpriteUploadChunk(const char *gifPath) {
-  HTTPUpload &upload = webServer.upload();
-  if (upload.status == UPLOAD_FILE_START) {
-    if (spriteUploadState == SPRITE_UPLOAD_PENDING ||
-        spriteUploadState == SPRITE_UPLOAD_PROCESSING) {
-      return;
-    }
-    uploadFile = LittleFS.open(gifPath, "w");
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
-  } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
-    if (uploadFile) uploadFile.close();
-  }
-}
-
-void handleRawSpriteUploadChunk(const char *tempPath) {
-  HTTPUpload &upload = webServer.upload();
-  if (upload.status == UPLOAD_FILE_START) {
-    if (spriteUploadState == SPRITE_UPLOAD_PENDING ||
-        spriteUploadState == SPRITE_UPLOAD_PROCESSING) {
-      return;
-    }
-    LittleFS.remove(tempPath);
-    uploadFile = LittleFS.open(tempPath, "w");
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
-  } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
-    if (uploadFile) uploadFile.close();
-  }
-}
-
-void handleRawSpriteUploadDone(ActiveApp slot) {
-  if (spriteUploadState == SPRITE_UPLOAD_PENDING ||
-      spriteUploadState == SPRITE_UPLOAD_PROCESSING) {
-    webServer.send(409, "text/plain", "another sprite upload is still processing");
-    return;
-  }
-
-  spriteUploadSlot = slot;
-  spriteUploadState = SPRITE_UPLOAD_PROCESSING;
-  lastSpriteUploadError = "none";
-  bool ok = applyUploadedRaw(slot);
-  spriteUploadState = ok ? SPRITE_UPLOAD_SUCCEEDED : SPRITE_UPLOAD_FAILED;
-  if (ok) {
-    webServer.send(200, "text/plain", "native sprite applied");
-  } else {
-    webServer.send(422, "text/plain", lastSpriteUploadError);
-  }
-}
-
-void handleSpriteUploadDone(ActiveApp slot) {
-  if (spriteUploadState == SPRITE_UPLOAD_PENDING ||
-      spriteUploadState == SPRITE_UPLOAD_PROCESSING) {
-    webServer.send(409, "text/plain", "another sprite upload is still processing");
-    return;
-  }
-
-  const char *gifPath = (slot == APP_CLAUDE) ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
-  File uploaded = LittleFS.open(gifPath, "r");
-  bool valid = uploaded && uploaded.size() > 0;
-  if (uploaded) uploaded.close();
-  if (!valid) {
-    LittleFS.remove(gifPath);
-    webServer.send(500, "text/plain", "uploaded GIF was not stored");
-    return;
-  }
-
-  spriteUploadSlot = slot;
-  spriteUploadState = SPRITE_UPLOAD_PENDING;
-  spriteUploadReadyMs = millis() + 250;
-  lastSpriteUploadError = "none";
-  webServer.sendHeader("Connection", "close");
-  webServer.send(202, "text/plain", "accepted; poll /api/info sprite_upload");
-  Serial.println("[sprite] upload stored; decode deferred until HTTP memory is released");
-}
-
-bool applyUploadedGif(ActiveApp slot) {
-  const char *gifPath = (slot == APP_CLAUDE) ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
-  const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
-  const char *tempPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_TEMP_FILE : CODEX_SPRITE_TEMP_FILE;
-  const char *backupPath =
-      (slot == APP_CLAUDE) ? CLAUDE_SPRITE_BACKUP_FILE : CODEX_SPRITE_BACKUP_FILE;
-  int tw = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_W : CODEX_SPRITE_W;
-  int th = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_H : CODEX_SPRITE_H;
-
-  LittleFS.remove(tempPath);
-  bool ok = decodeGifToBin(gifPath, tempPath, tw, th);
-  LittleFS.remove(gifPath); // temp raw gif no longer needed once decoded
-
-  if (!ok) {
-    LittleFS.remove(tempPath);
-    return false;
-  }
-  if (!replaceSpriteFile(binPath, tempPath, backupPath)) {
-    lastSpriteUploadError = "sprite file swap failed";
-    LittleFS.remove(tempPath);
-    return false;
-  }
-
-  spriteRev++;
-  loadCustomSpriteState();
-  if (slot == APP_CLAUDE) claudeFrame = 0;
-  else codexFrame = 0;
-  if (currentApp == slot) drawActiveApp();
-  return true;
-}
-
-void processPendingSpriteUpload() {
-  if (spriteUploadState != SPRITE_UPLOAD_PENDING || millis() < spriteUploadReadyMs) return;
-  if (webServer.client()) return;
-
-  spriteUploadState = SPRITE_UPLOAD_PROCESSING;
-  bool ok = applyUploadedGif(spriteUploadSlot);
-  spriteUploadState = ok ? SPRITE_UPLOAD_SUCCEEDED : SPRITE_UPLOAD_FAILED;
-  if (ok) {
-    Serial.println("[sprite] deferred GIF decoded & applied");
-  } else {
-    Serial.printf("[sprite] deferred GIF decode FAILED: %s\n", lastSpriteUploadError);
-  }
-}
+#include "printer_web.h"
 
 void setupWebServer() {
+  registerPrinterRoutes();
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/save", HTTP_POST, handleSave);
   webServer.on("/reset-wifi", HTTP_POST, handleResetWifi);
   webServer.on("/api/info", HTTP_GET, handleApiInfo);
   webServer.on("/api/display", HTTP_POST, handleApiDisplay);
-  webServer.on("/api/pomodoro", HTTP_POST, handleApiPomodoro);
+  webServer.on("/api/salary", HTTP_POST, handleApiSalary);
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
   webServer.on("/api/brightness", HTTP_POST, handleApiBrightness);
-  webServer.on("/sprite/claude/reset", HTTP_POST, []() { handleSpriteReset(APP_CLAUDE); });
-  webServer.on("/sprite/codex/reset", HTTP_POST, []() { handleSpriteReset(APP_CODEX); });
-  webServer.on("/sprite/claude/raw", HTTP_GET, []() { handleSpriteRaw(APP_CLAUDE); });
-  webServer.on("/sprite/codex/raw", HTTP_GET, []() { handleSpriteRaw(APP_CODEX); });
-  webServer.on(
-      "/sprite/claude/raw", HTTP_POST, []() { handleRawSpriteUploadDone(APP_CLAUDE); },
-      []() { handleRawSpriteUploadChunk(CLAUDE_SPRITE_TEMP_FILE); });
-  webServer.on(
-      "/sprite/codex/raw", HTTP_POST, []() { handleRawSpriteUploadDone(APP_CODEX); },
-      []() { handleRawSpriteUploadChunk(CODEX_SPRITE_TEMP_FILE); });
-  webServer.on(
-      "/sprite/claude", HTTP_POST, []() { handleSpriteUploadDone(APP_CLAUDE); },
-      []() { handleSpriteUploadChunk(CLAUDE_GIF_FILE); });
-  webServer.on(
-      "/sprite/codex", HTTP_POST, []() { handleSpriteUploadDone(APP_CODEX); },
-      []() { handleSpriteUploadChunk(CODEX_GIF_FILE); });
+  webServer.on("/api/orientation", HTTP_POST, handleApiOrientation);
 #if AICLOCK_OTA_AVAILABLE
   webServer.on("/update", HTTP_GET, []() {
     if (authenticateOtaRequest()) webServer.send_P(200, "text/html", OTA_UPDATE_PAGE);
@@ -2854,28 +2559,31 @@ void setupWebServer() {
 // ---------- Arduino entry points ----------
 
 void setup() {
-  Serial.setRxBufferSize(2048); // a serial #STATUS frame (~600B) must survive a slow draw
+  platformInitializePowerHold();
+  Serial.setRxBufferSize(2048); // line frames must survive a slow draw
   Serial.begin(115200);
-  fileSystemReady = LittleFS.begin();
+  fileSystemReady = platformMountFileSystemOnStartup();
+  PrinterMonitor::begin(fileSystemReady);
 #if !AICLOCK_WIRED_ONLY
   if (fileSystemReady) {
     loadBridgeHost();
     loadBrightness();
-    loadPomodoroConfig();
-    loadCustomSpriteState();
+    loadSalaryConfig();
+    loadWeatherAstronautState();
   }
 #else
   if (fileSystemReady) {
-    loadPomodoroConfig();
-    loadCustomSpriteState();
+    loadSalaryConfig();
+    loadWeatherAstronautState();
   }
 #endif
+  if (fileSystemReady) loadOrientationConfig();
+  HardwareFeatures::begin();
 
   tft.init();
-  tft.setRotation(0);
+  tft.setRotation(screenRotation);
   tft.fillScreen(TFT_BLACK);
-  analogWriteFreq(BRIGHTNESS_PWM_FREQ);
-  analogWriteRange(100); // duty maps 1:1 to a 0-100 percentage
+  platformInitializeBacklight();
   applyBrightness();
 
 #if AICLOCK_WIRED_ONLY
@@ -2909,6 +2617,14 @@ void loop() {
   wifiManager.process(); // keeps the config portal alive until WiFi is set up
 #endif
   pumpSerial();          // wired (USB) bridge frames
+  PrinterMonitor::poll();
+  // A lost ACK or disconnected sender must not keep the weather renderer
+  // suspended indefinitely. The host can retry after this state is released.
+  if (serialWeatherAssetActive &&
+      millis() - serialWeatherLastProgressMs >= 20000UL) {
+    clearSerialWeatherAssetUpload(true);
+    Serial.println("#WEATHER_ASSET_ERR timeout");
+  }
 
 #if !AICLOCK_WIRED_ONLY
   if (!webServerStarted && WiFi.status() == WL_CONNECTED) {
@@ -2921,7 +2637,6 @@ void loop() {
   }
   if (webServerStarted) {
     webServer.handleClient();
-    processPendingSpriteUpload();
   }
 #if AICLOCK_OTA_AVAILABLE
   if (otaRestartPending && millis() - otaRestartRequestedMs >= 1000) {
@@ -2930,46 +2645,52 @@ void loop() {
   }
 #endif
 #endif
+  const bool batteryChanged = HardwareFeatures::pollBattery();
+  if (mainUiShown && autoRotateEnabled && HardwareFeatures::imuAvailable()) {
+    uint8_t suggestedRotation = screenRotation;
+    if (HardwareFeatures::pollSuggestedRotation(screenRotation, suggestedRotation)) {
+      applyScreenRotation(suggestedRotation);
+    }
+  }
   if (!mainUiShown) return; // config-portal screen is up, nothing to animate
+  if (batteryChanged) {
+    DisplayMode batteryMode = effectiveMode();
+    if (batteryMode == MODE_WEATHER || batteryMode == MODE_SALARY || batteryMode == MODE_PRINTER) {
+      drawBatteryIndicator();
+    }
+  }
 
   unsigned long nowMs = millis();
-  advancePomodoro(nowMs);
 
-  // Effective mode may differ from the configured one (AUTO -> music while
+  // Effective mode may differ from the configured one (weather -> music while
   // audio plays). On a transition, reset the incoming mode's chrome so it
-  // repaints cleanly, and repaint the pet immediately when returning to it.
+  // repaints cleanly.
   DisplayMode eff = effectiveMode();
   if (eff != lastEffectiveMode) {
+    PrinterScreen::release();
     lastEffectiveMode = eff;
-    if (eff == MODE_NET) {
-      netChromeDrawn = false;
-      lastNetPollMs = 0;
-    } else if (eff == MODE_MUSIC) {
+    if (eff == MODE_MUSIC) {
       musicChromeDrawn = false;
       lastMusicPollMs = 0;
     } else if (eff == MODE_STOCK) {
       stockChromeDrawn = false;
       lastStockPollMs = 0;
-    } else if (eff == MODE_POMODORO) {
-      pomodoroChromeDrawn = false;
-    } else {
-      updateActiveApp();
-      drawActiveApp();
+    } else if (eff == MODE_WEATHER) {
+      weatherChromeDrawn = false;
+      weatherScreenDrawnRev = -1;
+      weatherLastSecond = -1;
+      weatherAstronautFrame = 0;
+      lastWeatherAstronautMs = 0;
+      lastWeatherPollMs = 0;
+      // Do not leave the previous stock/music frame underneath the weather
+      // page while its bridge-rendered frame is being prepared.
+      tft.fillScreen(TFT_BLACK);
+    } else if (eff == MODE_SALARY) {
+      salaryChromeDrawn = false;
     }
   }
 
-  if (eff == MODE_NET) {
-    // net-speed mode: rendering (constant-rate sweep) is independent of the
-    // bridge polls that refill its sample queue
-    if (nowMs - lastNetDrawMs >= NET_DRAW_INTERVAL_MS) {
-      lastNetDrawMs = nowMs;
-      netDrawTick();
-    }
-    if (nowMs - lastNetPollMs >= NET_POLL_INTERVAL_MS) {
-      lastNetPollMs = nowMs;
-      pollNet();
-    }
-  } else if (eff == MODE_MUSIC) {
+  if (eff == MODE_MUSIC) {
     // music now-playing mode: cover art + track metadata from the bridge
     if (nowMs - lastMusicPollMs >= MUSIC_POLL_INTERVAL_MS) {
       lastMusicPollMs = nowMs;
@@ -2982,50 +2703,42 @@ void loop() {
       if (!wiredActive()) pollStock();
     }
     if (!stockChromeDrawn || stockDirty) drawStockScreen();
-  } else if (eff == MODE_POMODORO) {
-    drawPomodoroScreen();
-  } else {
-    // sprite walk-cycle animation (only advances while that app is showing)
-    if (nowMs - lastAnimMs >= ANIM_INTERVAL_MS) {
-      lastAnimMs = nowMs;
-      bool claudeWorking = claudeStatus.status == "working";
-      bool codexWorking = codexStatus.status == "working";
-      if (showingCd != CD_NONE) {
-        // countdown owns the center area: no sprite frames over it
-      } else if (currentApp == APP_CLAUDE && claudeWorking) {
-        claudeFrame = (claudeFrame + 1) % claudeFrameCount();
-        drawClaudeSprite(claudeFrame);
-      } else if (currentApp == APP_CODEX && codexWorking) {
-        codexFrame = (codexFrame + 1) % codexFrameCount();
-        drawCodexSprite(codexFrame);
+  } else if (eff == MODE_WEATHER) {
+    // USB weather assets reuse rowBuf while they are decoded. Keep every
+    // other renderer away from that buffer until the transfer is committed.
+    if (!serialWeatherAssetActive) {
+      // Rotation/mode changes invalidate the panel, not the host's minute
+      // revision. Explicitly request that same frame again over USB.
+      if (wiredActive() && !weatherChromeDrawn &&
+          nowMs - lastWeatherScreenRequestMs >= 3000UL) {
+        lastWeatherScreenRequestMs = nowMs;
+        Serial.println("#WEATHER_SCREEN_NEEDED");
+      }
+      if (!wiredActive() && nowMs - lastWeatherPollMs >= WEATHER_POLL_INTERVAL_MS) {
+        lastWeatherPollMs = nowMs;
+        pollWeather();
+      }
+      if (weatherChromeDrawn) {
+        drawWeatherSeconds();
+      }
+      if (weatherChromeDrawn && weatherAstronautFrames > 0 &&
+          nowMs - lastWeatherAstronautMs >= WEATHER_ASTRONAUT_INTERVAL_MS) {
+        lastWeatherAstronautMs = nowMs;
+        weatherAstronautFrame =
+            (weatherAstronautFrame + 1) % weatherAstronautFrames;
+        drawWeatherAstronautFrame(weatherAstronautFrame);
       }
     }
-
-    // countdown seconds tick locally between bridge polls
-    static unsigned long lastCdTickMs = 0;
-    if (showingCd != CD_NONE && nowMs - lastCdTickMs >= 1000) {
-      lastCdTickMs = nowMs;
-      drawCountdown(false);
+  } else if (eff == MODE_PRINTER) {
+#if defined(ARDUINO_ARCH_ESP8266) && !AICLOCK_WIRED_ONLY
+    if (!wiredActive() && nowMs - lastPrinterPollMs >= 2000UL) {
+      lastPrinterPollMs = nowMs;
+      pollPrinterBridge();
     }
-
-    // "urgent" flash toggle (independent, faster cadence)
-    if (nowMs - lastFlashMs >= FLASH_INTERVAL_MS) {
-      lastFlashMs = nowMs;
-      flashOn = !flashOn;
-      if (bridgeStale()) {
-        redrawRingOnly();
-      } else if (currentAppNeedsInput()) {
-        // approval needed: blink the whole border red, restore the quota ring
-        // on the off-phase so it doesn't erase the normal chrome permanently
-        if (flashOn) drawFullBorder(TFT_RED);
-        else redrawRingOnly();
-      }
-    }
-
-    // alternate which app is shown when neither/both are uniquely working
-    if (updateActiveApp()) {
-      drawActiveApp();
-    }
+#endif
+    PrinterScreen::draw();
+  } else if (eff == MODE_SALARY) {
+    drawSalaryScreen();
   }
 
   // status poll continues in every mode (feeds /api/info and the web page).

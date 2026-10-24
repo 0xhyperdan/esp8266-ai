@@ -2,10 +2,18 @@ import XCTest
 @testable import AIClockBridge
 
 final class DeviceClientTests: XCTestCase {
+    private var originalHost = ""
+
+    override func setUp() {
+        super.setUp()
+        originalHost = DeviceClient.host
+        DeviceClient.host = ""
+    }
+
     override func tearDown() {
         DeviceClient.wiredCommandHandler = nil
         DeviceClient.wiredInfoProvider = nil
-        DeviceClient.wiredPetUploadHandler = nil
+        DeviceClient.host = originalHost
         super.tearDown()
     }
 
@@ -31,84 +39,121 @@ final class DeviceClientTests: XCTestCase {
         wait(for: [completed], timeout: 1)
     }
 
-    func testUploadGifPrefersWiredTransport() {
-        let gif = Data([0x47, 0x49, 0x46])
-        let completed = expectation(description: "wired pet upload completed")
-        DeviceClient.wiredPetUploadHandler = { data, slot, format, completion in
-            XCTAssertEqual(data, gif)
-            XCTAssertEqual(slot, "claude")
-            XCTAssertEqual(format, "gif")
-            completion(nil)
-            return true
-        }
+    func testStockNamesPayloadValidation() {
+        let oneRow = Data(count: StockMonitor.nameW * StockMonitor.nameH * 2)
+        var valid = Data([1])
+        valid.append(oneRow)
+        XCTAssertTrue(SerialLink.isValidStockNamesPayload(valid))
 
-        DeviceClient.uploadGif(gif, slot: "claude") { error in
-            XCTAssertNil(error)
-            completed.fulfill()
-        }
+        XCTAssertFalse(SerialLink.isValidStockNamesPayload(Data([0])))
+        XCTAssertFalse(SerialLink.isValidStockNamesPayload(Data([1])))
+        XCTAssertFalse(SerialLink.isValidStockNamesPayload(Data([5])))
 
-        wait(for: [completed], timeout: 1)
+        var fiveRows = Data([5])
+        fiveRows.append(Data(count: 5 * StockMonitor.nameW * StockMonitor.nameH * 2))
+        XCTAssertTrue(SerialLink.isValidStockNamesPayload(fiveRows))
+        XCTAssertFalse(SerialLink.isValidStockNamesPayload(Data([6])))
     }
 
-    func testUploadPetUsesNativeSpriteOverWiredTransport() {
-        let sprite = Data([0x01, 0xF8, 0x00])
-        let gif = Data([0x47, 0x49, 0x46])
-        let completed = expectation(description: "wired native pet upload completed")
-        DeviceClient.wiredPetUploadHandler = { data, slot, format, completion in
-            XCTAssertEqual(data, sprite)
-            XCTAssertEqual(slot, "codex")
-            XCTAssertEqual(format, "rgb565")
-            completion(nil)
-            return true
-        }
-
-        DeviceClient.uploadPet(sprite, fallbackGif: gif, slot: "codex") { error in
-            XCTAssertNil(error)
-            completed.fulfill()
-        }
-
-        wait(for: [completed], timeout: 1)
-    }
-
-    func testPetUploadCrc32MatchesStandardVector() {
-        XCTAssertEqual(SerialLink.crc32(Data("123456789".utf8)), 0xCBF4_3926)
-    }
-
-    func testPomodoroControlUsesWiredTransport() {
-        let completed = expectation(description: "wired pomodoro command completed")
+    func testSalaryControlUsesWiredTransport() {
+        let completed = expectation(description: "wired salary command completed")
         DeviceClient.wiredCommandHandler = { command in
-            XCTAssertEqual(command["pomodoro"] as? String, "configure")
-            XCTAssertEqual(command["focus_min"] as? Int, 50)
-            XCTAssertEqual(command["break_min"] as? Int, 10)
+            guard let salary = command["salary"] as? [String: Any] else {
+                XCTFail("expected a salary payload object")
+                return false
+            }
+            XCTAssertEqual(salary["monthly_fen"] as? Int, 250000)
+            XCTAssertEqual(salary["start_min"] as? Int, 540)
+            XCTAssertEqual(salary["end_min"] as? Int, 1110)
+            XCTAssertEqual(salary["lunch_start_min"] as? Int, 720)
+            XCTAssertEqual(salary["lunch_end_min"] as? Int, 780)
             return true
         }
-        DeviceClient.controlPomodoro("configure", focusMinutes: 50, breakMinutes: 10) { error in
+        DeviceClient.configureSalary(monthlyYuan: 2500, startMin: 540, endMin: 1110,
+                                     lunchStartMin: 720, lunchEndMin: 780) { error in
             XCTAssertNil(error)
             completed.fulfill()
         }
         wait(for: [completed], timeout: 1)
+    }
+
+    func testAutoRotateControlUsesWiredTransport() {
+        let completed = expectation(description: "wired auto-rotation command completed")
+        DeviceClient.wiredCommandHandler = { command in
+            XCTAssertEqual(command["auto_rotate"] as? Bool, false)
+            return true
+        }
+        DeviceClient.setAutoRotate(false) { error in
+            XCTAssertNil(error)
+            completed.fulfill()
+        }
+        wait(for: [completed], timeout: 1)
+    }
+
+    func testBridgeRepairDetectsAddressChangeEvenWithFreshUSBStatus() {
+        XCTAssertTrue(DeviceClient.bridgeNeedsRepair(
+            current: "192.168.2.154:8765",
+            expected: "192.168.2.141:8765",
+            lastUpdateS: 2
+        ))
+    }
+
+    func testBridgeRepairSkipsMatchingFreshAddress() {
+        XCTAssertFalse(DeviceClient.bridgeNeedsRepair(
+            current: "192.168.2.141:8765",
+            expected: "192.168.2.141:8765",
+            lastUpdateS: 2
+        ))
+    }
+
+    func testBridgeRepairRetriesMatchingStaleAddress() {
+        XCTAssertTrue(DeviceClient.bridgeNeedsRepair(
+            current: "192.168.2.141:8765",
+            expected: "192.168.2.141:8765",
+            lastUpdateS: 61
+        ))
     }
 
     func testDecodeInfoIncludesFirmwareAndOTA() throws {
         let data = Data("""
-        {"ip":"192.168.1.50","mode":"pomodoro","fw":"0.6.0","ota":true,
-         "sprite_upload":{"state":"processing","slot":"codex","error":""},
-         "pomodoro":{"phase":"break","running":true,"remaining_s":238,"duration_s":300,
-                       "completed":3,"focus_min":25,"break_min":5},
-         "claude":{"custom_sprite":false},"codex":{"custom_sprite":true}}
+        {"board":"waveshare-esp32-s3-touch-lcd-1.54","ip":"192.168.1.50",
+         "mode":"weather","fw":"0.7.1-s3","ota":true,
+         "orientation":{"supported":true,"auto":true,"rotation":2},
+         "battery":{"supported":true,"present":true,"charging":true,
+                    "level":76,"voltage_mv":3940},
+         "weather_animation":{"revision":3,"frames":20}}
         """.utf8)
         let info = try XCTUnwrap(DeviceClient.decodeInfo(data))
-        XCTAssertEqual(info.firmwareVersion, "0.6.0")
-        XCTAssertEqual(info.mode, "pomodoro")
+        XCTAssertEqual(info.board, "waveshare-esp32-s3-touch-lcd-1.54")
+        XCTAssertEqual(info.firmwareVersion, "0.7.1-s3")
+        XCTAssertEqual(info.mode, "weather")
         XCTAssertTrue(info.otaAvailable)
-        XCTAssertEqual(info.spriteUploadState, "processing")
-        XCTAssertEqual(info.spriteUploadSlot, "codex")
-        XCTAssertTrue(info.codexCustomSprite)
-        XCTAssertEqual(info.pomodoroPhase, "break")
-        XCTAssertTrue(info.pomodoroRunning)
-        XCTAssertEqual(info.pomodoroRemainingS, 238)
-        XCTAssertEqual(info.pomodoroDurationS, 300)
-        XCTAssertEqual(info.pomodoroCompleted, 3)
+        XCTAssertTrue(info.autoRotateSupported)
+        XCTAssertTrue(info.autoRotateEnabled)
+        XCTAssertEqual(info.screenRotation, 2)
+        XCTAssertTrue(info.batterySupported)
+        XCTAssertTrue(info.batteryPresent)
+        XCTAssertTrue(info.batteryCharging)
+        XCTAssertEqual(info.batteryLevel, 76)
+        XCTAssertEqual(info.batteryVoltageMv, 3940)
+        XCTAssertEqual(info.weatherAnimationRevision, 3)
+        XCTAssertEqual(info.weatherAnimationFrames, 20)
+    }
+
+    func testDecodeInfoMigratesLegacyModesToWeather() throws {
+        let data = Data("""
+        {"ip":"192.168.1.50","mode":"codex","effective":"auto"}
+        """.utf8)
+        let info = try XCTUnwrap(DeviceClient.decodeInfo(data))
+
+        XCTAssertEqual(info.mode, "weather")
+        XCTAssertEqual(info.effective, "weather")
+    }
+
+    func testClockDiscoveryUsesMinimalIdentityFields() {
+        XCTAssertTrue(DeviceClient.isClockInfo(["mode": "weather", "fw": "1.0.0"]))
+        XCTAssertFalse(DeviceClient.isClockInfo(["mode": "weather"]))
+        XCTAssertFalse(DeviceClient.isClockInfo(["fw": "1.0.0"]))
     }
 
     func testFirmwareImageValidation() {
@@ -117,6 +162,38 @@ final class DeviceClientTests: XCTestCase {
         XCTAssertTrue(DeviceClient.isValidFirmwareImage(valid))
         XCTAssertFalse(DeviceClient.isValidFirmwareImage(Data(repeating: 0, count: 4096)))
         XCTAssertFalse(DeviceClient.isValidFirmwareImage(Data([0xE9])))
+    }
+
+    func testFirmwareImageValidationRejectsWrongChipFamily() {
+        var esp32S3 = Data(repeating: 0, count: 4096)
+        esp32S3[0] = 0xE9
+        esp32S3[12] = 9
+        XCTAssertTrue(DeviceClient.isValidFirmwareImage(
+            esp32S3,
+            boardID: "waveshare-esp32-s3-touch-lcd-1.54"
+        ))
+        XCTAssertFalse(DeviceClient.isValidFirmwareImage(
+            esp32S3,
+            boardID: "esp8266-fubotv-sd2"
+        ))
+
+        var esp8266 = Data(repeating: 0, count: 4096)
+        esp8266[0] = 0xE9
+        XCTAssertTrue(DeviceClient.isValidFirmwareImage(
+            esp8266,
+            boardID: "esp8266-fubotv-sd2"
+        ))
+        XCTAssertFalse(DeviceClient.isValidFirmwareImage(
+            esp8266,
+            boardID: "waveshare-esp32-s3-touch-lcd-1.54"
+        ))
+    }
+
+    func testSerialPortDiscoveryIncludesNativeUSB() {
+        XCTAssertTrue(SerialLink.isSupportedSerialPortName("cu.usbserial-110"))
+        XCTAssertTrue(SerialLink.isSupportedSerialPortName("cu.wchusbserial110"))
+        XCTAssertTrue(SerialLink.isSupportedSerialPortName("cu.usbmodem21201"))
+        XCTAssertFalse(SerialLink.isSupportedSerialPortName("cu.Bluetooth-Incoming-Port"))
     }
 
     func testFirmwareAuthorizationAndMultipartBody() {

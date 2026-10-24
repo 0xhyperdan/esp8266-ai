@@ -1,34 +1,41 @@
 import Foundation
 
-// Talks to the ESP8266 clock over HTTP, with USB serial fallbacks for device
-// information, controls, and pet uploads. Device address persists in defaults.
+// Talks to supported AI clocks over HTTP, with USB serial fallbacks for device
+// information and controls. Device address persists in defaults.
 
 struct DeviceInfo {
+    var printer = PrinterStatus()
+    var board = ""
     var ip = ""
     var ssid = ""
     var bridge = ""
-    var mode = "auto"       // configured: auto | claude | codex | net | music | stock | pomodoro
-    var effective = "auto"  // what's actually on screen (AUTO may promote to music)
+    var mode = "weather"    // configured: weather | net | music | stock | salary
+    var effective = "weather" // weather may temporarily promote to music
     var showing = ""
     var lastUpdateS = -1    // seconds since the device last got /status data, -1 = never
-    var spriteRev = 0       // bumped by the device on animation change
     var brightness = 100    // backlight 0-100 (0 = off)
+    var autoRotateSupported = false
+    var autoRotateEnabled = false
+    var screenRotation = 0
+    var batterySupported = false
+    var batteryPresent = false
+    var batteryCharging = false
+    var batteryLevel = -1
+    var batteryVoltageMv = 0
+    var weatherAnimationRevision = -1
+    var weatherAnimationFrames = 0
     var firmwareVersion = ""
     var otaAvailable = false
-    var spriteUploadState = ""
-    var spriteUploadSlot = ""
-    var spriteUploadError = ""
-    var pomodoroPhase = "focus"
-    var pomodoroRunning = false
-    var pomodoroRemainingS = 25 * 60
-    var pomodoroDurationS = 25 * 60
-    var pomodoroCompleted = 0
-    var pomodoroFocusMinutes = 25
-    var pomodoroBreakMinutes = 5
-    var claudeCustomSprite = false
-    var codexCustomSprite = false
-    var claudeW = 111, claudeH = 120
-    var codexW = 120, codexH = 120
+    var salaryMonthlyYuan = 0.0
+    var salaryStartMin = 9 * 60
+    var salaryEndMin = 18 * 60
+    var salaryLunchStartMin = 12 * 60
+    var salaryLunchEndMin = 13 * 60
+    var salaryElapsedS = 0
+    var salaryDailyWorkS = 8 * 60 * 60
+    var salaryEarnedYuan = 0.0
+    var salaryRateYuanPerSecond = 0.0
+    var salaryStatus = "CONFIGURE SALARY"
 }
 
 struct OTACredentials: Codable, Equatable {
@@ -90,20 +97,48 @@ final class FirmwareUploadTask: NSObject, URLSessionDataDelegate, URLSessionTask
 }
 
 final class DeviceClient {
-    private static let hostKey = "device_host"
     private static let lastSeenKey = "device_last_seen"
+    private static let registry = DeviceRegistry.shared
 
     static var wiredCommandHandler: (([String: Any]) -> Bool)?
     static var wiredInfoProvider: (() -> DeviceInfo?)?
-    static var wiredPetUploadHandler: ((Data, String, String, @escaping (Error?) -> Void) -> Bool)?
     private static var activeFirmwareUploads: [UUID: FirmwareUploadTask] = [:]
     private static let pairingScanLock = NSLock()
     private static var pairingScanGeneration = 0
     private static var activePairingSession: URLSession?
 
     static var host: String {
-        get { UserDefaults.standard.string(forKey: hostKey) ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: hostKey) }
+        get { registry.selectedAddress }
+        set { registry.selectedAddress = newValue }
+    }
+
+    static var deviceAddresses: [String] {
+        var addresses = registry.addresses
+        if let wiredAddress = wiredInfoProvider?().flatMap(deviceAddress),
+           !addresses.contains(wiredAddress) {
+            addresses.append(wiredAddress)
+        }
+        return addresses
+    }
+
+    static func registerDevice(_ address: String) {
+        _ = registry.register(address)
+    }
+
+    static func selectDevice(_ address: String) {
+        registry.selectedAddress = address
+    }
+
+    static func removeDevice(_ address: String) {
+        registry.remove(address)
+    }
+
+    static func displayName(for address: String) -> String {
+        if address.hasPrefix("/dev/") {
+            return "USB " + URL(fileURLWithPath: address).lastPathComponent
+                .replacingOccurrences(of: "cu.", with: "")
+        }
+        return address
     }
 
     /// Last LAN address that polled our /status — i.e. the clock itself.
@@ -113,23 +148,33 @@ final class DeviceClient {
     }
 
     static var baseURL: URL? {
-        let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        baseURL(for: host)
+    }
+
+    private static func baseURL(for address: String) -> URL? {
+        let h = DeviceRegistry.normalize(address)
         guard !h.isEmpty else { return nil }
         return URL(string: h.hasPrefix("http") ? h : "http://\(h)")
     }
 
     /// GET /api/info
     static func fetchInfo(completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
-        if let info = wiredInfoProvider?() {
+        let selected = host
+        if let info = selectedWiredInfo(for: selected) {
             DispatchQueue.main.async { completion(.success(info)) }
             return
         }
-        fetchLANInfo(completion: completion)
+        fetchLANInfo(address: selected, completion: completion)
     }
 
     /// GET /api/info over LAN even when a USB device is linked.
     static func fetchLANInfo(completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
-        guard let base = baseURL else {
+        fetchLANInfo(address: host, completion: completion)
+    }
+
+    private static func fetchLANInfo(address: String,
+                                     completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
+        guard let base = baseURL(for: address) else {
             completion(.failure(Self.noHostError))
             return
         }
@@ -148,73 +193,112 @@ final class DeviceClient {
         }.resume()
     }
 
+    private static func deviceAddress(_ info: DeviceInfo) -> String? {
+        let address = DeviceRegistry.normalize(info.ip)
+        return address.isEmpty ? nil : address
+    }
+
+    private static func selectedWiredInfo(for address: String) -> DeviceInfo? {
+        guard let info = wiredInfoProvider?(), let wiredAddress = deviceAddress(info) else { return nil }
+        let selected = DeviceRegistry.normalize(address)
+        return selected.isEmpty || selected == wiredAddress ? info : nil
+    }
+
+    private static var shouldUseWiredTransport: Bool {
+        let selected = DeviceRegistry.normalize(host)
+        if selected.isEmpty {
+            return wiredInfoProvider != nil || wiredCommandHandler != nil
+        }
+        return selectedWiredInfo(for: selected) != nil
+    }
+
     static func decodeInfo(_ data: Data) -> DeviceInfo? {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
         var info = DeviceInfo()
+        info.printer = PrinterStatus.decode(obj["printer"] as? [String: Any] ?? [:])
+        info.board = obj["board"] as? String ?? ""
         info.ip = obj["ip"] as? String ?? ""
         info.ssid = obj["ssid"] as? String ?? ""
         info.bridge = obj["bridge"] as? String ?? ""
-        info.mode = obj["mode"] as? String ?? "auto"
-        info.effective = obj["effective"] as? String ?? info.mode
+        info.mode = DisplayModeDescriptor.normalizedMode(obj["mode"] as? String ?? "weather")
+        info.effective = DisplayModeDescriptor.normalizedMode(
+            obj["effective"] as? String ?? info.mode
+        )
         info.showing = obj["showing"] as? String ?? ""
         info.lastUpdateS = (obj["last_update_s"] as? NSNumber)?.intValue ?? -1
-        info.spriteRev = (obj["sprite_rev"] as? NSNumber)?.intValue ?? 0
         info.brightness = (obj["brightness"] as? NSNumber)?.intValue ?? 100
+        let orientation = obj["orientation"] as? [String: Any]
+        info.autoRotateSupported = orientation?["supported"] as? Bool ?? false
+        info.autoRotateEnabled = orientation?["auto"] as? Bool ?? false
+        info.screenRotation = (orientation?["rotation"] as? NSNumber)?.intValue ?? 0
+        let battery = obj["battery"] as? [String: Any]
+        info.batterySupported = battery?["supported"] as? Bool ?? false
+        info.batteryPresent = battery?["present"] as? Bool ?? false
+        info.batteryCharging = battery?["charging"] as? Bool ?? false
+        info.batteryLevel = (battery?["level"] as? NSNumber)?.intValue ?? -1
+        info.batteryVoltageMv = (battery?["voltage_mv"] as? NSNumber)?.intValue ?? 0
+        let weatherAnimation = obj["weather_animation"] as? [String: Any]
+        info.weatherAnimationRevision =
+            (weatherAnimation?["revision"] as? NSNumber)?.intValue ?? -1
+        info.weatherAnimationFrames =
+            (weatherAnimation?["frames"] as? NSNumber)?.intValue ?? 0
         info.firmwareVersion = obj["fw"] as? String ?? ""
         info.otaAvailable = obj["ota"] as? Bool ?? false
-        let upload = obj["sprite_upload"] as? [String: Any]
-        info.spriteUploadState = upload?["state"] as? String ?? ""
-        info.spriteUploadSlot = upload?["slot"] as? String ?? ""
-        info.spriteUploadError = upload?["error"] as? String ?? ""
-        let pomodoro = obj["pomodoro"] as? [String: Any]
-        info.pomodoroPhase = pomodoro?["phase"] as? String ?? "focus"
-        info.pomodoroRunning = pomodoro?["running"] as? Bool ?? false
-        info.pomodoroRemainingS = (pomodoro?["remaining_s"] as? NSNumber)?.intValue ?? 25 * 60
-        info.pomodoroDurationS = (pomodoro?["duration_s"] as? NSNumber)?.intValue ?? 25 * 60
-        info.pomodoroCompleted = (pomodoro?["completed"] as? NSNumber)?.intValue ?? 0
-        info.pomodoroFocusMinutes = (pomodoro?["focus_min"] as? NSNumber)?.intValue ?? 25
-        info.pomodoroBreakMinutes = (pomodoro?["break_min"] as? NSNumber)?.intValue ?? 5
-        let claude = obj["claude"] as? [String: Any]
-        let codex = obj["codex"] as? [String: Any]
-        info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false
-        info.codexCustomSprite = codex?["custom_sprite"] as? Bool ?? false
-        info.claudeW = (claude?["w"] as? NSNumber)?.intValue ?? 111
-        info.claudeH = (claude?["h"] as? NSNumber)?.intValue ?? 120
-        info.codexW = (codex?["w"] as? NSNumber)?.intValue ?? 120
-        info.codexH = (codex?["h"] as? NSNumber)?.intValue ?? 120
+        let salary = obj["salary"] as? [String: Any]
+        info.salaryMonthlyYuan = ((salary?["monthly_fen"] as? NSNumber)?.doubleValue ?? 0) / 100.0
+        info.salaryStartMin = (salary?["start_min"] as? NSNumber)?.intValue ?? 9 * 60
+        info.salaryEndMin = (salary?["end_min"] as? NSNumber)?.intValue ?? 18 * 60
+        info.salaryLunchStartMin = (salary?["lunch_start_min"] as? NSNumber)?.intValue ?? 12 * 60
+        info.salaryLunchEndMin = (salary?["lunch_end_min"] as? NSNumber)?.intValue ?? 13 * 60
+        info.salaryElapsedS = (salary?["elapsed_s"] as? NSNumber)?.intValue ?? 0
+        // Firmwares before daily_work_s: derive it from the schedule so the
+        // mirror progress ring stays correct.
+        if let daily = (salary?["daily_work_s"] as? NSNumber)?.intValue, daily > 0 {
+            info.salaryDailyWorkS = daily
+        } else {
+            let lunch = max(0, info.salaryLunchEndMin - info.salaryLunchStartMin)
+            info.salaryDailyWorkS = max(60, info.salaryEndMin - info.salaryStartMin - lunch) * 60
+        }
+        info.salaryEarnedYuan = (salary?["earned_yuan"] as? NSNumber)?.doubleValue ?? 0
+        info.salaryRateYuanPerSecond = (salary?["rate_yuan_per_second"] as? NSNumber)?.doubleValue ?? 0
+        info.salaryStatus = salary?["status"] as? String ?? "CONFIGURE SALARY"
         return info
     }
 
-    /// POST /api/display  mode=auto|claude|codex|net|music|stock|pomodoro
+    /// POST /api/display  mode=weather|net|music|stock|weather|salary
     static func setDisplayMode(_ mode: String, completion: @escaping (Error?) -> Void) {
-        if wiredCommandHandler?(["display": mode]) == true {
+        if shouldUseWiredTransport, wiredCommandHandler?(["display": mode]) == true {
             completion(nil)
             return
         }
         postForm(path: "api/display", fields: ["mode": mode], completion: completion)
     }
 
-    /// Controls the device-owned Pomodoro state machine and brings it on screen.
-    static func controlPomodoro(_ action: String, focusMinutes: Int? = nil,
-                                breakMinutes: Int? = nil,
-                                completion: @escaping (Error?) -> Void) {
-        var command: [String: Any] = ["pomodoro": action]
-        var fields = ["action": action]
-        if let focusMinutes = focusMinutes {
-            command["focus_min"] = focusMinutes
-            fields["focus_min"] = String(focusMinutes)
-        }
-        if let breakMinutes = breakMinutes {
-            command["break_min"] = breakMinutes
-            fields["break_min"] = String(breakMinutes)
-        }
-        if wiredCommandHandler?(command) == true {
+    /// Saves monthly salary and the paid work schedule, then shows the salary page.
+    static func configureSalary(monthlyYuan: Double, startMin: Int, endMin: Int,
+                               lunchStartMin: Int, lunchEndMin: Int,
+                               completion: @escaping (Error?) -> Void) {
+        let monthlyText = String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), monthlyYuan)
+        let salary: [String: Any] = [
+            "monthly_fen": max(0, Int((monthlyYuan * 100.0).rounded())),
+            "start_min": startMin,
+            "end_min": endMin,
+            "lunch_start_min": lunchStartMin,
+            "lunch_end_min": lunchEndMin,
+        ]
+        if shouldUseWiredTransport, wiredCommandHandler?(["salary": salary]) == true {
             completion(nil)
             return
         }
-        postForm(path: "api/pomodoro", fields: fields, completion: completion)
+        postForm(path: "api/salary", fields: [
+            "monthly_yuan": monthlyText,
+            "start_min": String(startMin),
+            "end_min": String(endMin),
+            "lunch_start_min": String(lunchStartMin),
+            "lunch_end_min": String(lunchEndMin),
+        ], completion: completion)
     }
 
     /// POST /api/bridge  host=ip:port
@@ -224,87 +308,38 @@ final class DeviceClient {
 
     /// Set brightness. HTTP persists it; wired mode applies it for this boot.
     static func setBrightness(_ level: Int, completion: @escaping (Error?) -> Void) {
-        if wiredCommandHandler?(["brightness": level]) == true {
+        if shouldUseWiredTransport, wiredCommandHandler?(["brightness": level]) == true {
             completion(nil)
             return
         }
         postForm(path: "api/brightness", fields: ["level": String(level)], completion: completion)
     }
 
-    /// Uploads the device-native RGB565 stream. Firmware before 0.6.1 falls
-    /// back to the legacy GIF decoder when the raw HTTP route is unavailable.
-    static func uploadPet(_ sprite: Data, fallbackGif gif: Data, slot: String,
-                          completion: @escaping (Error?) -> Void) {
-        if wiredPetUploadHandler?(sprite, slot, "rgb565", completion) == true {
+    /// Enables or disables the device-owned IMU auto-rotation policy.
+    static func setAutoRotate(_ enabled: Bool, completion: @escaping (Error?) -> Void) {
+        if shouldUseWiredTransport,
+           wiredCommandHandler?(["auto_rotate": enabled]) == true {
+            completion(nil)
             return
         }
-        uploadMultipart(sprite, slot: slot, pathSuffix: "raw", filename: "pet.rgb565",
-                        contentType: "application/octet-stream") { error in
-            if let error = error, [404, 405, 501].contains((error as NSError).code) {
-                uploadGif(gif, slot: slot, completion: completion)
-                return
-            }
-            guard error == nil else {
-                completion(error)
-                return
-            }
-            waitForSpriteUpload(slot: slot, deadline: Date().addingTimeInterval(30),
-                                completion: completion)
-        }
+        postForm(path: "api/orientation", fields: ["auto": enabled ? "1" : "0"],
+                 completion: completion)
     }
 
-    /// POST /sprite/{claude|codex} multipart GIF upload for legacy firmware.
-    static func uploadGif(_ gif: Data, slot: String, completion: @escaping (Error?) -> Void) {
-        if wiredPetUploadHandler?(gif, slot, "gif", completion) == true {
-            return
-        }
-        uploadMultipart(gif, slot: slot, pathSuffix: nil, filename: "pet.gif",
-                        contentType: "image/gif") { error in
-            guard error == nil else {
-                completion(error)
-                return
-            }
-            waitForSpriteUpload(slot: slot, deadline: Date().addingTimeInterval(90),
-                                completion: completion)
-        }
-    }
-
-    private static func uploadMultipart(_ payload: Data, slot: String, pathSuffix: String?,
-                                        filename: String, contentType: String,
-                                        completion: @escaping (Error?) -> Void) {
-        guard let base = baseURL else {
-            completion(Self.noHostError)
-            return
-        }
-        var path = "sprite/\(slot)"
-        if let pathSuffix = pathSuffix { path += "/\(pathSuffix)" }
-        var req = URLRequest(url: base.appendingPathComponent(path))
-        req.httpMethod = "POST"
-        req.timeoutInterval = 60
-        let boundary = "aiclock-\(UUID().uuidString)"
-        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        var body = Data()
-        body.append(Data("--\(boundary)\r\n".utf8))
-        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".utf8))
-        body.append(Data("Content-Type: \(contentType)\r\n\r\n".utf8))
-        body.append(payload)
-        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-        req.httpBody = body
-        run(req, completion: completion)
-    }
-
-    /// Uploads an ESP8266 firmware image over the authenticated Web OTA route,
+    /// Uploads a firmware image over the authenticated Web OTA route,
     /// then waits for the device to restart and answer /api/info again.
-    static func uploadFirmware(_ firmware: Data, credentials: OTACredentials,
+    static func uploadFirmware(_ firmware: Data, boardID: String,
+                               credentials: OTACredentials,
                                progress: @escaping (FirmwareUpdateProgress) -> Void,
                                completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
         guard let base = baseURL else {
             completion(.failure(Self.noHostError))
             return
         }
-        guard isValidFirmwareImage(firmware) else {
+        guard isValidFirmwareImage(firmware, boardID: boardID) else {
             completion(.failure(NSError(domain: "DeviceClient", code: 10,
-                userInfo: [NSLocalizedDescriptionKey: "The selected file is not an ESP8266 firmware image."])))
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The selected firmware does not match the connected device."])))
             return
         }
 
@@ -333,8 +368,25 @@ final class DeviceClient {
         uploader.start(request: request, body: body)
     }
 
-    static func isValidFirmwareImage(_ data: Data) -> Bool {
-        data.count >= 4096 && data.first == 0xE9
+    static func isValidFirmwareImage(_ data: Data, boardID: String = "") -> Bool {
+        guard data.count >= 4096, data.first == 0xE9 else { return false }
+        let normalized = boardID.lowercased()
+        if normalized.contains("esp32-s3") {
+            return firmwareChipID(data) == 9
+        }
+        if normalized.contains("esp8266") {
+            return firmwareChipID(data) != 9
+        }
+        return true
+    }
+
+    static func firmwareTargetName(for boardID: String) -> String {
+        boardID.lowercased().contains("esp32-s3") ? "ESP32-S3" : "ESP8266"
+    }
+
+    private static func firmwareChipID(_ data: Data) -> UInt16? {
+        guard data.count >= 14 else { return nil }
+        return UInt16(data[12]) | UInt16(data[13]) << 8
     }
 
     static func basicAuthorizationHeader(_ credentials: OTACredentials) -> String {
@@ -373,33 +425,6 @@ final class DeviceClient {
         }.resume()
     }
 
-    /// POST /sprite/{claude|codex}/reset — back to the compiled-in animation.
-    static func resetSprite(slot: String, completion: @escaping (Error?) -> Void) {
-        postForm(path: "sprite/\(slot)/reset", fields: [:], completion: completion)
-    }
-
-    /// GET /sprite/{claude|codex}/raw — the animation the device is actually
-    /// using, wire format [1 byte frame count][RGB565 big-endian frames...].
-    static func fetchSpriteRaw(slot: String, completion: @escaping (Result<Data, Error>) -> Void) {
-        guard let base = baseURL else {
-            completion(.failure(Self.noHostError))
-            return
-        }
-        var req = URLRequest(url: base.appendingPathComponent("sprite/\(slot)/raw"))
-        req.timeoutInterval = 30
-        URLSession.shared.dataTask(with: req) { data, resp, error in
-            var result: Result<Data, Error>
-            if let error = error {
-                result = .failure(error)
-            } else if let data = data, (resp as? HTTPURLResponse)?.statusCode == 200, data.count > 1 {
-                result = .success(data)
-            } else {
-                result = .failure(Self.badResponseError)
-            }
-            DispatchQueue.main.async { completion(result) }
-        }.resume()
-    }
-
     // MARK: - internals
 
     private static func postForm(path: String, fields: [String: String],
@@ -431,38 +456,6 @@ final class DeviceClient {
         }.resume()
     }
 
-    private static func waitForSpriteUpload(slot: String, deadline: Date,
-                                            completion: @escaping (Error?) -> Void) {
-        guard Date() < deadline else {
-            completion(NSError(domain: "DeviceClient", code: 12,
-                userInfo: [NSLocalizedDescriptionKey: "The device did not finish decoding the pet in time."]))
-            return
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
-            fetchLANInfo { result in
-                switch result {
-                case let .success(info):
-                    // Firmware before 0.5.3 completed decoding inside the upload request.
-                    if info.spriteUploadState.isEmpty {
-                        completion(nil)
-                    } else if info.spriteUploadSlot == slot, info.spriteUploadState == "succeeded" {
-                        completion(nil)
-                    } else if info.spriteUploadSlot == slot, info.spriteUploadState == "failed" {
-                        let reason = info.spriteUploadError.isEmpty ? "unknown decode error" : info.spriteUploadError
-                        completion(NSError(domain: "DeviceClient", code: 13,
-                            userInfo: [NSLocalizedDescriptionKey: "The device could not decode the pet: \(reason)"]))
-                    } else {
-                        waitForSpriteUpload(slot: slot, deadline: deadline, completion: completion)
-                    }
-                case .failure:
-                    // The single-core ESP8266 cannot answer HTTP while decoding. Retry until it is free.
-                    waitForSpriteUpload(slot: slot, deadline: deadline, completion: completion)
-                }
-            }
-        }
-    }
-
     private static var noHostError: NSError {
         NSError(domain: "DeviceClient", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "未设置设备地址，请先在菜单里填写设备 IP"])
@@ -477,6 +470,10 @@ final class DeviceClient {
 
     /// Checks whether `ip` answers like our clock (GET /api/info with the
     /// expected JSON shape).
+    static func isClockInfo(_ object: [String: Any]) -> Bool {
+        object["mode"] is String && object["fw"] is String
+    }
+
     static func verifyDevice(ip: String, timeout: TimeInterval = 2,
                              completion: @escaping (Bool) -> Void) {
         guard let url = URL(string: "http://\(ip)/api/info") else {
@@ -487,7 +484,7 @@ final class DeviceClient {
         req.timeoutInterval = timeout
         URLSession.shared.dataTask(with: req) { data, _, _ in
             let ok = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                .map { $0["mode"] is String && $0["sprite_rev"] != nil } ?? false
+                .map(isClockInfo) ?? false
             DispatchQueue.main.async { completion(ok) }
         }.resume()
     }
@@ -564,7 +561,7 @@ final class DeviceClient {
                 group.enter()
                 let task = session.dataTask(with: URL(string: "http://\(ip)/api/info")!) { data, _, _ in
                     let ok = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                        .map { $0["mode"] is String && $0["sprite_rev"] != nil } ?? false
+                        .map(isClockInfo) ?? false
                     if ok, isPairingScanActive(generation) {
                         lock.lock()
                         if found == nil { found = ip }
@@ -614,7 +611,7 @@ final class DeviceClient {
 
     // MARK: - pairing watchdog
 
-    /// Stamped on every device poll of our /status|/net|/music (see main.swift).
+    /// Stamped on every device poll of our /status|/music (see main.swift).
     static var devicePollAt = Date.distantPast
 
     private static var healInFlight = false
@@ -637,14 +634,26 @@ final class DeviceClient {
             fetchInfo { result in
                 defer { healInFlight = false }
                 guard case let .success(info) = result, let myIP = localIPv4() else { return }
-                let stale = info.lastUpdateS < 0 || info.lastUpdateS > 60
-                guard info.bridge.isEmpty || stale else { return }
-                setBridgeHost("\(myIP):\(port)") { error in
+                let expectedBridge = "\(myIP):\(port)"
+                guard bridgeNeedsRepair(
+                    current: info.bridge,
+                    expected: expectedBridge,
+                    lastUpdateS: info.lastUpdateS
+                ) else { return }
+                setBridgeHost(expectedBridge) { error in
                     FileHandle.standardError.write(Data(
-                        "[pair] pushed bridge \(myIP):\(port) to \(info.ip): \(error.map { "\($0.localizedDescription)" } ?? "ok")\n".utf8))
+                        "[pair] pushed bridge \(expectedBridge) to \(info.ip): \(error.map { "\($0.localizedDescription)" } ?? "ok")\n".utf8))
                 }
             }
         }
+    }
+
+    static func bridgeNeedsRepair(
+        current: String,
+        expected: String,
+        lastUpdateS: Int
+    ) -> Bool {
+        current.isEmpty || current != expected || lastUpdateS < 0 || lastUpdateS > 60
     }
 
     /// LAN IPv4 of this Mac (en0 preferred) — used for one-click "point the

@@ -1,408 +1,98 @@
-# 开发文档
+# Development
 
-> 面向想改代码 / 自己折腾硬件的人，普通使用看仓库根目录的 [README](../README.md) 即可。
+This repository contains the ESP8266 / ESP32-S3 firmware and the macOS / Windows bridge apps. Retained user-facing pages are weather, music, stocks, and salary. Device administration covers multi-device pairing, Wi-Fi or USB transport, brightness, web OTA, IMU auto-rotation, and battery awareness.
 
-一个 ESP8266 WiFi 时钟固件：显示时间 + Claude Code / Codex CLI 的实时工作状态和用量。
-不需要任何官方账单 API key —— 数据来自两处本地已有的来源：
-
-- **工作状态**（working/idle/offline）：本地会话日志的新旧程度
-  - `~/.claude/projects/**/*.jsonl`（Claude Code 会话记录）
-  - `~/.codex/sessions/**/*.jsonl`（Codex CLI 会话记录）
-- **真实额度**（5h / 周窗口用量百分比 + 重置时间）：复用两个 CLI 已经存在本机的
-  OAuth 登录凭据，直接调各自官方用量接口（做法与
-  [CodexBar](https://github.com/steipete/CodexBar) 相同，token 只发给各自官方 API）：
-  - Claude：Keychain 里的 `Claude Code-credentials` → `api.anthropic.com/api/oauth/usage`
-  - Codex：`~/.codex/auth.json` → `chatgpt.com/backend-api/wham/usage`
-
-架构：`mac-app/` 是一个 **Swift 原生菜单栏 app**（Windows 用户用 `windows-app/`，
-功能一致的 C# 托盘移植版），读日志、开一个本地 HTTP 服务；
-`firmware/` 是 ESP8266 固件，联网后每 15 秒轮询这个服务，把时间 + 状态画到 240x240
-ST7789 彩屏上。桌宠动画（GIF）的上传和解码**全部在 ESP8266 板子上完成**，换形象不再需要
-电脑参与（详见第 4 节）。
-
-## 目录结构
-
-```
-mac-app/      Mac 原生菜单栏 app (Swift / SPM，仅用系统框架，无第三方依赖)
-windows-app/  Windows 托盘 app (C# / .NET 8 WinForms)，功能与 mac-app 一致（见其 README）
-firmware/     ESP8266 固件 (PlatformIO + Arduino framework)，含板上 GIF 解码
-tools/        GIF -> RGB565 默认精灵图头文件的转换脚本（改编译进固件的默认动画时用）
+```text
+firmware/       Arduino firmware and PlatformIO environments
+mac-app/        Swift menu-bar app and XCTest suite
+windows-app/    WinForms tray app and focused bridge tests
+docs/images/    Retained weather and feature artwork
 ```
 
-## 1. 跑起 Mac 端菜单栏 app
+## Status heartbeat
 
-> Windows 用户：功能一致的托盘版见 [`windows-app/README.md`](windows-app/README.md)，
-> 本节其余说明（左右键交互、自动配对、数据来源）同样适用。
-
-需要 Xcode / Swift 工具链（macOS 自带 `swift`）。
-
-```bash
-cd mac-app
-swift run                # 前台运行；或 swift build 后跑 .build/debug/AIClockBridge
-```
-
-菜单栏会出现一个**固定黑底的复古麦金塔小电脑图标**（代码绘制，不跟随系统主题切换，
-也不占宽度显示额度数字）：
-
-- **左键点击** → 弹出 ESP8266 屏幕的**实时镜像**：Mac 端用与固件完全相同的数据
-  重绘同一个画面（方形额度环 + 当前桌宠动画 + logo + 额度文字），动画帧直接从设备
-  `GET /sprite/<app>/raw` 拉取（设备正在用什么就播什么，自定义/内置都一样），
-  working 时同步播放走路循环，随设备 2s/6s 切换同步换角色；底部附
-  自动/Claude/Codex 快速切换。
-- **右键点击** → 控制菜单：完整额度（5h/周 用量 + 重置倒计时）+ 设备遥控：
-
-- **自动查找并配对设备**：一般不用手动——设备本来就在轮询本机的 `/status`，
-  bridge 记下来访 IP 即完成发现（零扫描）；地址为空时自动配对，设备 DHCP 换了 IP
-  也会自愈。菜单项走完整流程：最近来访 IP → 已配置地址复验 → 子网 /24 扫描兜底
-  （覆盖"刚配完 WiFi、还没设过桥接"的全新设备）。
-- **设置设备地址…**：手动填时钟的 IP（开机时屏幕会显示；有自动配对后基本用不上）
-- **屏幕显示**：自动 / 固定 Claude / 固定 Codex / 网速 / 音乐 / 股票 / 番茄时钟
-- **番茄时钟**：开始/暂停、重置、跳过，以及设置专注/休息时长
-- **音乐播放**：显示 Mac 当前播放的专辑封面、歌曲、歌手和进度
-- **更换桌宠动画…**：内置 [petdex.dev](https://petdex.dev) 画廊（3300+ 开源桌宠），
-  搜索 → 选动画（待机/跑步/挥手…9 种）→ 预览 → 一键上传到设备
-- **恢复默认动画**：删掉自定义 GIF，回到固件内置形象
-- **把本机设为设备桥接**：一键把设备的 Bridge host 指到这台 Mac
-
-验证服务是否正常：
-
-```bash
-curl -s http://localhost:8765/status | python3 -m json.tool
-```
-
-已验证返回示例（真实数据）：
+HTTP `GET /status` and USB `#STATUS` use the same minimal envelope:
 
 ```json
 {
-  "claude": {"status": "working", "tokens_today": 4868001, "session_min": 26, "session_window_min": 300},
-  "codex":  {"status": "offline", "tokens_today": 61471, "primary_pct": 1.0, "primary_window_min": 300,
-             "primary_reset_min": 0, "weekly_pct": 2.0, "weekly_window_min": 10080, "weekly_reset_min": 8729}
+  "ts": 1780000000,
+  "music_playing": false
 }
 ```
 
-需要登录后自动启动和异常退出自动恢复时，运行：
+`ts` anchors device-owned salary timing, and `music_playing` lets the default weather page temporarily promote to the music page. The firmware acknowledges a valid USB heartbeat with `#ACK status`. No agent state, task data, quota fields, pet settings, or lifecycle metadata are transmitted.
+
+Legacy `auto`, `claude`, `codex`, `home`, `usage`, `info`, `net`, and `pomodoro` display values normalize to `weather` on macOS, Windows, over HTTP, and over USB. Bridge clients normalize unknown reported modes to weather; invalid device HTTP commands still return 400.
+
+## Mac app
+
+Printer telemetry is documented in [PRINTER.md](PRINTER.md). ESP32-S3 owns its
+TLS MQTT connection; ESP8266 receives normalized full snapshots from Mac over
+HTTP `/printer` or USB `#PRINTER`. The Mac owns the MQTT connection in that mode
+and stores access codes only in Keychain. `/api/info.printer.supported` gates the
+printer menu and preview; `printer.native` selects device or Mac configuration.
+Pomodoro routes, commands, state, persistence code, and renderers are removed.
 
 ```bash
-mac-app/install-launch-agent.sh
+cd mac-app
+swift run
+swift test --disable-sandbox
+swift build -c release --disable-sandbox
 ```
 
-脚本会构建 release 版本，将二进制和 SwiftPM 资源包安装到
-`~/Library/Application Support/AIClockBridge/`，并注册用户级 LaunchAgent
-`~/Library/LaunchAgents/local.AIClockBridge.plist`。正常从菜单退出后不会强制重启；进程
-异常结束时 launchd 会自动拉起。更新源码后重新运行安装脚本即可部署，卸载使用
-`mac-app/uninstall-launch-agent.sh`。
+The app serves `/status`, `/music`, `/stock`, `/weather`, and their RGB565/compressed assets. It discovers multiple devices, mirrors the selected screen, controls brightness/pages/salary, configures weather and stocks, uploads firmware, and uses USB serial when a compatible port is linked. Sleep notifications pause monitors and wake notifications resume them.
 
-**注意**：HTTP 服务监听 `0.0.0.0:8765`，同一局域网内的设备都能读到（只是状态和 token
-计数，不含任何 API key），如果在意，建议只在家庭可信网络下跑，或用系统防火墙限制。
+Focused regression tests cover legacy mode migration, minimal status serialization, the USB `#STATUS` line format, clock discovery, weather assets, device transport, and sleep/wake behavior.
 
-### 数据来源与局限
+## Windows app
 
-- **额度（两家都是真实值）**：app 每 2 分钟调一次官方用量接口（见开头），拿到
-  5h / 周窗口的已用百分比和重置时间，合并进 `/status` 下发给设备。接口 429 限流时
-  自动退避 5 分钟并沿用上一次的数值。
-- Claude 的 OAuth token 存在 Keychain，app 通过 `security` CLI 读取，第一次运行
-  macOS 可能弹一次授权框（选"始终允许"即可）；`~/.claude/.credentials.json` 存在时
-  优先读文件。
-- 若凭据缺失/过期，额度显示"?"，工作状态仍照常工作（来自日志，不依赖网络）。
+```powershell
+cd windows-app\AIClockBridge
+dotnet run
+dotnet publish -c Release -r win-x64 --self-contained false
 
-## 2. 烧录 ESP8266 固件
-
-已确认的硬件：ESP8266EX（ESP-12S 模组）/ 4MB flash / CH340C 转串口，macOS 设备节点
-通常为 `/dev/cu.usbserial-XXXX`（后缀因设备而异）。这是拼多多"WiFi天气时钟 MG01"成品板，本质是 oshwhub 上
-["SD2/小电视"开源方案](https://oshwhub.com/q21182889/sd2) 的量产版。
-
-### Web OTA
-
-混合版支持带 HTTP Basic Authentication 的固件更新页面。实际凭据放在被 Git 忽略的
-`firmware/include/ota_secrets.h`；新环境可复制 `ota_secrets.example.h` 后设置独立密码。
-没有本机凭据文件时固件仍可编译，但 OTA 会保持关闭。
-
-首次用 USB 刷入支持 OTA 的版本后，后续流程是：
-
-```bash
-cd firmware
-.pio-venv/bin/pio run -e nodemcuv2
-open http://DEVICE_IP/update
+cd ..\BridgeTests
+dotnet run
 ```
 
-登录后上传 `.pio/build/nodemcuv2/firmware.bin`。更新只写程序分区，LittleFS 中的桌宠数据、
-Wi-Fi 配置、亮度和 Bridge 地址都会保留。Basic Authentication 在普通 HTTP 上传输，因而
-只应在可信局域网使用；不要把 `ota_secrets.h` 提交到 Git。
+The tray app pairs and controls devices, switches retained pages, manages stocks, and serves `/status`, `/music`, `/stock`, and their music/stock binary assets. Weather data and location configuration are provided by the Mac bridge; the Windows app can still select the device's weather page.
 
-Mac 菜单栏的「Wi-Fi 更新固件…」使用同一个 `/update` 接口。它会强制通过 LAN 查询
-`/api/info`，不会因为 USB 串口在线而误走有线设备信息；首次使用时将用户名和密码保存到
-macOS Keychain，之后选择 `.bin` 即可。若设备返回 401，程序会删除失效凭据，下次重新询问。
+`BridgeTests` covers the minimal heartbeat envelope, mode migration, and minimal `/api/info` discovery. WinForms behavior still requires a Windows host for manual release validation.
 
-**接线是厂家固定的，一体成型无法重接**，网上能搜到的几份"看起来像"的教程接线图实测
-都是错的——真正正确的引脚来自该开源项目附带的厂家参考固件源码
-（`TFT_eSPI/User_Setup.h` + `SmallDesktopDisplay.ino`），已在实机验证点亮：
-
-| 屏幕引脚 | 说明 | ESP-12S | GPIO |
-|---|---|---|---|
-| SCLK | SPI 时钟 | D5 | GPIO14（硬件 SPI）|
-| MOSI | SPI 数据 | D7 | GPIO13（硬件 SPI）|
-| CS   | 片选 | D8 | GPIO15 |
-| DC   | 数据/命令选择 | D3 | GPIO0  |
-| RESET| 复位 | D4 | GPIO2  |
-| 背光 | LED 背光，**低电平点亮**，厂家固件用 PWM 调光 | D1 | GPIO5  |
-| VCC  | 电源 | 3V3 | - |
-| GND  | 地 | GND | - |
-
-驱动型号也有讲究：要用 TFT_eSPI 的 `ST7789_2_DRIVER`（一个专门的简化初始化变体），
-用普通的 `ST7789_DRIVER` 配合正确引脚依然点不亮。`platformio.ini` 里已经按这个组合
-配置好了。
-
-如果你买到的是完全不同的板子，改 `firmware/platformio.ini` 里 `build_flags` 的
-`TFT_*` 几行即可；但如果就是这款"WiFi天气时钟 MG01"，直接用现在的配置就行，不用再猜。
+## Firmware
 
 ```bash
 cd firmware
-python3 -m venv .pio-venv && source .pio-venv/bin/activate
-pip install platformio
-pio run -t upload          # 已验证：编译成功，Flash 45.7%，RAM 39.7%
+pio run -e nodemcuv2
+pio run -e fubotv-usb
+pio run -e waveshare-s3-touch-lcd-154
 ```
 
-只走 USB 串口、不使用 Wi-Fi 时，选择 `fubotv-usb` 构建目标。它会关闭 ESP8266
-无线射频、跳过配网和 Web 服务，并等待 Mac 端主动推送状态数据：
+- `nodemcuv2`: SD2 / MG01 ESP8266 with Wi-Fi or CH340 USB.
+- `fubotv-usb`: disables Wi-Fi, provisioning, and the web server; receives bridge data over serial.
+- `waveshare-s3-touch-lcd-154`: Waveshare ESP32-S3-Touch-LCD-1.54 with QMI8658 rotation, touch, battery monitoring, 16 MB flash, and PSRAM.
 
-```bash
-cd firmware
-pio run -e fubotv-usb -t upload
+The firmware owns salary configuration, brightness persistence, weather animation state, Wi-Fi provisioning, and password-protected OTA. ESP32-S3 battery and IMU state remain available through `/api/info`.
 
-cd ../mac-app
-AICLOCK_SERIAL_PORT=/dev/cu.usbserial-XXXX swift run
-```
+## Device HTTP API
 
-`AICLOCK_SERIAL_PORT` 是可选的；未设置时会自动扫描 CH340 串口。纯 USB 模式支持
-Claude / Codex 状态、额度、系统负载、股票数据、显示模式切换、亮度调节和自定义 GIF
-上传。亮度在纯 USB 模式下只对本次开机有效；依赖 HTTP 的音乐封面、动画恢复默认、
-设备画面原始帧读取和 Web 管理页不可用。
-菜单栏镜像会根据设备每 5 秒返回的串口确认判断在线状态，不需要配置设备 IP；连续 15 秒
-没有确认才会显示离线。
+Bridge-facing endpoints:
 
-前台开发运行可使用 `mac-app/start-aiclock.sh`；脚本会按自身位置定位工程，首次运行时
-自动构建。已安装 LaunchAgent 时，该脚本只会唤醒现有服务。需要常驻运行则使用
-`mac-app/install-launch-agent.sh`，日志位于 `~/Library/Logs/AIClockBridge/`。
-
-烧录后串口会打印调试日志（这版固件不再是"静默"的）：
-
-```
-[wifi] starting WiFiManager autoConnect...
-*wm:AutoConnect
-*wm:No wifi saved, skipping
-*wm:StartAP with SSID:  AI-Clock-Setup
-*wm:AP IP address: 192.168.4.1
-```
-
-首次开机（或 WiFi 配置丢失时）会开一个热点 `AI-Clock-Setup`，手机连上后自动弹出配置页
-（或手动访问 `192.168.4.1`），选择你的 WiFi，并在 "Bridge host (ip:port)" 里填这台 Mac
-的局域网 IP，例如 `192.168.1.23:8765`。保存后设备会记住配置（存在 LittleFS 里），下次
-开机自动连线。
-
-查看串口日志：
-
-```bash
-pio device monitor -b 115200
-```
-
-## 3. 屏幕布局
-
-全屏单应用视图（不显示时钟），一次只显示 Claude 或 Codex 其中一个，规则：
-
-- **只有一方在工作** → 固定显示正在工作的那个
-- **两方都在工作** → 每 2 秒交替
-- **都空闲** → 每 6 秒慢速交替
-- Mac 菜单栏里也可以强制固定显示某一方（`POST /api/display`），固定后忽略上述规则
-
-视觉元素：
-
-- 屏幕中央：对应角色的大幅像素动画（Claude = 跑步的 Dario，Codex = 戴耳机的宠物），
-  仅在该角色 `working` 时播放动画，否则停在静止帧。
-- 屏幕四周一圈方形进度环：环的填充长度 = 用量百分比（Claude 用 5 小时滚动窗口已用
-  比例近似，Codex 用真实的 5h `primary_pct`）；环的颜色/动画参考
-  [vibecoding-signal-light](https://github.com/starlight36/vibecoding-signal-light)
-  的红绿灯设计：
-  - **常亮绿** = 空闲/离线，不需要关注
-  - **绿→黄→红缓慢循环** = 正在工作
-  - **红色闪烁**（最高优先级，覆盖其他状态）= 桥接服务连不上或数据过期（超过
-    2 个轮询周期没更新），需要马上看一眼
-- **整圈边框红色闪烁 = 需要你确认操作**：Claude / Codex 弹出权限/审批选择时（Claude
-  的 `Notification`、Codex 的 `PermissionRequest` hook），设备整圈边框红色闪烁提醒你去
-  确认；AUTO 模式还会自动切到那个待审批的角色（优先级高于音乐自动切换）。你在 CLI 里
-  做出选择后（下一个工具调用/回合事件到达）自动停止闪烁，5 分钟无响应也会自动超时清除。
-  Mac 弹窗镜像同步显示红色边框闪烁。
-
-## 4. 自定义桌宠形象
-
-两个入口，推荐 Mac 菜单栏（petdex 画廊 + 预览），设备网页作为兜底：
-
-1. **Mac 菜单栏 →「更换桌宠动画…」**：从 [petdex.dev](https://petdex.dev) 的公开
-   manifest（`assets.petdex.dev/manifests/petdex-v1.json`，3300+ 开源桌宠）搜索选择。
-   每个桌宠是一张 1536x1872 的 WebP 精灵图（8 列 x 9 行，每帧 192x208，每行一种动画：
-   待机/左右跑/挥手/跳跃/失败/等待/原地跑/思考）。app 在本地裁出所选动画行、缩放到
-   目标插槽尺寸，同时生成预览 GIF 和设备原生 RGB565 帧流。USB 设备已连接时优先走串口
-   上传，否则 POST 到设备的 `/sprite/claude|codex/raw`。
-2. **设备网页** `http://<设备IP>/`：手动上传任意 `.gif`，适合用自己的图。
-
-菜单栏选择器优先上传已经转换好的 RGB565 帧，避开 ESP8266 连续堆内存不足；设备网页上传
-的任意 GIF 仍由板上兼容解码器处理。两条路径都会立刻替换角色动画并持久化到 LittleFS，
-**不需要重新编译或烧录固件**。
-
-### 设备 HTTP API（Mac app 用的就是这套）
-
-| 方法 | 路径 | 说明 |
+| Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/info` | 设备状态 JSON：ip/ssid/bridge/显示模式/当前显示/自定义精灵标记 |
-| POST | `/api/display` | `mode=auto\|claude\|codex\|net\|music` 切换屏幕显示（net=网速曲线页，music=音乐播放页）|
-| POST | `/api/bridge` | `host=ip:port` 设置桥接地址 |
-| POST | `/sprite/claude`、`/sprite/codex` | multipart 上传 GIF 并板上解码替换 |
-| POST | `/sprite/claude/raw`、`/sprite/codex/raw` | multipart 上传 `[1B帧数][RGB565大端帧...]` 并直接替换 |
-| POST | `/sprite/claude/reset`、`/sprite/codex/reset` | 删除自定义动画，恢复内置形象 |
-| GET | `/sprite/claude/raw`、`/sprite/codex/raw` | 当前生效动画的原始帧流 `[1B帧数][RGB565大端帧...]`（镜像窗口用）|
+| GET | `/status` | Minimal timestamp/music heartbeat |
+| GET | `/music`, `/stock`, `/weather` | Feature payloads |
+| GET | `/music/*.raw`, `/stock/names*.raw`, `/weather/*.raw` | RGB565/compressed assets |
 
-`/api/info` 里的 `sprite_rev` 在每次上传/重置动画后自增，镜像端据此决定是否重新拉帧。
+Device administration:
 
-### USB 桌宠上传协议
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/info` | Device identity, transport, mode, hardware, salary, battery, orientation, OTA |
+| POST | `/api/display` | `mode=weather,music,stock,salary,printer`; printer is native on ESP32-S3 and Mac-bridged on ESP8266; legacy Agent, `net`, and `pomodoro` modes migrate to weather |
+| POST | `/api/bridge` | `host=ip:port` |
+| POST | `/api/brightness` | `level=0..100` |
+| POST | `/api/orientation` | `auto=true/false` when IMU is available |
+| POST | `/api/salary` | Configure salary and paid schedule |
 
-串口传输采用逐块确认，避免 ESP8266 写 Flash 或解码时 UART 接收缓冲区溢出：
-
-```text
-Mac -> ESP  #PET_BEGIN {"slot":"claude","format":"rgb565","size":12345,"crc32":2309737967}
-ESP -> Mac  #PET_READY
-Mac -> ESP  #PET_CHUNK 0 <base64>
-ESP -> Mac  #PET_ACK 0
-Mac -> ESP  #PET_END
-ESP -> Mac  #PET_PROCESSING
-ESP -> Mac  #PET_DONE
-```
-
-每块原始数据最多 384 字节；设备在应用前同时校验格式、总长度和 IEEE CRC32，任一步失败会返回
-`#PET_ERR <reason>`。USB 模式启动时只尝试挂载 LittleFS，不会自动破坏已有数据；仅当用户
-明确发起第一次宠物上传且文件系统无法挂载时，才格式化并初始化存储区。上传成功后仍复用
-HTTP 原生路径相同的 `/c.bin`、`/x.bin` 校验、原子替换和持久化链路。`format=gif` 保留给
-旧客户端兼容。
-
-## 5. 网速曲线页（Mac + 设备同步显示）
-
-Mac app 每 250ms（4Hz）读一次内核的网卡字节计数（getifaddrs/AF_LINK，只统计物理
-`en*` 网卡，避免 VPN/utun 重复计数），保留 3 分钟历史。
-
-显示模式切到「网速曲线」后，设备端**渲染与网络完全解耦**：`GET /net` 返回带全局
-序号（seq）的最近 12 个 250ms 样本，设备每 2 秒拉一次补进队列（按 seq 去重），
-渲染以固定 250ms/列的节奏消费队列，HTTP 延迟不会体现在画面上。
-
-界面是任务管理器风格的**滚动填充面积图**（224 列 x 128px，56 秒窗口，最新在右）：
-下载 = 暗绿填充 + 亮绿顶边，上传 = 2px 黄线，背景 25/50/75% 暗格线；整图共享一个
-1/2/5 阶梯的"整数量程"（10K/20K/50K/…），高度全图可比，量程标签显示在图外右上。
-每帧从 224 个样本的数据环逐行合成像素、每行一次 `pushImage` 整行写屏——没有
-"先清屏再画"的过程，所以完全无闪烁。顶部大号 DL/UL 读数取 1 秒平均，只在数值
-变化时局部重绘。Mac 弹窗镜像用同一套数据模型和布局同步渲染。
-
-Mac 端常驻进程可由 `mac-app/install-launch-agent.sh` 安装的用户级 LaunchAgent 管理。
-LaunchAgent 直接运行 `~/Library/Application Support/AIClockBridge/AIClockBridge`，并在
-异常退出后自动恢复。**改代码后需要重新运行安装脚本**，确保 release 二进制和 SwiftPM
-资源包一起更新；不要同时手动运行另一份实例，否则会争用 8765 端口。
-
-## 6. 音乐播放页（Mac + 设备同步显示，自动切换）
-
-**AUTO 模式下自动切换**：Mac 一有音频在播放（放歌、看视频都算），设备自动切到音乐
-页；停止后自动切回桌宠/额度页。机制：`/status` 带 `music_playing` 字段（状态轮询
-5 秒一次 → 开始播放约 5 秒内切入），音乐页显示时靠 `/music` 的 2 秒轮询快速检测停止
-（约 2 秒切回）。仅 AUTO 生效；手动固定某模式（含固定「音乐播放」）时不受影响。
-`/api/info` 里 `mode` 是配置的模式、`effective` 是当前实际渲染的模式，Mac 镜像按
-`effective` 跟随。
-
-
-显示模式切到「音乐播放」（弹窗底部分段控件 / 右键菜单 / `POST /api/display mode=music`）
-后，Mac app 通过系统 Now Playing 信息读取当前播放的歌曲、歌手、播放进度和专辑封面，
-桥接服务提供：
-
-- `GET /music`：歌曲、歌手、专辑、播放状态、进度、封面版本号
-- `GET /music/cover.raw`：128x128 RGB565 封面原始像素，设备逐行读取后直接绘制
-
-设备每 2 秒刷新一次音乐信息；封面只有在版本号变化时重新拉取。Mac 弹窗镜像同样显示
-音乐页，方便不用看设备也能确认布局。
-
-## 7. 番茄时钟（设备端独立计时）
-
-番茄时钟的状态机完全运行在 ESP8266 上，Mac/Windows 只负责遥控和镜像。因此开始计时后
-可以拔掉 USB 数据线，甚至退出桥接程序，设备仍会继续倒计时；专注结束自动进入休息，
-休息结束自动开始下一轮专注。默认时长为 25/5 分钟，设置保存在 LittleFS 的
-`/pomodoro.txt`，重启后保留时长，但会从一个暂停的新专注阶段开始。
-
-控制入口：
-
-- 菜单栏/托盘的「番茄时钟」子菜单：开始/暂停、重置、跳过、设置时长。
-- 设备管理网页：同样提供完整控制，电脑桥接程序未运行时可用手机操作。
-- `POST /api/pomodoro`：`action=toggle|start|pause|reset|skip|configure`；配置时额外传
-  `focus_min=1..120` 和 `break_min=1..60`。
-- `POST /api/display mode=pomodoro`：只切换页面，不改变当前计时状态。
-
-`GET /api/info` 的 `pomodoro` 对象返回 `phase`、`running`、`remaining_s`、
-`duration_s`、`completed`、`focus_min` 和 `break_min`。USB 模式每秒用 `#INFO` /
-`#DEVICE` 同步同一份字段，避免桌面端维护第二套倒计时造成漂移。
-
-## 8. Hooks 实时状态（秒级，参考 clawd-on-desk 的做法）
-
-除了日志 mtime 轮询（保留为兜底），bridge 还接收两个 CLI 官方 hooks 的事件推送，
-状态切换从"最多迟滞 20 秒"变成"毫秒级"：
-
-- bridge 新增 `POST /event`，body：`{"agent":"claude|codex","event":"PreToolUse"}`
-- `~/.claude/settings.json` 已注册 8 个事件的 curl hook（UserPromptSubmit/PreToolUse/
-  PostToolUse/Stop/SessionEnd/Notification/PreCompact/SubagentStop，每条 `-m 1` 超时，
-  不会拖慢 Claude Code；与已有 hooks 共存，靠命令里的 `8765/event` 标记幂等）
-- 映射：UserPromptSubmit/Pre/PostToolUse 等 → working（TTL 10 分钟，覆盖长工具调用）；
-  Stop/Notification 等 → idle（TTL 60 秒，只用来立刻压掉 mtime 的"工作尾巴"）
-- Codex 侧已写入 `~/.codex/hooks.json` + `config.toml [features] hooks = true`，
-  但 Codex 要求在 TUI 里跑一次 `/hooks` 信任新命令后才生效；未信任前走 mtime 兜底。
-- 局限：事件是全局的不分会话——A 会话 Stop 会把还在干活的 B 会话压成 idle 最多 60 秒
-  （B 的下一个工具调用事件会立刻翻回 working）。
-
-### 桌宠上传架构
-
-菜单栏 petdex 选择器在 Mac 上完成裁剪、缩放和 RGB565 转换，再通过 HTTP 或 USB 把
-`[1字节帧数][各帧像素...]` 流式写入临时文件。固件校验帧数与文件长度后原子替换
-`/c.bin` / `/x.bin`。这条日常路径不需要创建 GIF 解码器，因此不受 ESP8266 堆碎片影响。
-
-设备网页的任意 GIF 上传作为兼容入口，仍使用下面的板上解码链路：
-
-架构：GIF 通过 `ESP8266WebServer` 的 multipart 文件上传（`HTTPUpload` 回调）边收边流式
-写进 LittleFS 的临时文件（`/c.gif` / `/x.gif`），然后固件用
-[AnimatedGIF](https://github.com/bitbank2/AnimatedGIF) 库**逐行解码**成设备要的 RGB565
-帧，写入 `/c.bin` / `/x.bin`（格式 `[1字节帧数][各帧像素...]`），最后删掉临时 GIF。
-
-ESP8266 总共只有 ~80KB RAM，一帧 120x120 的 RGB565 就 ~28KB，AnimatedGIF 自己也要
-~24KB，两个大缓冲塞不下，所以整条链路都是**逐行流式、不常驻整帧**：
-
-- 上传：multipart 分块写文件，不把整个 body 攒进一个 `String`（那样体积必炸内存）。
-- 解码：AnimatedGIF 逐行回调，只用两条「一行」缓冲把源行最近邻缩放到目标尺寸，直接
-  逐行写进 `.bin`；不覆盖到的区域用**上一帧**补齐（读回刚写进 `.bin` 的上一帧），
-  这样被优化器裁成小矩形的 GIF（disposal method 1）也能拼对。解码期间才在堆上
-  临时 `new` 出 AnimatedGIF，用完就 `delete`。
-- 显示：每次也只把「当前要画的一帧」从 LittleFS 逐行读出来 `pushImage`，不整帧驻留内存。
-- 没有自定义素材时，退回固件里编译好的默认动画（`firmware/include/img/*.h`）。
-
-**注意事项 / 局限**：
-
-- 网页 GIF 太大（尺寸很大、颜色/帧很多）可能因内存不足解码失败；菜单栏 petdex 原生上传
-  不受这个限制。
-- 目标插槽尺寸固定：Claude 111x120、Codex 120x120，板上会最近邻缩放匹配（质量不如
-  PIL 的 LANCZOS，像素风 GIF 通常没问题）。
-- 最多取 GIF 的**前 8 帧**（没有整体帧数信息，就不做均匀抽帧了）。
-- disposal method 2（"恢复到背景色"）没有单独区分，未覆盖像素保留上一帧而不是清空；
-  对循环角色动画来说无所谓。
-- WiFi 上传大文件偶尔会瞬时掉线（broken pipe 之类），失败重新上传一次即可。
-
-## 已知限制 / TODO
-
-- 参考项目里的“黄色闪烁-需要处理”“红色闪烁-需要批准”这类更细的状态，目前本地日志
-  拿不到可靠信号，没有实现，只做了 working/idle-离线/桥接离线 三档。
-- Mac 端 app 无鉴权，HTTP `/status` 监听 `0.0.0.0:8765`，仅建议在可信局域网使用；
-  设备的 HTTP API 同样无鉴权。
-- Claude 用量接口有较严格的服务端限流（429），app 已做 60s 节流 + 429 后 5 分钟退避 +
-  沿用旧值，偶尔菜单里额度会显示为几分钟前的数据。
-- LaunchAgent 在用户登录后启动，不会在尚未登录的系统启动阶段运行；菜单栏程序本身也
-  依赖 Aqua 图形会话。
-- 改**默认**编译进固件的动画（`firmware/include/img/claude_sprite.h` /
-  `codex_sprite.h`）仍可用 `tools/convert_sprites.py` 生成新的 `.h` 后 `pio run -t upload`；
-  日常换形象用菜单栏 petdex 选择器或设备网页即可，无需烧录。
+Agent app-server clients, session watchers, pet uploads, dual-provider mirrors, quota renderers, and removed-agent protocol libraries are intentionally absent.

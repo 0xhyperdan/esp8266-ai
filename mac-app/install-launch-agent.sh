@@ -39,7 +39,9 @@ launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
 for pid in ${(f)"$(pgrep -x AIClockBridge 2>/dev/null || true)"}; do
   command_path=$(ps -p "$pid" -o command= 2>/dev/null || true)
   if [[ "$command_path" == "$SCRIPT_DIR/.build/"* || \
-        "$command_path" == "$INSTALLED_BINARY"* ]]; then
+        "$command_path" == *"/.build/"* || \
+        "$command_path" == "$INSTALLED_BINARY"* || \
+        "$command_path" == *"/AIClockBridge.app/Contents/MacOS/AIClockBridge"* ]]; then
     kill "$pid" >/dev/null 2>&1 || true
   fi
 done
@@ -64,6 +66,7 @@ rm -f "$TEMP_PLIST"
 /usr/libexec/PlistBuddy -c \
   "Add :EnvironmentVariables:PATH string /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
   "$TEMP_PLIST"
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:AICLOCK_HEADLESS string 1" "$TEMP_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StandardOutPath string $STDOUT_PATH" "$TEMP_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $STDERR_PATH" "$TEMP_PLIST"
 

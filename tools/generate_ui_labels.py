@@ -10,14 +10,20 @@ OUTPUT_PATH = ROOT / "firmware/include/img/ui_labels_zh.h"
 PREVIEW_PATH = Path("/private/tmp/aiclock-ui-labels.png")
 
 LABELS = [
-    ("WEEK_LABEL", "week_label_bits", "\u5468", 14, 14, 16),
     ("STOCK_LABEL", "stock_label_bits", "\u80a1\u7968", 11, 22, 12),
-    ("POMODORO_LABEL", "pomodoro_label_bits", "\u756a\u8304\u949f", 14, 42, 16),
-    ("FOCUS_LABEL", "focus_label_bits", "\u4e13\u6ce8", 14, 28, 16),
-    ("BREAK_LABEL", "break_label_bits", "\u4f11\u606f", 14, 28, 16),
-    ("RUNNING_LABEL", "running_label_bits", "\u8fdb\u884c\u4e2d", 14, 42, 16),
-    ("PAUSED_LABEL", "paused_label_bits", "\u5df2\u6682\u505c", 14, 42, 16),
-    ("COMPLETED_LABEL", "completed_label_bits", "\u5b8c\u6210", 12, 24, 14),
+    # salary clock page (poster-style: 每秒进账 / gold coin / progress bar)
+    ("SALARY_TITLE", "salary_title_bits", "\u6bcf\u79d2\u8fdb\u8d26", 24, 96, 26),
+    ("SALARY_RATE_PREFIX", "salary_rate_prefix_bits", "\u6bcf\u79d2", 16, 32, 18),
+    ("SALARY_YUAN", "salary_yuan_bits", "\u5143", 16, 16, 18),
+    ("SALARY_EARNED_PREFIX", "salary_earned_prefix_bits", "\u5df2\u6323", 16, 32, 18),
+    ("SALARY_FOOTER_PREFIX", "salary_footer_prefix_bits", "\u6708\u85aa", 16, 32, 18),
+    ("SALARY_STATUS_EARNING", "salary_status_earning_bits", "\u8ba1\u85aa\u4e2d", 14, 42, 16),
+    ("SALARY_STATUS_LUNCH", "salary_status_lunch_bits", "\u5348\u4f11\u6682\u505c", 14, 56, 16),
+    ("SALARY_STATUS_WEEKEND", "salary_status_weekend_bits", "\u5468\u672b\u6682\u505c", 14, 56, 16),
+    ("SALARY_STATUS_BEFORE", "salary_status_before_bits", "\u4e0a\u73ed\u524d", 14, 42, 16),
+    ("SALARY_STATUS_AFTER", "salary_status_after_bits", "\u5df2\u4e0b\u73ed", 14, 42, 16),
+    ("SALARY_STATUS_CONFIG", "salary_status_config_bits", "\u8bf7\u5148\u914d\u7f6e\u85aa\u8d44", 14, 84, 16),
+    ("SALARY_STATUS_CLOCK", "salary_status_clock_bits", "\u7b49\u5f85\u65f6\u949f", 14, 56, 16),
 ]
 
 

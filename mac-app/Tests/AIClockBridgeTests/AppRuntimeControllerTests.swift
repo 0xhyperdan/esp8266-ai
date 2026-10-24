@@ -39,13 +39,13 @@ final class AppRuntimeControllerTests: XCTestCase {
     func testSleepStopsEveryActivityAndCancelsPairing() {
         let preferences = FeaturePreferences(defaults: defaults)
         let core = FakeActivity()
-        let net = FakeActivity()
+        let stock = FakeActivity()
         let music = FakeActivity()
         var cancellationCount = 0
         let runtime = makeRuntime(
             preferences: preferences,
             alwaysOn: [core],
-            features: ["net": net, "music": music],
+            features: ["stock": stock, "music": music],
             cancelPairing: { cancellationCount += 1 }
         )
 
@@ -54,45 +54,62 @@ final class AppRuntimeControllerTests: XCTestCase {
 
         XCTAssertTrue(runtime.isSuspended)
         XCTAssertFalse(core.isRunning)
-        XCTAssertFalse(net.isRunning)
+        XCTAssertFalse(stock.isRunning)
         XCTAssertFalse(music.isRunning)
         XCTAssertEqual(cancellationCount, 1)
     }
 
     func testFeatureChangesStartAndStopOnlyTheirMonitor() {
         let preferences = FeaturePreferences(defaults: defaults)
-        preferences.setEnabled(false, for: "net")
+        preferences.setEnabled(false, for: "music")
         let core = FakeActivity()
-        let net = FakeActivity()
+        let stock = FakeActivity()
         let music = FakeActivity()
         let runtime = makeRuntime(
             preferences: preferences,
             alwaysOn: [core],
-            features: ["net": net, "music": music]
+            features: ["stock": stock, "music": music]
         )
 
         runtime.start()
-        XCTAssertFalse(net.isRunning)
-        XCTAssertTrue(music.isRunning)
+        XCTAssertFalse(music.isRunning)
+        XCTAssertTrue(stock.isRunning)
 
-        preferences.setEnabled(true, for: "net")
-        preferences.setEnabled(false, for: "music")
+        preferences.setEnabled(true, for: "music")
+        preferences.setEnabled(false, for: "stock")
         runtime.applyFeatureConfiguration()
 
-        XCTAssertTrue(net.isRunning)
-        XCTAssertFalse(music.isRunning)
+        XCTAssertTrue(music.isRunning)
+        XCTAssertFalse(stock.isRunning)
+        runtime.stop()
+    }
+
+    func testWeatherActivityAlwaysRuns() {
+        let preferences = FeaturePreferences(defaults: defaults)
+        preferences.setEnabled(false, for: "weather")
+        let weather = FakeActivity()
+        let runtime = makeRuntime(
+            preferences: preferences,
+            alwaysOn: [],
+            features: ["weather": weather]
+        )
+
+        runtime.start()
+
+        XCTAssertTrue(preferences.isEnabled("weather"))
+        XCTAssertTrue(weather.isRunning)
         runtime.stop()
     }
 
     func testWakeResumesOnlyCurrentlyEnabledFeatures() {
         let preferences = FeaturePreferences(defaults: defaults)
         let core = FakeActivity()
-        let net = FakeActivity()
+        let music = FakeActivity()
         let stock = FakeActivity()
         let runtime = makeRuntime(
             preferences: preferences,
             alwaysOn: [core],
-            features: ["net": net, "stock": stock]
+            features: ["music": music, "stock": stock]
         )
 
         runtime.start()
@@ -102,7 +119,7 @@ final class AppRuntimeControllerTests: XCTestCase {
 
         XCTAssertFalse(runtime.isSuspended)
         XCTAssertTrue(core.isRunning)
-        XCTAssertTrue(net.isRunning)
+        XCTAssertTrue(music.isRunning)
         XCTAssertFalse(stock.isRunning)
         XCTAssertEqual(core.startCount, 2)
         XCTAssertEqual(stock.startCount, 1)

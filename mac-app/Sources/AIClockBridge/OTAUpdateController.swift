@@ -31,7 +31,7 @@ final class OTAUpdateController: NSObject {
                                                   "This device firmware does not support Wi-Fi updates."))
                     return
                 }
-                self.chooseFirmware(host: host)
+                self.chooseFirmware(host: host, info: info)
             case let .failure(error):
                 Self.alert(title: Self.text("ota.connect_failed.title", "Could not reach device"),
                            message: error.localizedDescription)
@@ -39,9 +39,11 @@ final class OTAUpdateController: NSObject {
         }
     }
 
-    private func chooseFirmware(host: String) {
+    private func chooseFirmware(host: String, info: DeviceInfo) {
+        let targetName = DeviceClient.firmwareTargetName(for: info.board)
         let panel = NSOpenPanel()
-        panel.title = Self.text("ota.file.title", "Select ESP8266 firmware")
+        let titleFormat = Self.text("ota.file.title", "Select %@ firmware")
+        panel.title = String(format: titleFormat, targetName)
         panel.prompt = Self.text("ota.file.choose", "Choose Firmware")
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
@@ -52,14 +54,17 @@ final class OTAUpdateController: NSObject {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             let firmware = try Data(contentsOf: url, options: .mappedIfSafe)
-            guard DeviceClient.isValidFirmwareImage(firmware) else {
+            guard DeviceClient.isValidFirmwareImage(firmware, boardID: info.board) else {
+                let messageFormat = Self.text(
+                    "ota.invalid.message",
+                    "Select a firmware.bin built for this %@ device."
+                )
                 Self.alert(title: Self.text("ota.invalid.title", "Invalid firmware"),
-                           message: Self.text("ota.invalid.message",
-                                              "Select a firmware.bin built for this ESP8266 device."))
+                           message: String(format: messageFormat, targetName))
                 return
             }
             guard let credentials = credentials(host: host) else { return }
-            beginUpload(firmware, host: host, credentials: credentials)
+            beginUpload(firmware, host: host, boardID: info.board, credentials: credentials)
         } catch {
             Self.alert(title: Self.text("ota.read_failed.title", "Could not read firmware"),
                        message: error.localizedDescription)
@@ -111,10 +116,12 @@ final class OTAUpdateController: NSObject {
         return value
     }
 
-    private func beginUpload(_ firmware: Data, host: String, credentials: OTACredentials) {
+    private func beginUpload(_ firmware: Data, host: String, boardID: String,
+                             credentials: OTACredentials) {
         updating = true
         showProgressWindow()
-        DeviceClient.uploadFirmware(firmware, credentials: credentials, progress: { [weak self] state in
+        DeviceClient.uploadFirmware(firmware, boardID: boardID,
+                                    credentials: credentials, progress: { [weak self] state in
             self?.apply(state)
         }, completion: { [weak self] result in
             guard let self = self else { return }

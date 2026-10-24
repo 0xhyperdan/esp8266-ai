@@ -2,93 +2,70 @@
   <img src="docs/images/logo.svg" width="72" alt="logo">
 </p>
 
-<h1 align="center">AI Mac Mini Display</h1>
+<h1 align="center">AI Mac Mini Screen</h1>
 
-<p align="center">A tiny AI status computer for your desk — ESP8266 · Open Source Hardware · Desktop Companion</p>
+<p align="center">A 240×240 weather and desktop dashboard — ESP8266 / ESP32-S3 · open hardware</p>
 
 <p align="center">
-  <a href="README.md">中文</a> ·
-  English
+  <a href="README.md">中文</a> · English
 </p>
 
 <p align="center">
   <a href="https://mac.qust.me">Website</a> ·
-  <a href="https://mac.qust.me/#flash">Web Flasher</a> ·
-  <a href="https://github.com/pengchujin/esp8266-ai/releases/latest">Download</a>
+  <a href="https://mac.qust.me/#flash">Web flasher</a> ·
+  <a href="https://github.com/pengchujin/esp8266-ai/releases/latest">Downloads</a>
 </p>
 
 <p align="center">
-  <img src="docs/images/hero.jpg" width="640" alt="AI Mac Mini Display">
+  <img src="docs/images/hero.jpg" width="640" alt="AI Mac mini screen">
 </p>
 
-A retro mini-TV with a 240×240 screen that sits on your desk showing **what Claude Code / Codex CLI are doing right now and how much quota you have left**. No API key needed: everything comes from the CLI credentials and session logs already on your machine, served to the device over your LAN by the companion Mac / Windows bridge app.
+This retro mini-TV defaults to a weather clock and can switch between music, stocks, and salary pages. The Mac bridge supports Wi-Fi and USB; Windows currently supports Wi-Fi only and does not provide weather data or location. The device retains provisioning, web administration, brightness, OTA, battery status, and IMU rotation; the Mac bridge supports multiple devices.
 
 ## Features
 
 | | |
 |---|---|
-| <img src="docs/images/feature1.jpg" width="360" alt="AI status"> | **AI status & quota**<br>Pet is walking = the AI is working. A square progress ring plus large digits show your real 5-hour / weekly quota usage; when a window is used up the pet becomes a reset countdown, and the border flashes red when the AI is waiting for your approval. |
-| <img src="docs/images/feature2.jpg" width="360" alt="Network monitor"> | **Live network monitor**<br>Task-manager-style upload/download curves, 56-second rolling window, auto-scaling axis. |
-| <img src="docs/images/music.jpg" width="360" alt="Now playing"> | **Now playing**<br>Album art, title, artist and progress bar in real time; switches in automatically when music starts, back when it stops. |
-| <img src="docs/images/feature3.jpg" width="360" alt="Swappable pets"> | **Swappable pets**<br>Built-in [petdex.dev](https://petdex.dev) gallery with 3300+ open-source pets, encoded to the device-native format on the desktop for reliable uploads; arbitrary GIF uploads remain available from the device web page. |
+| <img src="docs/images/weather-clock.png" width="240" alt="Weather clock"> | **FuBoTV weather clock**<br>Reuses the factory weather, humidity, and astronaut artwork to show weather, air quality, date/time, temperature, and humidity. macOS supports automatic location or a manual city; the device ticks seconds locally. |
+| <img src="docs/images/music.jpg" width="360" alt="Music playback"> | **Now-playing display**<br>Album art, title, artist, and progress stay in sync. Music temporarily replaces the default weather page and returns when playback stops. |
 
-The firmware also includes a **device-owned Pomodoro timer**. It defaults to a
-25-minute focus period and a 5-minute break, supports start/pause, reset, skip,
-and configurable durations, and keeps running after the USB data cable or
-desktop bridge is disconnected.
+Also included:
+
+- **Stocks**: the Mac fetches Tencent quotes and the device renders up to five symbols with prices and percentage changes; localized names use a compressed binary transport.
+- **Salary clock**: converts monthly salary using 21.75 statutory working days, with workday and lunch schedule settings; lunch and weekends pause automatically.
+- **Device administration**: remembered multi-device addresses and automatic pairing, brightness, bridge address, web OTA, ESP32-S3 battery status, and IMU auto-rotation.
 
 ## Getting started
 
-What you need: an "SD2 mini-TV" dev board ([open-source hardware](https://oshwhub.com/q21182889/sd2), or [buy one assembled](https://mobile.yangkeduo.com/goods.html?ps=OuBjGMWE82)) and a USB **data** cable.
+You need an SD2 mini-TV board ([open hardware](https://oshwhub.com/q21182889/sd2), also available [pre-assembled](https://mobile.yangkeduo.com/goods.html?ps=OuPjGMWE82)) and a USB **data** cable.
 
-### Step 1 · Flash the firmware (~30 s)
+1. Open the [web flasher](https://mac.qust.me/#flash) in Chrome or Edge and flash the device.
+2. On first boot, join the `AI-Clock-Setup` hotspot and configure home Wi-Fi at `192.168.4.1`.
+3. Install the macOS or Windows bridge from [Releases](https://github.com/pengchujin/esp8266-ai/releases/latest).
 
-Open **[mac.qust.me/#flash](https://mac.qust.me/#flash)** in Chrome / Edge, plug the device in over USB, click "Connect & Flash", pick the serial port and wait. No tools to install.
+On macOS, left-click the menu-bar icon for the live mirror and brightness slider. Right-click for device selection, page switching, feature toggles, weather location, stocks, salary settings, bridge address, and OTA updates. The Windows tray provides device discovery/control, page switching, stocks, and bridge settings.
 
-> Serial port not showing up? On Windows install the [CH340 driver](https://www.wch.cn/downloads/CH341SER_EXE.html); macOS has it built in. Try another USB cable (many are charge-only). More troubleshooting in the [website FAQ](https://mac.qust.me/#flash-faq).
->
-> Command-line folks can also flash `esp8266-ai-firmware-*.bin` from [Releases](https://github.com/pengchujin/esp8266-ai/releases/latest) to address `0x0` with esptool.
+Devices on the same LAN are discovered and paired automatically. The Mac bridge uses USB serial when connected, which works around AP client isolation or avoids Wi-Fi setup entirely. The bridge keeps a minimal `/status` heartbeat containing only a timestamp and music-playing flag; legacy `auto`, `claude`, `codex`, `home`, `usage`, `info`, `net`, and `pomodoro` display modes safely migrate to the default weather page.
 
-### Step 2 · Connect WiFi
+When the Mac sleeps, the bridge pauses media, stock, and weather polling and resumes after wake. The ESP32-S3 build supports battery indication and IMU auto-rotation, and the device web page provides password-protected OTA updates.
 
-On first boot the device opens a hotspot named **`AI-Clock-Setup`**: join it from your phone and the setup page pops up (or browse to `192.168.4.1`), pick your WiFi and enter the password. Done.
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for hardware, API, and build details or [windows-app/README.md](windows-app/README.md) for Windows notes.
 
-### Step 3 · Install the bridge app
+## Bambu printer monitor (ESP8266 / ESP32-S3)
 
-Download from [Releases](https://github.com/pengchujin/esp8266-ai/releases/latest) and open:
+Waveshare ESP32-S3-Touch-LCD-1.54 supports one LAN MQTT printer independently
+of the Mac. This local-source feature requires matching builds from this checkout;
+the changes have not been published to upstream releases or its web flasher.
+It displays progress, remaining time, layers, nozzle and bed
+temperatures, including X2D dual-nozzle telemetry. Use **打印机设置…** in the Mac
+menu-bar context menu and authenticate with the device's OTA credentials.
+Never put printer access codes in chat or Git.
 
-- **macOS**: `AIClockBridge-*-macOS.dmg`, drag into Applications (ad-hoc signed; on first launch allow it in "System Settings → Privacy & Security" and grant local-network access)
-- **Windows**: `AIClockBridge-*-Windows-x64.exe`, just double-click
-
-The bridge lives in your menu bar / tray and **auto-discovers and pairs** with the device on the same LAN — at this point the screen comes alive.
-
-<p align="center">
-  <img src="docs/images/working.jpg" width="640" alt="In action">
-</p>
-
-Daily use is all on the tray icon: **left-click** opens a live mirror of the device screen (with a brightness slider at the bottom), **right-click** opens the full menu (quota details, screen switching, Pomodoro controls, pet swapping, music/network pages, and more).
-
-## FAQ
-
-- **Screen border flashing red**: the device can't reach the bridge — make sure the app is running and on the same WiFi.
-- **Quota shows `-` forever**: no Claude Code / Codex CLI login on this machine, so the bridge has no credentials to read.
-- **Want a different pet**: right-click the tray icon → "Change pet animation…", pick one and upload.
-
-## Development
-
-```
-firmware/     ESP8266 firmware (PlatformIO + Arduino, native sprite uploads + GIF fallback)
-mac-app/      macOS menu bar bridge (Swift/SPM, zero third-party dependencies)
-windows-app/  Windows tray bridge (C# / .NET 8 WinForms)
-tools/        GIF → RGB565 built-in sprite conversion script
-docs/         Developer docs (pinout, HTTP API, architecture details)
-```
-
-```bash
-cd firmware && pio run -t upload   # firmware: build + flash over USB
-cd mac-app && swift run            # Mac bridge: run locally
-```
-
-Hardware pinout, display-driver gotchas, the device HTTP API and the on-board GIF decoding architecture are documented in **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** (Chinese).
-
-Hardware, firmware and software are all open source — modify it, build it, even sell it.
+This is LAN read-only monitoring, not cloud login, camera streaming, or printer
+control. ESP8266 receives compact telemetry through the Mac bridge over Wi-Fi
+or USB; the Mac must remain awake with the app running. Its printer credentials
+are stored only in macOS Keychain. Use the native Mac settings dialog to enable
+monitoring and explicitly opt into trusted-LAN self-signed TLS if needed.
+Windows does not implement this printer bridge. Pomodoro has been removed from all
+firmware and desktop code. See [printer setup and security](docs/PRINTER.md).
+Real-printer connectivity and physical-screen behavior remain to be verified.

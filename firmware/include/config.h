@@ -5,8 +5,26 @@
 #define AICLOCK_WIRED_ONLY 0
 #endif
 
-// ---- Firmware version (shown on the first-time WiFi setup screen & /api/info) ----
-#define FW_VERSION "0.6.7"
+// ---- Firmware identity (shown on the first-time WiFi setup screen & /api/info) ----
+#if defined(AICLOCK_BOARD_ESP32_S3_TOUCH_LCD_1_54)
+#define FW_VERSION "1.1.1-s3"
+#define AICLOCK_BOARD_ID "waveshare-esp32-s3-touch-lcd-1.54"
+#else
+#define FW_VERSION "1.1.1"
+#define AICLOCK_BOARD_ID "esp8266-fubotv-sd2"
+#endif
+
+#ifndef AICLOCK_BACKLIGHT_ACTIVE_HIGH
+#define AICLOCK_BACKLIGHT_ACTIVE_HIGH 0
+#endif
+
+#ifndef AICLOCK_POWER_HOLD_PIN
+#define AICLOCK_POWER_HOLD_PIN -1
+#endif
+
+#ifndef AICLOCK_POWER_HOLD_ACTIVE_HIGH
+#define AICLOCK_POWER_HOLD_ACTIVE_HIGH 1
+#endif
 
 // ---- Web OTA ----
 // Copy ota_secrets.example.h to ota_secrets.h and set unique credentials.
@@ -31,15 +49,16 @@
 // ---- WiFiManager ----
 #define WIFI_PORTAL_AP_NAME "AI-Clock-Setup"
 #define WIFI_CONFIG_FILE "/bridge_host.txt"
-#define POMODORO_CONFIG_FILE "/pomodoro.txt"
+#define SALARY_CONFIG_FILE "/salary.txt"
+#define ORIENTATION_CONFIG_FILE "/orientation.txt"
 
-// ---- Pomodoro timer ----
-#define POMODORO_FOCUS_DEFAULT_MIN 25
-#define POMODORO_BREAK_DEFAULT_MIN 5
-#define POMODORO_FOCUS_MIN 1
-#define POMODORO_FOCUS_MAX 120
-#define POMODORO_BREAK_MIN 1
-#define POMODORO_BREAK_MAX 60
+// ---- Salary clock ----
+// China's statutory average monthly working days used for wage conversion.
+#define SALARY_MONTHLY_WORKDAYS 21.75f
+#define SALARY_DEFAULT_START_MIN 540
+#define SALARY_DEFAULT_END_MIN 1080
+#define SALARY_DEFAULT_LUNCH_START_MIN 720
+#define SALARY_DEFAULT_LUNCH_END_MIN 780
 
 // ---- Backlight ----
 #define BRIGHTNESS_FILE "/brightness.txt"

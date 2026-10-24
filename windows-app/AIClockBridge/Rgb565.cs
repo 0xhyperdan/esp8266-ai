@@ -4,8 +4,7 @@ using System.Drawing.Imaging;
 namespace AIClockBridge;
 
 // Big-endian RGB565 conversions, the wire format the ESP8266 draws directly
-// (see tools/convert_sprites.py). Shared by the cover/text-strip encoders and
-// the mirror's sprite/cover decoders.
+// Shared by the music cover and text-strip encoders.
 static class Rgb565
 {
     /// 32bppArgb bitmap -> big-endian RGB565 bytes, row-major.

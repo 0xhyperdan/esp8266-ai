@@ -48,6 +48,7 @@ final class StockMonitor {
     private var rows: [Row] = []
     private var timer: Timer?
     private var activeTask: URLSessionDataTask?
+    private var requestGeneration = 0
     private(set) var isRunning = false
 
     // The device's font is ASCII-only, so CJK company names go down as Mac-
@@ -76,6 +77,21 @@ final class StockMonitor {
         timer = nil
         activeTask?.cancel()
         activeTask = nil
+        requestGeneration += 1
+    }
+
+    func updateSymbols(_ symbols: [String]) {
+        Self.symbols = symbols
+        requestGeneration += 1
+        activeTask?.cancel()
+        activeTask = nil
+        let codes = Self.symbols.map(Self.displayCode)
+        lock.lock()
+        rows = codes.compactMap { code in rows.first { $0.code == code } }
+        let retained = rows
+        lock.unlock()
+        renderNamesIfNeeded(retained)
+        fetch()
     }
 
     var snapshot: [Row] {
@@ -85,10 +101,10 @@ final class StockMonitor {
     }
 
     func jsonData() -> Data {
-        let stocks = snapshot.map { r -> [String: Any] in
+        lock.lock()
+        let stocks = rows.map { r -> [String: Any] in
             ["code": r.code, "name": r.name, "price": r.price, "pct": r.pct, "up": r.up]
         }
-        lock.lock()
         let rev = namesRev
         lock.unlock()
         let dict: [String: Any] = ["stocks": stocks, "names_rev": rev]
@@ -109,15 +125,24 @@ final class StockMonitor {
         return namesV2Data
     }
 
+    /// Atomically captures the revision and pixels used by the wired transfer.
+    /// Keeping them under one lock prevents a new quote refresh from pairing an
+    /// old revision with newly rendered name strips.
+    func namesV2Snapshot() -> (revision: Int, data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (namesRev, namesV2Data)
+    }
+
     private func renderNamesIfNeeded(_ parsed: [Row]) {
-        let key = parsed.prefix(4).map { $0.name }.joined(separator: "\n")
+        let key = parsed.prefix(5).map { $0.name }.joined(separator: "\n")
         lock.lock()
         let dirty = key != lastNamesKey
         lock.unlock()
         guard dirty else { return }
-        var data = Data([UInt8(min(parsed.count, 4))])
-        var v2Data = Data([UInt8(min(parsed.count, 4))])
-        for row in parsed.prefix(4) {
+        var data = Data([UInt8(min(parsed.count, 5))])
+        var v2Data = Data([UInt8(min(parsed.count, 5))])
+        for row in parsed.prefix(5) {
             let emptyStrip = Data(count: Self.nameW * Self.nameH * 2)
             data.append(Self.renderNameStrip(row.name, alignment: .right, fontSize: 12) ?? emptyStrip)
             v2Data.append(Self.renderNameStrip(row.name, alignment: .left, fontSize: 13) ?? emptyStrip)
@@ -165,9 +190,12 @@ final class StockMonitor {
 
     private func fetch() {
         guard isRunning else { return }
+        requestGeneration += 1
+        let generation = requestGeneration
         let symbols = Self.symbols
         guard let url = Self.quoteURL(for: symbols) else {
             lock.lock(); rows = []; lock.unlock()
+            renderNamesIfNeeded([])
             return
         }
         var req = URLRequest(url: url)
@@ -181,7 +209,8 @@ final class StockMonitor {
                 ?? String(data: data, encoding: .isoLatin1) ?? ""
             let parsed = Self.parse(text: text, order: symbols)
             DispatchQueue.main.async {
-                guard self.isRunning else { return }
+                guard self.isRunning, self.requestGeneration == generation,
+                      Self.symbols == symbols else { return }
                 self.activeTask = nil
                 self.lock.lock()
                 self.rows = parsed
@@ -208,13 +237,16 @@ final class StockMonitor {
             let f = line[line.index(after: eq)...]
                 .trimmingCharacters(in: CharacterSet(charactersIn: "\";"))
                 .components(separatedBy: "~")
-            guard f.count > 32, let price = Double(f[3]), let chg = Double(f[31]),
-                  let pct = Double(f[32]) else { continue }
+            guard f.count > 32 else { continue }
+            let rawPrice = f[3].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let price = Double(rawPrice), price.isFinite,
+                  let chg = Double(f[31]), chg.isFinite,
+                  let pct = Double(f[32]), pct.isFinite else { continue }
             // lowercase key so the case-normalized query symbol still matches
             bySymbol[symbol.lowercased()] = Row(
                 code: displayCode(symbol),
                 name: f[1],
-                price: formatPrice(price),
+                price: rawPrice,
                 pct: String(format: "%+.2f%%", pct),
                 up: chg > 0 ? 1 : (chg < 0 ? -1 : 0))
         }
@@ -227,11 +259,5 @@ final class StockMonitor {
             return String(symbol.dropFirst(2)).uppercased()
         }
         return symbol.uppercased()
-    }
-
-    static func formatPrice(_ p: Double) -> String {
-        if p >= 10000 { return String(format: "%.0f", p) }
-        if p >= 1000 { return String(format: "%.1f", p) }
-        return String(format: "%.2f", p)
     }
 }

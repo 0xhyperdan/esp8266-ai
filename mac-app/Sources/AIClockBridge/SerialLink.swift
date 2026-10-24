@@ -1,13 +1,16 @@
 import Foundation
 
 // Wired (USB serial) transport to the clock, for WiFi networks with client
-// isolation - or for skipping WiFi setup entirely. Scans for CH340-style
+// isolation - or for skipping WiFi setup entirely. Scans for CH340 and native
 // serial ports, handshakes, then pushes the same payloads the device would
 // otherwise poll over HTTP, as newline-terminated frames:
-//   bridge -> device:  #HELLO   #INFO   #STATUS {json}   #NET {json}   #CMD {json}
-//                       #PET_BEGIN {json}   #PET_CHUNK <seq> <base64>   #PET_END
+//   bridge -> device:  #HELLO   #INFO   #STATUS {json}   #CMD {json}
+//                       #STOCK_NAMES_BEGIN {json}
+//                       #STOCK_NAMES_CHUNK <seq> <base64>   #STOCK_NAMES_END
+//                       #WEATHER {json}   #WEATHER_ASSET_BEGIN {json}
+//                       #WEATHER_ASSET_CHUNK <seq> <base64>   #WEATHER_ASSET_END
 //   device -> bridge:  #DEVICE {"name":"aiclock","fw":"x.y.z"}
-//                       #ACK status   #PET_READY   #PET_ACK <seq>   #PET_DONE
+//                       #ACK status
 // Device log lines (anything not starting with '#') are ignored.
 //
 // Set AICLOCK_SERIAL_PORT to pin the bridge to one device. The automatic scan
@@ -15,58 +18,88 @@ import Foundation
 //
 // NOTE: quit the app before flashing so the two serial clients do not race.
 final class SerialLink {
-    private enum PetUploadPhase {
+    private enum StockNamesUploadPhase {
         case waitingReady
         case waitingAcknowledgement(Int)
         case waitingDone
     }
 
-    private struct PetUpload {
+    private struct StockNamesUpload {
         let data: Data
-        let slot: String
-        let format: String
-        let completion: (Error?) -> Void
+        let revision: Int
         var offset = 0
         var sequence = 0
-        var phase = PetUploadPhase.waitingReady
+        var phase = StockNamesUploadPhase.waitingReady
         var deadline = Date().addingTimeInterval(10)
     }
 
-    private static let petChunkSize = 384
-    private static let maximumPetBytes = 384 * 1024
+    private enum WeatherAssetKind: String {
+        case screen
+        case astronaut
+    }
+
+    private enum WeatherAssetUploadPhase {
+        case waitingReady
+        case waitingAcknowledgement(Int)
+        case waitingDone
+    }
+
+    private struct WeatherAssetUpload {
+        let data: Data
+        let kind: WeatherAssetKind
+        let revision: Int
+        let decodedSize: Int
+        let frames: Int
+        var offset = 0
+        var sequence = 0
+        var phase = WeatherAssetUploadPhase.waitingReady
+        var deadline = Date().addingTimeInterval(15)
+    }
+
+    private static let stockNamesChunkSize = 384
+    private static let maximumStockNamesBytes = 1 + 5 * StockMonitor.nameW * StockMonitor.nameH * 2
+    private static let weatherAssetChunkSize = 768
+    private static let maximumWeatherAssetBytes = 256 * 1024
 
     private let service: StatusService
-    private let netMonitor: NetSpeedMonitor
     private let stockMonitor: StockMonitor
+    private let weatherMonitor: WeatherMonitor
     private let featurePreferences: FeaturePreferences
+    private let printerStatusProvider: () -> PrinterStatus
 
     private var fd: Int32 = -1
     private var portPath = ""
     private var linked = false // saw #DEVICE from the clock on this port
     private var dataConfirmed = false // saw a parsed status acknowledgement
     private var lastStatusConfirmedAt = Date.distantPast
-    private var displayMode = "auto"
+    private var displayMode = "weather"
     private var brightness = 100
-    private var showing = "claude"
     private var openedAt = Date.distantPast
     private var lastHelloAt = Date.distantPast
     private var lastStatusAt = Date.distantPast
-    private var lastNetAt = Date.distantPast
+    private var lastPrinterAt = Date.distantPast
     private var lastInfoAt = Date.distantPast
     private var rxBuf = Data()
     private var timer: Timer?
     private(set) var isRunning = false
-    private var petUpload: PetUpload?
-    private var claudeCustomSprite = false
-    private var codexCustomSprite = false
+    private var stockNamesUpload: StockNamesUpload?
+    private var uploadedStockNamesRevision = -1
+    private var lastStockNamesUploadAttemptAt = Date.distantPast
+    private var weatherAssetUpload: WeatherAssetUpload?
+    private var uploadedWeatherScreenRevision = -1
+    private var uploadedWeatherAstronautRevision = -1
+    private var lastWeatherAssetUploadAttemptAt = Date.distantPast
     private var reportedInfo = DeviceInfo()
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor,
-         featurePreferences: FeaturePreferences = .shared) {
+    init(service: StatusService, stockMonitor: StockMonitor,
+         weatherMonitor: WeatherMonitor,
+         featurePreferences: FeaturePreferences = .shared,
+         printerStatusProvider: @escaping () -> PrinterStatus = { PrinterBridge.shared.snapshot() }) {
         self.service = service
-        self.netMonitor = netMonitor
         self.stockMonitor = stockMonitor
+        self.weatherMonitor = weatherMonitor
         self.featurePreferences = featurePreferences
+        self.printerStatusProvider = printerStatusProvider
     }
 
     func start() {
@@ -93,10 +126,13 @@ final class SerialLink {
               Date().timeIntervalSince(lastStatusConfirmedAt) < 15 else { return nil }
 
         var info = reportedInfo
-        info.ip = portPath
+        if info.ip.isEmpty { info.ip = portPath }
         info.ssid = "USB"
         info.bridge = "USB serial"
         info.lastUpdateS = Int(Date().timeIntervalSince(lastStatusConfirmedAt))
+        if !info.printer.native {
+            info.printer = printerStatusProvider()
+        }
         return info
     }
 
@@ -107,55 +143,25 @@ final class SerialLink {
               let json = try? JSONSerialization.data(withJSONObject: command) else { return false }
         guard send(frame("#CMD ", json)) else { return false }
         if let mode = command["display"] as? String {
-            displayMode = mode
-            reportedInfo.mode = mode
-            reportedInfo.effective = mode
+            let normalizedMode = DisplayModeDescriptor.normalizedMode(mode)
+            displayMode = normalizedMode
+            reportedInfo.mode = normalizedMode
+            reportedInfo.effective = normalizedMode
+            if mode == "weather" {
+                uploadedWeatherScreenRevision = -1
+                lastStatusAt = .distantPast
+            }
         }
         if let level = command["brightness"] as? Int {
             brightness = max(0, min(100, level))
             reportedInfo.brightness = brightness
         }
-        return true
-    }
-
-    @discardableResult
-    func uploadPet(_ data: Data, slot: String, format: String = "gif",
-                   completion: @escaping (Error?) -> Void) -> Bool {
-        guard linked, fd >= 0 else { return false }
-        guard slot == "claude" || slot == "codex" else {
-            completion(Self.petUploadError(code: 1, message: "Unsupported pet slot"))
-            return true
-        }
-        guard format == "gif" || format == "rgb565" else {
-            completion(Self.petUploadError(code: 2, message: "Unsupported pet format"))
-            return true
-        }
-        guard !data.isEmpty, data.count <= Self.maximumPetBytes else {
-            completion(Self.petUploadError(code: 3, message: "Pet data must be between 1 byte and 384 KB"))
-            return true
-        }
-        guard petUpload == nil else {
-            completion(Self.petUploadError(code: 4, message: "Another pet upload is already running"))
-            return true
-        }
-
-        let metadata: [String: Any] = [
-            "slot": slot,
-            "format": format,
-            "size": data.count,
-            "crc32": NSNumber(value: Self.crc32(data)),
-        ]
-        guard let json = try? JSONSerialization.data(withJSONObject: metadata) else {
-            completion(Self.petUploadError(code: 5, message: "Could not encode pet metadata"))
-            return true
-        }
-
-        petUpload = PetUpload(data: data, slot: slot, format: format, completion: completion)
-        if !send(frame("#PET_BEGIN ", json)) {
-            finishPetUpload(error: Self.petUploadError(code: 6, message: "Could not write to the USB device"))
+        if let enabled = command["auto_rotate"] as? Bool {
+            reportedInfo.autoRotateEnabled = enabled
         }
         return true
     }
+
 
     static func crc32(_ data: Data) -> UInt32 {
         var crc = UInt32.max
@@ -170,6 +176,12 @@ final class SerialLink {
             }
         }
         return ~crc
+    }
+
+    static func isValidStockNamesPayload(_ data: Data) -> Bool {
+        guard let count = data.first, count > 0, count <= 5 else { return false }
+        let expected = 1 + Int(count) * StockMonitor.nameW * StockMonitor.nameH * 2
+        return data.count == expected
     }
 
     private func tick() {
@@ -191,23 +203,35 @@ final class SerialLink {
             }
             return
         }
-        if let upload = petUpload {
+
+        if let upload = stockNamesUpload, now >= upload.deadline {
+            finishStockNamesUpload(success: false)
+            return
+        }
+        if let upload = weatherAssetUpload {
             if now >= upload.deadline {
-                finishPetUpload(error: Self.petUploadError(code: 6, message: "USB pet upload timed out"))
+                finishWeatherAssetUpload(success: false)
             }
             return
         }
+        if displayMode == "printer", !reportedInfo.printer.native,
+           now.timeIntervalSince(lastPrinterAt) >= 2 {
+            lastPrinterAt = now
+            send(Self.printerFrame(printerStatusProvider()))
+        }
         if now.timeIntervalSince(lastStatusAt) > 5 {
             lastStatusAt = now
-            send(frame("#STATUS ", service.snapshot().jsonData()))
+            send(Self.statusFrame(service.snapshot()))
             if featurePreferences.isEnabled("stock") {
                 send(frame("#STOCK ", stockMonitor.jsonData()))
             }
-        }
-        if featurePreferences.isEnabled("net"), now.timeIntervalSince(lastNetAt) > 2 {
-            lastNetAt = now
-            let stats = SystemStatsMonitor.shared.snapshot()
-            send(frame("#NET ", netMonitor.jsonData(cpu: stats.cpu, mem: stats.mem)))
+            if displayMode == "weather" {
+                send(frame("#WEATHER ", weatherMonitor.jsonData(now: now)))
+                beginWeatherAssetUploadIfNeeded(now: now)
+            }
+            if featurePreferences.isEnabled("stock") {
+                beginStockNamesUploadIfNeeded(now: now)
+            }
         }
         if now.timeIntervalSince(lastInfoAt) > 1 {
             lastInfoAt = now
@@ -222,6 +246,20 @@ final class SerialLink {
         return d
     }
 
+    static func statusFrame(_ envelope: StatusEnvelope) -> Data {
+        var frame = Data("#STATUS ".utf8)
+        frame.append(envelope.jsonData())
+        frame.append(0x0A)
+        return frame
+    }
+
+    static func printerFrame(_ status: PrinterStatus) -> Data {
+        var frame = Data("#PRINTER ".utf8)
+        frame.append(status.jsonData())
+        frame.append(0x0a)
+        return frame
+    }
+
     // MARK: - port lifecycle
 
     private func scanAndOpen() {
@@ -234,12 +272,15 @@ final class SerialLink {
         }
 
         let names = (try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? []
-        let candidates = names.filter {
-            $0.hasPrefix("cu.usbserial") || $0.hasPrefix("cu.wchusbserial")
-        }.sorted()
+        let candidates = names.filter(Self.isSupportedSerialPortName).sorted()
         for name in candidates where openPort("/dev/" + name) {
             return
         }
+    }
+
+    static func isSupportedSerialPortName(_ name: String) -> Bool {
+        name.hasPrefix("cu.usbserial") || name.hasPrefix("cu.wchusbserial") ||
+            name.hasPrefix("cu.usbmodem")
     }
 
     private func openPort(_ path: String) -> Bool {
@@ -263,13 +304,17 @@ final class SerialLink {
         lastStatusConfirmedAt = .distantPast
         displayMode = "auto"
         brightness = 100
-        showing = "claude"
-        claudeCustomSprite = false
-        codexCustomSprite = false
         openedAt = Date()
         lastHelloAt = .distantPast
         lastInfoAt = .distantPast
         reportedInfo = DeviceInfo()
+        uploadedStockNamesRevision = -1
+        lastStockNamesUploadAttemptAt = .distantPast
+        stockNamesUpload = nil
+        uploadedWeatherScreenRevision = -1
+        uploadedWeatherAstronautRevision = -1
+        lastWeatherAssetUploadAttemptAt = .distantPast
+        weatherAssetUpload = nil
         rxBuf.removeAll()
         FileHandle.standardError.write(Data("[serial] trying \(path)\n".utf8))
         return true
@@ -285,7 +330,8 @@ final class SerialLink {
         linked = false
         dataConfirmed = false
         lastStatusConfirmedAt = .distantPast
-        finishPetUpload(error: Self.petUploadError(code: 7, message: "USB device disconnected during pet upload"))
+        finishStockNamesUpload(success: false)
+        finishWeatherAssetUpload(success: false)
     }
 
     // MARK: - I/O
@@ -340,23 +386,24 @@ final class SerialLink {
             rxBuf.removeSubrange(...nl)
             guard let line = String(data: lineData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) else { continue }
-            if handlePetUploadLine(line) {
+            if handleStockNamesUploadLine(line) {
+                continue
+            } else if handleWeatherAssetUploadLine(line) {
                 continue
             } else if line.hasPrefix("#DEVICE") {
                 let payload = line.dropFirst("#DEVICE ".count)
                 if let data = String(payload).data(using: .utf8),
                    let info = DeviceClient.decodeInfo(data) {
                     reportedInfo = info
-                    displayMode = info.mode
+                    let address = info.ip.isEmpty ? portPath : info.ip
+                    DeviceClient.registerDevice(address)
+                    displayMode = DisplayModeDescriptor.normalizedMode(info.mode)
                     brightness = info.brightness
-                    showing = info.showing
-                    claudeCustomSprite = info.claudeCustomSprite
-                    codexCustomSprite = info.codexCustomSprite
+                    uploadedWeatherAstronautRevision = info.weatherAnimationRevision
                 }
                 if !linked {
                     linked = true
                     lastStatusAt = .distantPast // push a status immediately
-                    lastNetAt = .distantPast
                     FileHandle.standardError.write(Data("[serial] linked \(portPath): \(line)\n".utf8))
                 }
             } else if line == "#ACK status" {
@@ -370,85 +417,233 @@ final class SerialLink {
         }
     }
 
-    private func handlePetUploadLine(_ line: String) -> Bool {
-        if line == "#PET_READY" {
-            guard var upload = petUpload, case .waitingReady = upload.phase else { return true }
+    private func beginStockNamesUploadIfNeeded(now: Date) {
+        guard linked, fd >= 0, stockNamesUpload == nil,
+              weatherAssetUpload == nil,
+              now.timeIntervalSince(lastStockNamesUploadAttemptAt) >= 5 else { return }
+        let snapshot = stockMonitor.namesV2Snapshot()
+        guard snapshot.revision != uploadedStockNamesRevision,
+              Self.isValidStockNamesPayload(snapshot.data),
+              snapshot.data.count <= Self.maximumStockNamesBytes else { return }
+
+        let metadata: [String: Any] = [
+            "revision": snapshot.revision,
+            "size": snapshot.data.count,
+            "crc32": NSNumber(value: Self.crc32(snapshot.data)),
+        ]
+        guard let json = try? JSONSerialization.data(withJSONObject: metadata) else { return }
+        lastStockNamesUploadAttemptAt = now
+        stockNamesUpload = StockNamesUpload(data: snapshot.data, revision: snapshot.revision)
+        if !send(frame("#STOCK_NAMES_BEGIN ", json)) {
+            finishStockNamesUpload(success: false)
+        }
+    }
+
+    private func handleStockNamesUploadLine(_ line: String) -> Bool {
+        if line == "#STOCK_NAMES_READY" {
+            guard var upload = stockNamesUpload,
+                  case .waitingReady = upload.phase else { return true }
             upload.deadline = Date().addingTimeInterval(10)
-            petUpload = upload
-            sendNextPetChunk()
+            stockNamesUpload = upload
+            sendNextStockNamesChunk()
             return true
         }
-        if line.hasPrefix("#PET_ACK ") {
-            let value = line.dropFirst("#PET_ACK ".count)
-            guard let sequence = Int(value), var upload = petUpload,
+        if line.hasPrefix("#STOCK_NAMES_ACK ") {
+            let value = line.dropFirst("#STOCK_NAMES_ACK ".count)
+            guard let sequence = Int(value), var upload = stockNamesUpload,
                   case let .waitingAcknowledgement(expected) = upload.phase,
                   sequence == expected else { return true }
-            upload.offset += min(Self.petChunkSize, upload.data.count - upload.offset)
+            upload.offset += min(Self.stockNamesChunkSize, upload.data.count - upload.offset)
             upload.sequence += 1
             upload.deadline = Date().addingTimeInterval(10)
-            petUpload = upload
-            sendNextPetChunk()
+            stockNamesUpload = upload
+            sendNextStockNamesChunk()
             return true
         }
-        if line == "#PET_PROCESSING" {
-            guard var upload = petUpload, case .waitingDone = upload.phase else { return true }
-            upload.deadline = Date().addingTimeInterval(60)
-            petUpload = upload
+        if line == "#STOCK_NAMES_DONE" {
+            guard let upload = stockNamesUpload,
+                  case .waitingDone = upload.phase else { return true }
+            uploadedStockNamesRevision = upload.revision
+            FileHandle.standardError.write(Data(
+                "[serial] stock names revision \(upload.revision) uploaded\n".utf8))
+            finishStockNamesUpload(success: true)
             return true
         }
-        if line.hasPrefix("#PET_DONE") {
-            guard let upload = petUpload, case .waitingDone = upload.phase else { return true }
-            if upload.slot == "claude" {
-                claudeCustomSprite = true
-            } else {
-                codexCustomSprite = true
-            }
-            finishPetUpload(error: nil)
-            return true
-        }
-        if line.hasPrefix("#PET_ERR") {
-            let reason = line.dropFirst("#PET_ERR".count).trimmingCharacters(in: .whitespaces)
-            finishPetUpload(error: Self.petUploadError(
-                code: 8,
-                message: reason.isEmpty ? "The device rejected the pet upload" : "Device rejected pet upload: \(reason)"
-            ))
+        if line.hasPrefix("#STOCK_NAMES_ERR") {
+            FileHandle.standardError.write(Data("[serial] \(line)\n".utf8))
+            finishStockNamesUpload(success: false)
             return true
         }
         return false
     }
 
-    private func sendNextPetChunk() {
-        guard var upload = petUpload else { return }
+    private func sendNextStockNamesChunk() {
+        guard var upload = stockNamesUpload else { return }
         if upload.offset >= upload.data.count {
             upload.phase = .waitingDone
-            upload.deadline = Date().addingTimeInterval(60)
-            petUpload = upload
-            if !send(Data("#PET_END\n".utf8)) {
-                finishPetUpload(error: Self.petUploadError(code: 9, message: "Could not finish the USB pet upload"))
+            upload.deadline = Date().addingTimeInterval(10)
+            stockNamesUpload = upload
+            if !send(Data("#STOCK_NAMES_END\n".utf8)) {
+                finishStockNamesUpload(success: false)
             }
             return
         }
 
-        let end = min(upload.offset + Self.petChunkSize, upload.data.count)
+        let end = min(upload.offset + Self.stockNamesChunkSize, upload.data.count)
         let encoded = upload.data.subdata(in: upload.offset..<end).base64EncodedString()
         upload.phase = .waitingAcknowledgement(upload.sequence)
         upload.deadline = Date().addingTimeInterval(10)
-        petUpload = upload
-        if !send(Data("#PET_CHUNK \(upload.sequence) \(encoded)\n".utf8)) {
-            finishPetUpload(error: Self.petUploadError(code: 10, message: "Could not send a USB pet chunk"))
+        stockNamesUpload = upload
+        if !send(Data("#STOCK_NAMES_CHUNK \(upload.sequence) \(encoded)\n".utf8)) {
+            finishStockNamesUpload(success: false)
         }
     }
 
-    private func finishPetUpload(error: Error?) {
-        guard let upload = petUpload else { return }
-        petUpload = nil
-        DispatchQueue.main.async {
-            upload.completion(error)
+    private func finishStockNamesUpload(success: Bool) {
+        guard stockNamesUpload != nil else { return }
+        stockNamesUpload = nil
+        if !success {
+            FileHandle.standardError.write(Data("[serial] stock name upload failed; retrying later\n".utf8))
         }
     }
 
-    private static func petUploadError(code: Int, message: String) -> NSError {
-        NSError(domain: "SerialLink.PetUpload", code: code,
-                userInfo: [NSLocalizedDescriptionKey: message])
+    private func beginWeatherAssetUploadIfNeeded(now: Date) {
+        guard linked, fd >= 0, displayMode == "weather",
+              stockNamesUpload == nil, weatherAssetUpload == nil,
+              now.timeIntervalSince(lastWeatherAssetUploadAttemptAt) >= 3 else { return }
+
+        let upload: WeatherAssetUpload?
+        if let screen = weatherMonitor.wiredScreenSnapshot(now: now),
+           screen.revision != uploadedWeatherScreenRevision {
+            upload = WeatherAssetUpload(
+                data: screen.encoded,
+                kind: .screen,
+                revision: screen.revision,
+                decodedSize: screen.decodedSize,
+                frames: 0
+            )
+        } else if let astronaut = weatherMonitor.wiredAstronautSnapshot(),
+                  astronaut.revision != uploadedWeatherAstronautRevision {
+            upload = WeatherAssetUpload(
+                data: astronaut.encoded,
+                kind: .astronaut,
+                revision: astronaut.revision,
+                decodedSize: astronaut.decodedSize,
+                frames: astronaut.frames
+            )
+        } else {
+            upload = nil
+        }
+        guard let upload, !upload.data.isEmpty,
+              upload.data.count <= Self.maximumWeatherAssetBytes else { return }
+
+        let metadata: [String: Any] = [
+            "kind": upload.kind.rawValue,
+            "encoding": "rle565",
+            "revision": upload.revision,
+            "frames": upload.frames,
+            "size": upload.data.count,
+            "decoded_size": upload.decodedSize,
+            "crc32": NSNumber(value: Self.crc32(upload.data)),
+        ]
+        guard let json = try? JSONSerialization.data(withJSONObject: metadata) else { return }
+        lastWeatherAssetUploadAttemptAt = now
+        weatherAssetUpload = upload
+        FileHandle.standardError.write(Data((
+            "[serial] uploading weather \(upload.kind.rawValue) revision \(upload.revision), " +
+                "\(upload.data.count)/\(upload.decodedSize) bytes\n"
+        ).utf8))
+        if !send(frame("#WEATHER_ASSET_BEGIN ", json)) {
+            finishWeatherAssetUpload(success: false)
+        }
+    }
+
+    static func weatherScreenRevision(afterDeviceLine line: String,
+                                      current: Int, uploadInProgress: Bool) -> Int {
+        line == "#WEATHER_SCREEN_NEEDED" && !uploadInProgress ? -1 : current
+    }
+
+    private func handleWeatherAssetUploadLine(_ line: String) -> Bool {
+        if line == "#WEATHER_SCREEN_NEEDED" {
+            uploadedWeatherScreenRevision = Self.weatherScreenRevision(
+                afterDeviceLine: line, current: uploadedWeatherScreenRevision,
+                uploadInProgress: weatherAssetUpload != nil
+            )
+            return true
+        }
+        if line == "#WEATHER_ASSET_READY" {
+            guard var upload = weatherAssetUpload,
+                  case .waitingReady = upload.phase else { return true }
+            upload.deadline = Date().addingTimeInterval(15)
+            weatherAssetUpload = upload
+            sendNextWeatherAssetChunk()
+            return true
+        }
+        if line.hasPrefix("#WEATHER_ASSET_ACK ") {
+            let value = line.dropFirst("#WEATHER_ASSET_ACK ".count)
+            guard let sequence = Int(value), var upload = weatherAssetUpload,
+                  case let .waitingAcknowledgement(expected) = upload.phase,
+                  sequence == expected else { return true }
+            upload.offset += min(Self.weatherAssetChunkSize, upload.data.count - upload.offset)
+            upload.sequence += 1
+            upload.deadline = Date().addingTimeInterval(15)
+            weatherAssetUpload = upload
+            sendNextWeatherAssetChunk()
+            return true
+        }
+        if line == "#WEATHER_ASSET_DONE" {
+            guard let upload = weatherAssetUpload,
+                  case .waitingDone = upload.phase else { return true }
+            switch upload.kind {
+            case .screen:
+                uploadedWeatherScreenRevision = upload.revision
+            case .astronaut:
+                uploadedWeatherAstronautRevision = upload.revision
+            }
+            FileHandle.standardError.write(Data(
+                "[serial] weather \(upload.kind.rawValue) revision \(upload.revision) uploaded\n".utf8
+            ))
+            finishWeatherAssetUpload(success: true)
+            lastStatusAt = .distantPast
+            return true
+        }
+        if line.hasPrefix("#WEATHER_ASSET_ERR") {
+            FileHandle.standardError.write(Data("[serial] \(line)\n".utf8))
+            finishWeatherAssetUpload(success: false)
+            return true
+        }
+        return false
+    }
+
+    private func sendNextWeatherAssetChunk() {
+        guard var upload = weatherAssetUpload else { return }
+        if upload.offset >= upload.data.count {
+            upload.phase = .waitingDone
+            upload.deadline = Date().addingTimeInterval(20)
+            weatherAssetUpload = upload
+            if !send(Data("#WEATHER_ASSET_END\n".utf8)) {
+                finishWeatherAssetUpload(success: false)
+            }
+            return
+        }
+
+        let end = min(upload.offset + Self.weatherAssetChunkSize, upload.data.count)
+        let encoded = upload.data.subdata(in: upload.offset..<end).base64EncodedString()
+        upload.phase = .waitingAcknowledgement(upload.sequence)
+        upload.deadline = Date().addingTimeInterval(15)
+        weatherAssetUpload = upload
+        if !send(Data("#WEATHER_ASSET_CHUNK \(upload.sequence) \(encoded)\n".utf8)) {
+            finishWeatherAssetUpload(success: false)
+        }
+    }
+
+    private func finishWeatherAssetUpload(success: Bool) {
+        guard weatherAssetUpload != nil else { return }
+        weatherAssetUpload = nil
+        if !success {
+            FileHandle.standardError.write(Data(
+                "[serial] weather asset upload failed; retrying later\n".utf8
+            ))
+        }
     }
 }

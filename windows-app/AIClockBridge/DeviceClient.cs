@@ -1,37 +1,23 @@
 using System.Net;
-using System.Net.Http.Headers;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text.Json;
 
 namespace AIClockBridge;
 
-// Talks to the ESP8266 clock's own HTTP API, so everything the device's web
-// page can do (switch display, set bridge host, upload/reset pet GIFs) is
-// available straight from the tray. Device address persists in Settings.
+// Talks to the ESP8266 clock's own HTTP API for display, bridge, brightness,
+// and display controls. Device address persists in Settings.
 
 class DeviceInfo
 {
     public string Ip = "";
     public string Ssid = "";
     public string Bridge = "";
-    public string Mode = "auto";       // configured: auto | claude | codex | net | music | stock | pomodoro
-    public string Effective = "auto";  // what's actually on screen (AUTO may promote to music)
+    public string Mode = "weather";    // configured dashboard mode
+    public string Effective = "weather"; // weather may temporarily promote to music
     public string Showing = "";
     public int LastUpdateS = -1;       // seconds since the device last got /status data, -1 = never
-    public int SpriteRev;              // bumped by the device on animation change
     public int Brightness = 100;       // backlight 0-100 (0 = off)
-    public string PomodoroPhase = "focus";
-    public bool PomodoroRunning;
-    public int PomodoroRemainingS = 25 * 60;
-    public int PomodoroDurationS = 25 * 60;
-    public int PomodoroCompleted;
-    public int PomodoroFocusMinutes = 25;
-    public int PomodoroBreakMinutes = 5;
-    public bool ClaudeCustomSprite;
-    public bool CodexCustomSprite;
-    public int ClaudeW = 111, ClaudeH = 120;
-    public int CodexW = 120, CodexH = 120;
 }
 
 class DeviceException : Exception
@@ -43,10 +29,16 @@ static class DeviceClient
 {
     const string HostKey = "device_host";
     const string LastSeenKey = "device_last_seen";
+    static readonly string[] RetainedModes =
+    {
+        "weather", "music", "stock", "salary", "printer",
+    };
+
+    public static string NormalizeMode(string mode) =>
+        RetainedModes.Contains(mode) ? mode : "weather";
 
     // per-request CancellationTokenSources carry the timeouts (5s info, 8s
-    // posts, 30s sprite pull, 60s GIF upload+on-device decode), so the client
-    // itself must not impose a shorter global one
+    // posts), so the client itself must not impose a shorter global one
     static readonly HttpClient Http = new() { Timeout = Timeout.InfiniteTimeSpan };
 
     public static string Host
@@ -102,35 +94,12 @@ static class DeviceClient
                 Ip = Str(root, "ip"),
                 Ssid = Str(root, "ssid"),
                 Bridge = Str(root, "bridge"),
-                Mode = Str(root, "mode", "auto"),
+                Mode = NormalizeMode(Str(root, "mode", "weather")),
                 LastUpdateS = Int(root, "last_update_s", -1),
-                SpriteRev = Int(root, "sprite_rev"),
                 Brightness = Int(root, "brightness", 100),
                 Showing = Str(root, "showing"),
             };
-            info.Effective = Str(root, "effective", info.Mode);
-            if (root.TryGetProperty("pomodoro", out var pomodoro))
-            {
-                info.PomodoroPhase = Str(pomodoro, "phase", "focus");
-                info.PomodoroRunning = Bool(pomodoro, "running");
-                info.PomodoroRemainingS = Int(pomodoro, "remaining_s", 25 * 60);
-                info.PomodoroDurationS = Int(pomodoro, "duration_s", 25 * 60);
-                info.PomodoroCompleted = Int(pomodoro, "completed");
-                info.PomodoroFocusMinutes = Int(pomodoro, "focus_min", 25);
-                info.PomodoroBreakMinutes = Int(pomodoro, "break_min", 5);
-            }
-            if (root.TryGetProperty("claude", out var claude))
-            {
-                info.ClaudeCustomSprite = Bool(claude, "custom_sprite");
-                info.ClaudeW = Int(claude, "w", 111);
-                info.ClaudeH = Int(claude, "h", 120);
-            }
-            if (root.TryGetProperty("codex", out var codex))
-            {
-                info.CodexCustomSprite = Bool(codex, "custom_sprite");
-                info.CodexW = Int(codex, "w", 120);
-                info.CodexH = Int(codex, "h", 120);
-            }
+            info.Effective = NormalizeMode(Str(root, "effective", info.Mode));
             return info;
         }
         catch (Exception)
@@ -139,18 +108,9 @@ static class DeviceClient
         }
     }
 
-    /// POST /api/display  mode=auto|claude|codex|net|music|stock|pomodoro
+    /// POST /api/display  mode=weather|music|stock|salary
     public static Task SetDisplayMode(string mode) =>
         PostForm("api/display", new() { ["mode"] = mode });
-
-    public static Task ControlPomodoro(string action, int? focusMinutes = null,
-                                       int? breakMinutes = null)
-    {
-        Dictionary<string, string> fields = new() { ["action"] = action };
-        if (focusMinutes.HasValue) fields["focus_min"] = focusMinutes.Value.ToString();
-        if (breakMinutes.HasValue) fields["break_min"] = breakMinutes.Value.ToString();
-        return PostForm("api/pomodoro", fields);
-    }
 
     /// POST /api/bridge  host=ip:port
     public static Task SetBridgeHost(string bridgeHost) =>
@@ -159,50 +119,6 @@ static class DeviceClient
     /// POST /api/brightness  level=0-100 (0 = backlight off); device persists it
     public static Task SetBrightness(int level) =>
         PostForm("api/brightness", new() { ["level"] = level.ToString() });
-
-    /// POST /sprite/{claude|codex}  multipart GIF upload — the device decodes
-    /// and rescales the GIF on-board, then swaps the animation immediately.
-    public static async Task UploadGif(byte[] gif, string slot)
-    {
-        var url = Resolve($"sprite/{slot}");
-        using var content = new MultipartFormDataContent($"aiclock-{Guid.NewGuid()}");
-        var filePart = new ByteArrayContent(gif);
-        filePart.Headers.ContentType = new MediaTypeHeaderValue("image/gif");
-        content.Add(filePart, "file", "pet.gif");
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60)); // on-device decode
-        HttpResponseMessage resp;
-        try
-        {
-            resp = await Http.PostAsync(url, content, cts.Token);
-        }
-        catch (Exception e)
-        {
-            throw new DeviceException($"上传失败：{e.Message}");
-        }
-        using (resp) await ThrowUnlessOk(resp);
-    }
-
-    /// POST /sprite/{claude|codex}/reset — back to the compiled-in animation.
-    public static Task ResetSprite(string slot) => PostForm($"sprite/{slot}/reset", new());
-
-    /// GET /sprite/{claude|codex}/raw — the animation the device is actually
-    /// using, wire format [1 byte frame count][RGB565 big-endian frames...].
-    public static async Task<byte[]> FetchSpriteRaw(string slot)
-    {
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        byte[] data;
-        try
-        {
-            data = await Http.GetByteArrayAsync(Resolve($"sprite/{slot}/raw"), cts.Token);
-        }
-        catch (DeviceException) { throw; }
-        catch (Exception e)
-        {
-            throw new DeviceException($"拉取动画失败：{e.Message}");
-        }
-        if (data.Length <= 1) throw new DeviceException("设备响应解析失败");
-        return data;
-    }
 
     // MARK: - internals
 
@@ -248,6 +164,12 @@ static class DeviceClient
 
     /// Checks whether `ip` answers like our clock (GET /api/info with the
     /// expected JSON shape).
+    public static bool IsClockInfo(JsonElement root) =>
+        root.TryGetProperty("mode", out var mode)
+        && mode.ValueKind == JsonValueKind.String
+        && root.TryGetProperty("fw", out var firmware)
+        && firmware.ValueKind == JsonValueKind.String;
+
     public static async Task<bool> VerifyDevice(string ip, double timeoutSeconds = 2)
     {
         try
@@ -255,9 +177,7 @@ static class DeviceClient
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
             var body = await Http.GetStringAsync($"http://{ip}/api/info", cts.Token);
             using var doc = JsonDocument.Parse(body);
-            return doc.RootElement.TryGetProperty("mode", out var mode)
-                && mode.ValueKind == JsonValueKind.String
-                && doc.RootElement.TryGetProperty("sprite_rev", out _);
+            return IsClockInfo(doc.RootElement);
         }
         catch
         {
@@ -328,7 +248,7 @@ static class DeviceClient
 
     // MARK: - pairing watchdog
 
-    /// Stamped on every device poll of our /status|/net|/music (see Program.cs).
+    /// Stamped on every device poll of our /status|/music (see Program.cs).
     public static DateTime DevicePollAt = DateTime.MinValue;
 
     static bool _healInFlight;

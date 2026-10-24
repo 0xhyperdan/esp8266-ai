@@ -2,45 +2,9 @@ import AppKit
 
 // Live "mirror" of the ESP8266 screen, shown in a popover from the menu-bar
 // icon. Not a video stream: the Mac re-renders the same scene from the same
-// data — /api/info says which app the device is showing (and a sprite_rev
-// that bumps when animations change), /sprite/<app>/raw provides the exact
-// frames the device draws (custom upload or built-in), and the local
-// StatusService supplies the quota numbers the device gets from /status.
-// Result: what you see here is what the panel shows, including the walk
-// cycle animating only while that app is "working".
+// StatusService snapshot and /api/info identity used by the device.
 
-// MARK: - RGB565 frame decoding
-
-private func decodeSpriteFrames(_ data: Data, w: Int, h: Int) -> [CGImage] {
-    guard data.count >= 1 else { return [] }
-    let count = Int(data[data.startIndex])
-    let frameBytes = w * h * 2
-    guard count > 0, data.count >= 1 + count * frameBytes else { return [] }
-    var frames: [CGImage] = []
-    let bytes = [UInt8](data)
-    for f in 0..<count {
-        var rgba = [UInt8](repeating: 255, count: w * h * 4)
-        var src = 1 + f * frameBytes
-        for p in 0..<(w * h) {
-            // wire order is big-endian RGB565 (see tools/convert_sprites.py)
-            let v = (UInt16(bytes[src]) << 8) | UInt16(bytes[src + 1])
-            src += 2
-            rgba[p * 4 + 0] = UInt8((v >> 11) & 0x1F) << 3
-            rgba[p * 4 + 1] = UInt8((v >> 5) & 0x3F) << 2
-            rgba[p * 4 + 2] = UInt8(v & 0x1F) << 3
-        }
-        let data = CFDataCreate(nil, rgba, rgba.count)!
-        if let provider = CGDataProvider(data: data),
-           let img = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
-                             bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
-                             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
-                             provider: provider, decode: nil, shouldInterpolate: false,
-                             intent: .defaultIntent) {
-            frames.append(img)
-        }
-    }
-    return frames
-}
+// MARK: - the 240x240 replica view
 
 private func decodeCover(_ data: Data, w: Int, h: Int) -> CGImage? {
     let frameBytes = w * h * 2
@@ -49,14 +13,13 @@ private func decodeCover(_ data: Data, w: Int, h: Int) -> CGImage? {
     var rgba = [UInt8](repeating: 255, count: w * h * 4)
     var src = 0
     for p in 0..<(w * h) {
-        let v = (UInt16(bytes[src]) << 8) | UInt16(bytes[src + 1])
+        let value = (UInt16(bytes[src]) << 8) | UInt16(bytes[src + 1])
         src += 2
-        rgba[p * 4 + 0] = UInt8((v >> 11) & 0x1F) << 3
-        rgba[p * 4 + 1] = UInt8((v >> 5) & 0x3F) << 2
-        rgba[p * 4 + 2] = UInt8(v & 0x1F) << 3
+        rgba[p * 4 + 0] = UInt8((value >> 11) & 0x1F) << 3
+        rgba[p * 4 + 1] = UInt8((value >> 5) & 0x3F) << 2
+        rgba[p * 4 + 2] = UInt8((value & 0x1F) << 3)
     }
-    let data = CFDataCreate(nil, rgba, rgba.count)!
-    guard let provider = CGDataProvider(data: data) else { return nil }
+    guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
     return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
                    bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
@@ -64,58 +27,21 @@ private func decodeCover(_ data: Data, w: Int, h: Int) -> CGImage? {
                    intent: .defaultIntent)
 }
 
-// MARK: - the 240x240 replica view
-
 final class MirrorView: NSView {
+    var printerMode = false
+    var printerStatus = PrinterStatus()
     // scene state, all in the device's 240x240 logical coordinates
-    var frames: [CGImage] = []
-    var frameIdx = 0
-    var spriteW = 120, spriteH = 120
-    var ringPct: Double = 0
-    var needsInput = false // shown app waiting on approval -> red border flash
-    var flashOn = false
-    var line1 = "5H -"
-    var line2 = "\u{5468} -"
-    var showingClaude = true
     var deviceOK = false
-    // net-mode mirror: same scrolling area-chart model as the firmware —
-    // one column per 250ms sample, 224-column (56s) window, shared "nice"
-    // full-scale, dim-green download area + yellow upload line.
-    var netMode = false
-    var netCPU = -1 // -1 = hidden (CPU/MEM row disabled in the menu)
-    var netMem = -1
     var stockMode = false
     var stockRows: [StockMonitor.Row] = []
-    var pomodoroMode = false
-    var pomodoroPhase = "focus"
-    var pomodoroRunning = false
-    var pomodoroRemainingS = 25 * 60
-    var pomodoroDurationS = 25 * 60
-    var pomodoroCompleted = 0
-    var netHeaderDL = "0B"
-    var netHeaderUL = "0B"
-    private static let netCols = 224 // NET_CHART_W
-    private var histRx = [Double](repeating: 0, count: netCols)
-    private var histTx = [Double](repeating: 0, count: netCols)
-
-    func resetNetSweep() {
-        histRx = [Double](repeating: 0, count: Self.netCols)
-        histTx = [Double](repeating: 0, count: Self.netCols)
-    }
-
-    func pushNetSample(rx: Double, tx: Double) {
-        histRx.removeFirst()
-        histRx.append(rx)
-        histTx.removeFirst()
-        histTx.append(tx)
-        needsDisplay = true
-    }
-
-    /// Firmware's adaptiveNetScale: the window peak sits at ~87% of the chart.
-    private static func adaptiveNetScale(_ maxV: Double) -> Double {
-        max(maxV * 1.15, 10240)
-    }
-
+    var weatherMode = false
+    var weatherImage: NSImage?
+    var salaryMode = false
+    var salaryEarnedYuan = 0.0
+    var salaryRateYuanPerSecond = 0.0
+    var salaryDailyWorkS = 8 * 60 * 60
+    var salaryStatus = "CONFIGURE SALARY"
+    var salaryElapsedS = 0
     var musicMode = false
     var musicTitle = ""
     var musicArtist = ""
@@ -123,9 +49,6 @@ final class MirrorView: NSView {
     var musicDuration: Double = 0
     var musicPlaying = false
     var musicCover: CGImage?
-
-    private static let claudeLogo = Bundle.aiClockResources.image(forResource: "claude-logo")
-    private static let codexLogo = Bundle.aiClockResources.image(forResource: "codex-logo")
 
     override var isFlipped: Bool { true } // draw in the panel's top-left origin
 
@@ -142,8 +65,8 @@ final class MirrorView: NSView {
         panel.fill()
         panel.addClip()
 
-        if netMode {
-            drawNetScene(ctx)
+        if printerMode {
+            PrinterScene.draw(printerStatus, deviceOnline: deviceOK)
             ctx.restoreGState()
             return
         }
@@ -157,66 +80,54 @@ final class MirrorView: NSView {
             ctx.restoreGState()
             return
         }
-        if pomodoroMode {
-            drawPomodoroScene()
+        if weatherMode {
+            if let weatherImage {
+                var proposedRect = NSRect(origin: .zero, size: weatherImage.size)
+                if let image = weatherImage.cgImage(
+                    forProposedRect: &proposedRect,
+                    context: NSGraphicsContext.current,
+                    hints: nil
+                ) {
+                    let rect = CGRect(x: 0, y: 0, width: 240, height: 240)
+                    ctx.saveGState()
+                    ctx.interpolationQuality = .none
+                    // Core Graphics images are bottom-up inside this flipped view.
+                    ctx.translateBy(x: 0, y: rect.midY)
+                    ctx.scaleBy(x: 1, y: -1)
+                    ctx.translateBy(x: 0, y: -rect.midY)
+                    ctx.draw(image, in: rect)
+                    ctx.restoreGState()
+                }
+            }
+            ctx.restoreGState()
+            return
+        }
+        if salaryMode {
+            drawSalaryScene()
             ctx.restoreGState()
             return
         }
 
-        // square quota ring: margin 4, thickness 2, clockwise from top-left
-        let m: CGFloat = 4, t: CGFloat = 2
-        let side: CGFloat = 240 - 2 * m
-        let color = deviceOK ? NSColor(calibratedRed: 0, green: 0.85, blue: 0.2, alpha: 1)
-                             : NSColor.darkGray
-        color.setFill()
-        var remaining = side * 4 * CGFloat(max(0, min(ringPct, 100)) / 100)
-        let x0 = m, y0 = m, x1 = 240 - m
-        var seg = min(remaining, side)
-        if seg > 0 { NSRect(x: x0, y: y0, width: seg, height: t).fill() }          // top
-        remaining -= side
-        seg = min(remaining, side)
-        if seg > 0 { NSRect(x: x1 - t, y: y0, width: t, height: seg).fill() }      // right
-        remaining -= side
-        seg = min(remaining, side)
-        if seg > 0 { NSRect(x: x1 - seg, y: 240 - m - t, width: seg, height: t).fill() } // bottom
-        remaining -= side
-        seg = min(remaining, side)
-        if seg > 0 { NSRect(x: x0, y: 240 - m - seg, width: t, height: seg).fill() }     // left
-
-        // sprite, 10% larger and centered on the display
-        if !frames.isEmpty {
-            let img = frames[min(frameIdx, frames.count - 1)]
-            let displayW = CGFloat(spriteW) * 1.1
-            let displayH = CGFloat(spriteH) * 1.1
-            let rect = CGRect(x: 120 - displayW / 2, y: 120 - displayH / 2,
-                              width: displayW, height: displayH)
-            ctx.saveGState()
-            ctx.interpolationQuality = .none
-            // CGContext draws images bottom-up; flip locally around the rect
-            ctx.translateBy(x: 0, y: rect.midY)
-            ctx.scaleBy(x: 1, y: -1)
-            ctx.translateBy(x: 0, y: -rect.midY)
-            ctx.draw(img, in: rect)
-            ctx.restoreGState()
+        if let weatherImage {
+            var proposedRect = NSRect(origin: .zero, size: weatherImage.size)
+            if let image = weatherImage.cgImage(
+                forProposedRect: &proposedRect,
+                context: NSGraphicsContext.current,
+                hints: nil
+            ) {
+                ctx.saveGState()
+                ctx.interpolationQuality = .none
+                ctx.translateBy(x: 0, y: 120)
+                ctx.scaleBy(x: 1, y: -1)
+                ctx.translateBy(x: 0, y: -120)
+                ctx.draw(image, in: CGRect(x: 0, y: 0, width: 240, height: 240))
+                ctx.restoreGState()
+            }
         }
-
-        // app logo, top-left inside the ring (firmware draws it at 14,18 @30px)
-        if let logo = Self.claudeLogo, let logo2 = Self.codexLogo {
-            (showingClaude ? logo : logo2).draw(in: NSRect(x: 14, y: 18, width: 30, height: 30))
-        }
-
-        // quota text
-        let style = NSMutableParagraphStyle()
-        style.alignment = .center
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold),
-            .foregroundColor: NSColor.white,
-            .paragraphStyle: style,
-        ]
-        (line1 as NSString).draw(in: NSRect(x: 0, y: 188, width: 240, height: 18), withAttributes: attrs)
-        (line2 as NSString).draw(in: NSRect(x: 0, y: 206, width: 240, height: 18), withAttributes: attrs)
 
         if !deviceOK {
+            let style = NSMutableParagraphStyle()
+            style.alignment = .center
             let overlay: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 14, weight: .bold),
                 .foregroundColor: NSColor.systemRed,
@@ -224,16 +135,6 @@ final class MirrorView: NSView {
             ]
             ("设备离线" as NSString).draw(in: NSRect(x: 0, y: 60, width: 240, height: 20),
                                           withAttributes: overlay)
-        }
-
-        // approval pending: blink the whole border red over everything else
-        if needsInput && flashOn {
-            let m: CGFloat = 4, t: CGFloat = 10, side: CGFloat = 240 - 2 * m
-            NSColor.systemRed.setFill()
-            NSRect(x: m, y: m, width: side, height: t).fill()
-            NSRect(x: m, y: 240 - m - t, width: side, height: t).fill()
-            NSRect(x: m, y: m, width: t, height: side).fill()
-            NSRect(x: 240 - m - t, y: m, width: t, height: side).fill()
         }
         ctx.restoreGState()
     }
@@ -283,186 +184,105 @@ final class MirrorView: NSView {
         ctx.fill(CGRect(x: bar.minX, y: bar.minY, width: bar.width * frac, height: bar.height))
     }
 
-    /// Replica of the firmware's net-speed screen v2: header readouts, then
-    /// a 224x128 area chart at (8,60) — dim-green DL fill with bright top
-    /// edge, 2px yellow UL line, quarter gridlines, shared nice scale.
-    private func drawNetScene(_ ctx: CGContext) {
-        let green = NSColor(calibratedRed: 0, green: 0.85, blue: 0.2, alpha: 1)
-        let yellow = NSColor(calibratedRed: 1, green: 0.8, blue: 0, alpha: 1)
-        let grey = NSColor(white: 0.55, alpha: 1)
-        let labelFont = NSFont.monospacedSystemFont(ofSize: 8, weight: .medium)
 
-        ("DOWN" as NSString).draw(at: NSPoint(x: 14, y: 8), withAttributes: [
-            .font: labelFont, .foregroundColor: grey,
-        ])
-        ("UP" as NSString).draw(at: NSPoint(x: 134, y: 8), withAttributes: [
-            .font: labelFont, .foregroundColor: grey,
-        ])
-        let valueFont = NSFont.monospacedSystemFont(ofSize: 19, weight: .semibold)
-        ((netHeaderDL + "/s") as NSString).draw(at: NSPoint(x: 12, y: 19), withAttributes: [
-            .font: valueFont, .foregroundColor: green,
-        ])
-        ((netHeaderUL + "/s") as NSString).draw(at: NSPoint(x: 132, y: 19), withAttributes: [
-            .font: valueFont, .foregroundColor: yellow,
-        ])
-
-        let cx: CGFloat = 8, cy: CGFloat = 60, cw: CGFloat = 224, ch: CGFloat = 128
-        let scale = Self.adaptiveNetScale(max(histRx.max() ?? 0, histTx.max() ?? 0))
-
-        // quarter gridlines
-        ctx.setStrokeColor(NSColor(white: 0.16, alpha: 1).cgColor)
-        ctx.setLineWidth(1)
-        for q in 1...3 {
-            let y = cy + ch * CGFloat(q) / 4
-            ctx.move(to: CGPoint(x: cx, y: y))
-            ctx.addLine(to: CGPoint(x: cx + cw, y: y))
-        }
-        ctx.strokePath()
-
-        // 3-tap smoothed points, one per column (matches the device)
-        func points(_ vals: [Double]) -> [CGPoint] {
-            (0..<Self.netCols).map { i in
-                let lo = max(0, i - 1), hi = min(Self.netCols - 1, i + 1)
-                let v = (vals[lo] + vals[i] + vals[hi]) / 3
-                let h = min(CGFloat(v / scale), 1) * (ch - 2)
-                return CGPoint(x: cx + CGFloat(i), y: cy + ch - 1 - h)
-            }
-        }
-
-        // download: filled area + bright top edge
-        let dl = points(histRx)
-        ctx.saveGState()
-        ctx.beginPath()
-        ctx.move(to: CGPoint(x: cx, y: cy + ch - 1))
-        for p in dl { ctx.addLine(to: p) }
-        ctx.addLine(to: CGPoint(x: cx + cw - 1, y: cy + ch - 1))
-        ctx.closePath()
-        ctx.setFillColor(NSColor(calibratedRed: 0, green: 0.33, blue: 0, alpha: 1).cgColor)
-        ctx.fillPath()
-        ctx.restoreGState()
-        // NOT the firmware's LINE_T: the popover is ~4x the panel's physical
-        // size, so a thin stroke here matches the device's thick one visually.
-        ctx.setStrokeColor(green.cgColor)
-        ctx.setLineWidth(3)
-        ctx.setLineJoin(.round)
-        ctx.beginPath()
-        ctx.move(to: dl[0])
-        for p in dl.dropFirst() { ctx.addLine(to: p) }
-        ctx.strokePath()
-
-        // upload: yellow line
-        let ul = points(histTx)
-        ctx.setStrokeColor(yellow.cgColor)
-        ctx.setLineWidth(3)
-        ctx.beginPath()
-        ctx.move(to: ul[0])
-        for p in ul.dropFirst() { ctx.addLine(to: p) }
-        ctx.strokePath()
-
-        // axis + footer labels
-        let style = NSMutableParagraphStyle()
-        style.alignment = .right
-        (Self.deviceSpeedText(scale) as NSString).draw(
-            in: NSRect(x: 120, y: 46, width: 112, height: 12), withAttributes: [
-                .font: labelFont, .foregroundColor: grey, .paragraphStyle: style,
-            ])
+    // Salary scene mirrors the firmware's poster-style page: black sky, gold
+    // coin with ¥, big gold amount, muted rate caption, gold progress bar.
+    private func drawSalaryScene() {
         let center = NSMutableParagraphStyle()
         center.alignment = .center
-        if netCPU >= 0 {
-            // fixed-x label + value columns, so a value width change (5% ->
-            // 30%) never shifts the rest of the row (matches the firmware)
-            let sysLabelFont = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
-            let sysValueFont = NSFont.monospacedSystemFont(ofSize: 15, weight: .bold)
-            ("CPU" as NSString).draw(at: NSPoint(x: 28, y: 196), withAttributes: [
-                .font: sysLabelFont, .foregroundColor: grey,
+        let gold = NSColor(red: 1.0, green: 207 / 255, blue: 77 / 255, alpha: 1)
+        let goldDim = NSColor(red: 200 / 255, green: 151 / 255, blue: 31 / 255, alpha: 1)
+        let mark = NSColor(red: 138 / 255, green: 90 / 255, blue: 20 / 255, alpha: 1)
+        let muted = NSColor(red: 151 / 255, green: 160 / 255, blue: 181 / 255, alpha: 1)
+        let track = NSColor(red: 44 / 255, green: 53 / 255, blue: 80 / 255, alpha: 1)
+        let active = salaryStatus == "EARNING NOW"
+        let progress = max(0, min(1, Double(salaryElapsedS) / Double(max(1, salaryDailyWorkS))))
+
+        let statusNames = [
+            "EARNING NOW": "计薪中",
+            "LUNCH BREAK - PAUSED": "午休暂停",
+            "WEEKEND - PAUSED": "周末暂停",
+            "BEFORE WORK": "上班前",
+            "WORKDAY COMPLETE": "已下班",
+            "CONFIGURE SALARY": "请先配置薪资",
+            "WAITING FOR CLOCK": "等待时钟",
+        ]
+        let statusText = statusNames[salaryStatus] ?? salaryStatus
+        let configured = salaryStatus != "CONFIGURE SALARY"
+
+        ("每秒进账" as NSString).draw(in: NSRect(x: 0, y: 8, width: 240, height: 22), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 16, weight: .semibold),
+            .foregroundColor: NSColor.white, .paragraphStyle: center,
+        ])
+
+        // gold coin with a ¥ mark, same geometry as the firmware's r=30 coin
+        let coinCenter = NSPoint(x: 120, y: 64)
+        let coin = NSBezierPath(ovalIn: NSRect(x: coinCenter.x - 30, y: coinCenter.y - 30, width: 60, height: 60))
+        goldDim.setFill(); coin.fill()
+        let face = NSBezierPath(ovalIn: NSRect(x: coinCenter.x - 27, y: coinCenter.y - 27, width: 54, height: 54))
+        gold.setFill(); face.fill()
+        let ring = NSBezierPath(ovalIn: NSRect(x: coinCenter.x - 21, y: coinCenter.y - 21, width: 42, height: 42))
+        ring.lineWidth = 1.5; goldDim.setStroke(); ring.stroke()
+        let yen = NSBezierPath()
+        yen.lineWidth = 2
+        yen.lineCapStyle = .round
+        yen.move(to: NSPoint(x: coinCenter.x - 11, y: coinCenter.y - 13))
+        yen.line(to: NSPoint(x: coinCenter.x, y: coinCenter.y - 3))
+        yen.move(to: NSPoint(x: coinCenter.x + 11, y: coinCenter.y - 13))
+        yen.line(to: NSPoint(x: coinCenter.x, y: coinCenter.y - 3))
+        yen.move(to: NSPoint(x: coinCenter.x, y: coinCenter.y - 3))
+        yen.line(to: NSPoint(x: coinCenter.x, y: coinCenter.y + 14))
+        mark.setStroke(); yen.stroke()
+        mark.setFill()
+        NSRect(x: coinCenter.x - 10, y: coinCenter.y + 2, width: 20, height: 2).fill()
+        NSRect(x: coinCenter.x - 10, y: coinCenter.y + 7, width: 20, height: 2).fill()
+
+        let amount = salaryEarnedYuan > 0 ? String(format: "%.2f", salaryEarnedYuan)
+            : (configured ? "0.00" : "--")
+        let amountText = NSMutableAttributedString(
+            string: "\(amount) 元",
+            attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 36, weight: .medium),
+                .foregroundColor: gold,
+                .paragraphStyle: center,
             ])
-            ("\(netCPU)%" as NSString).draw(at: NSPoint(x: 62, y: 190), withAttributes: [
-                .font: sysValueFont, .foregroundColor: NSColor.white,
-            ])
-            ("MEM" as NSString).draw(at: NSPoint(x: 130, y: 196), withAttributes: [
-                .font: sysLabelFont, .foregroundColor: grey,
-            ])
-            ("\(netMem)%" as NSString).draw(at: NSPoint(x: 164, y: 190), withAttributes: [
-                .font: sysValueFont, .foregroundColor: NSColor.white,
-            ])
+        amountText.addAttributes(
+            [.font: NSFont.systemFont(ofSize: 15, weight: .medium), .foregroundColor: gold],
+            range: NSRange(location: amountText.length - 2, length: 2))
+        amountText.draw(in: NSRect(x: 0, y: 98, width: 240, height: 48))
+
+        let rate = salaryRateYuanPerSecond > 0 ? String(format: "+%.4f", salaryRateYuanPerSecond) : "--"
+        ("每秒 \(rate) 元" as NSString).draw(in: NSRect(x: 0, y: 150, width: 240, height: 18),
+                                          withAttributes: [
+                                            .font: NSFont.systemFont(ofSize: 13),
+                                            .foregroundColor: muted, .paragraphStyle: center,
+                                          ])
+
+        let barRect = NSRect(x: 28, y: 174, width: 184, height: 8)
+        track.setFill()
+        NSBezierPath(roundedRect: barRect, xRadius: 4, yRadius: 4).fill()
+        if progress > 0 {
+            let fillWidth = max(8, CGFloat(progress) * barRect.width)
+            gold.setFill()
+            NSBezierPath(roundedRect: NSRect(x: barRect.origin.x, y: barRect.origin.y,
+                                             width: min(fillWidth, barRect.width), height: barRect.height),
+                         xRadius: 4, yRadius: 4).fill()
         }
-        ("MAC NET  -  56s" as NSString).draw(
-            in: NSRect(x: 0, y: 212, width: 240, height: 12), withAttributes: [
-                .font: labelFont, .foregroundColor: grey, .paragraphStyle: center,
-            ])
+
+        if configured {
+            ("已挣 \(Int((progress * 100).rounded()))%" as NSString).draw(
+                in: NSRect(x: 0, y: 188, width: 240, height: 20), withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+                    .foregroundColor: NSColor.white, .paragraphStyle: center,
+                ])
+        }
+        (statusText as NSString).draw(in: NSRect(x: 0, y: 211, width: 240, height: 18), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: active ? gold : muted, .paragraphStyle: center,
+        ])
     }
 
-    private func drawPomodoroScene() {
-        let focus = pomodoroPhase != "break"
-        let activeColor = focus ? NSColor.systemRed : NSColor.systemGreen
-        let ringColor = pomodoroRunning ? activeColor : NSColor(white: 0.25, alpha: 1)
-        let duration = max(1, pomodoroDurationS)
-        let pct = max(0, min(1, Double(pomodoroRemainingS) / Double(duration)))
-        let m: CGFloat = 4, t: CGFloat = 2
-        let side: CGFloat = 240 - 2 * m
-        ringColor.setFill()
-        var remaining = side * 4 * CGFloat(pct)
-        let x0 = m, y0 = m, x1 = 240 - m
-        var segment = min(remaining, side)
-        if segment > 0 { NSRect(x: x0, y: y0, width: segment, height: t).fill() }
-        remaining -= side
-        segment = min(remaining, side)
-        if segment > 0 { NSRect(x: x1 - t, y: y0, width: t, height: segment).fill() }
-        remaining -= side
-        segment = min(remaining, side)
-        if segment > 0 { NSRect(x: x1 - segment, y: 240 - m - t, width: segment, height: t).fill() }
-        remaining -= side
-        segment = min(remaining, side)
-        if segment > 0 { NSRect(x: x0, y: 240 - m - segment, width: t, height: segment).fill() }
-
-        let center = NSMutableParagraphStyle()
-        center.alignment = .center
-        ("\u{756A}\u{8304}\u{949F}" as NSString).draw(
-            in: NSRect(x: 0, y: 17, width: 240, height: 18), withAttributes: [
-                .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
-                .foregroundColor: NSColor.lightGray, .paragraphStyle: center,
-            ])
-
-        NSColor.systemRed.setFill()
-        NSBezierPath(ovalIn: NSRect(x: 99, y: 42, width: 42, height: 42)).fill()
-        NSColor.systemGreen.setFill()
-        let leaves = NSBezierPath()
-        leaves.move(to: NSPoint(x: 120, y: 38))
-        leaves.line(to: NSPoint(x: 113, y: 49))
-        leaves.line(to: NSPoint(x: 127, y: 49))
-        leaves.close()
-        leaves.fill()
-
-        let phase = focus ? "\u{4E13}\u{6CE8}" : "\u{4F11}\u{606F}"
-        (phase as NSString).draw(in: NSRect(x: 0, y: 88, width: 240, height: 18),
-                                 withAttributes: [
-                                    .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
-                                    .foregroundColor: activeColor, .paragraphStyle: center,
-                                 ])
-        let minutes = max(0, pomodoroRemainingS) / 60
-        let seconds = max(0, pomodoroRemainingS) % 60
-        let time = String(format: "%02d:%02d", minutes, seconds)
-        (time as NSString).draw(in: NSRect(x: 0, y: 110, width: 240, height: 52),
-                                withAttributes: [
-                                    .font: NSFont.monospacedDigitSystemFont(ofSize: 40, weight: .medium),
-                                    .foregroundColor: NSColor.white, .paragraphStyle: center,
-                                ])
-        let state = pomodoroRunning ? "\u{8FDB}\u{884C}\u{4E2D}" : "\u{5DF2}\u{6682}\u{505C}"
-        (state as NSString).draw(in: NSRect(x: 0, y: 174, width: 240, height: 18),
-                                 withAttributes: [
-                                    .font: NSFont.systemFont(ofSize: 13, weight: .medium),
-                                    .foregroundColor: pomodoroRunning ? NSColor.white : NSColor.lightGray,
-                                    .paragraphStyle: center,
-                                 ])
-        let completed = String(format: "%@ %d", "\u{5B8C}\u{6210}", pomodoroCompleted)
-        (completed as NSString).draw(in: NSRect(x: 0, y: 207, width: 240, height: 16),
-                                     withAttributes: [
-                                        .font: NSFont.systemFont(ofSize: 12),
-                                        .foregroundColor: NSColor.lightGray, .paragraphStyle: center,
-                                     ])
-    }
-
-    // Stock watchlist, same 54px rows as the firmware: grey name on the left,
+    // Stock watchlist, same compact rows as the firmware: grey name on the left,
     // code on the right, big white price, and colored change.
     private func drawStockScene() {
         let grey = NSColor(white: 0.55, alpha: 1)
@@ -479,8 +299,9 @@ final class MirrorView: NSView {
                 ])
             return
         }
-        for (i, row) in stockRows.prefix(4).enumerated() {
-            let y0 = CGFloat(10 + i * 54)
+        for (i, row) in stockRows.prefix(5).enumerated() {
+            let rowHeight = 220 / max(1, min(5, stockRows.count))
+            let y0 = CGFloat(4 + i * rowHeight + (rowHeight - 44) / 2)
             let nameStyle = NSMutableParagraphStyle()
             nameStyle.lineBreakMode = .byTruncatingTail
             (row.name as NSString).draw(
@@ -515,26 +336,22 @@ final class MirrorView: NSView {
             ])
     }
 
-    /// Same compact unit strings the firmware prints ("2.3M", "480K").
-    static func deviceSpeedText(_ bps: Double) -> String {
-        if bps >= 1_000_000 { return String(format: "%.1fM", bps / 1_000_000) }
-        if bps >= 1_000 { return String(format: "%.0fK", bps / 1_000) }
-        return String(format: "%.0fB", bps)
-    }
 }
 
 // MARK: - popover controller
 
 final class MirrorPopoverController: NSObject, NSPopoverDelegate {
-    private let service: StatusService
-    private let netMonitor: NetSpeedMonitor
     private let nowPlaying: NowPlayingMonitor
     private let stockMonitor: StockMonitor
+    private let weatherMonitor: WeatherMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
+    private let deviceControl = NSSegmentedControl(labels: [],
+                                                   trackingMode: .selectOne, target: nil, action: nil)
     private let modeControl = NSSegmentedControl(labels: [],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private var selectableModes: [String]
+    private var enabledModes: [String] = []
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
     private let brightnessSlider = NSSlider(value: 100, minValue: 0, maxValue: 100,
                                             target: nil, action: nil)
@@ -545,18 +362,20 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var lastBrightnessSentAt = Date.distantPast
 
     private var pollTimer: Timer?
-    private var animTimer: Timer?
-    private var sweepTimer: Timer?
-    private var spriteCache: [String: (rev: Int, frames: [CGImage], w: Int, h: Int)] = [:]
+    private var weatherAnimationTimer: Timer?
     private var lastInfo: DeviceInfo?
-    private var fetchingSlot: String?
+    private var deviceAddresses: [String] = []
+    private weak var contentContainer: NSView?
+    private var singleDeviceTopConstraint: NSLayoutConstraint?
+    private var multipleDeviceTopConstraint: NSLayoutConstraint?
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor,
-         stockMonitor: StockMonitor, enabledOptionalModes: [String]) {
-        self.service = service
-        self.netMonitor = netMonitor
+    init(nowPlaying: NowPlayingMonitor,
+         stockMonitor: StockMonitor, weatherMonitor: WeatherMonitor,
+         enabledOptionalModes: [String]) {
         self.nowPlaying = nowPlaying
         self.stockMonitor = stockMonitor
+        self.weatherMonitor = weatherMonitor
+        self.enabledModes = enabledOptionalModes
         self.selectableModes = DisplayModeDescriptor.selectableModes(
             enabledOptionalModes: enabledOptionalModes
         )
@@ -569,6 +388,13 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private func makeContent() -> NSViewController {
         let vc = NSViewController()
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 316, height: 424))
+        contentContainer = container
+
+        deviceControl.target = self
+        deviceControl.action = #selector(deviceChanged)
+        deviceControl.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        deviceControl.segmentStyle = .rounded
+        deviceControl.isHidden = true
 
         modeControl.target = self
         modeControl.action = #selector(modeChanged)
@@ -589,12 +415,20 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                                                         accessibilityDescription: "亮度") ?? NSImage())
         brightnessIcon.contentTintColor = .secondaryLabelColor
 
-        for v in [mirror, modeControl, brightnessIcon, brightnessSlider, brightnessValueLabel, statusLabel] {
+        for v in [deviceControl, mirror, modeControl, brightnessIcon, brightnessSlider,
+                  brightnessValueLabel, statusLabel] {
             v.translatesAutoresizingMaskIntoConstraints = false
             container.addSubview(v)
         }
+        let singleDeviceTop = mirror.topAnchor.constraint(equalTo: container.topAnchor, constant: 14)
+        let multipleDeviceTop = mirror.topAnchor.constraint(equalTo: deviceControl.bottomAnchor, constant: 8)
+        singleDeviceTopConstraint = singleDeviceTop
+        multipleDeviceTopConstraint = multipleDeviceTop
         NSLayoutConstraint.activate([
-            mirror.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
+            deviceControl.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            deviceControl.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            deviceControl.widthAnchor.constraint(equalToConstant: 288),
+            singleDeviceTop,
             mirror.centerXAnchor.constraint(equalTo: container.centerXAnchor),
             mirror.widthAnchor.constraint(equalToConstant: 288),
             mirror.heightAnchor.constraint(equalToConstant: 288),
@@ -617,16 +451,58 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         return vc
     }
 
+    private func refreshDeviceControl() {
+        let addresses = DeviceClient.deviceAddresses
+        configureDeviceControl(addresses: addresses, selectedAddress: DeviceClient.host)
+    }
+
+    private func configureDeviceControl(addresses: [String], selectedAddress: String) {
+        guard addresses != deviceAddresses else {
+            deviceControl.selectedSegment = addresses.firstIndex(of: selectedAddress) ?? 0
+            return
+        }
+        deviceAddresses = addresses
+        deviceControl.segmentCount = addresses.count
+        let width = addresses.isEmpty ? 0 : 288.0 / CGFloat(addresses.count)
+        for (index, address) in addresses.enumerated() {
+            deviceControl.setLabel(DeviceClient.displayName(for: address), forSegment: index)
+            deviceControl.setToolTip(address, forSegment: index)
+            deviceControl.setWidth(width, forSegment: index)
+        }
+        deviceControl.selectedSegment = addresses.firstIndex(of: selectedAddress) ?? 0
+
+        let multiple = addresses.count > 1
+        deviceControl.isHidden = !multiple
+        singleDeviceTopConstraint?.isActive = !multiple
+        multipleDeviceTopConstraint?.isActive = multiple
+        let size = NSSize(width: 316, height: multiple ? 454 : 424)
+        contentContainer?.frame.size = size
+        popover.contentViewController?.preferredContentSize = size
+        popover.contentSize = size
+    }
+
+    #if DEBUG
+    func prepareDesignQASnapshot(addresses: [String], selectedAddress: String) -> NSView {
+        configureDeviceControl(addresses: addresses, selectedAddress: selectedAddress)
+        guard let view = popover.contentViewController?.view else {
+            preconditionFailure("Popover content view is unavailable")
+        }
+        view.layoutSubtreeIfNeeded()
+        return view
+    }
+    #endif
+
     func updateEnabledFeatures(_ enabledOptionalModes: [String]) {
+        enabledModes = enabledOptionalModes
         selectableModes = DisplayModeDescriptor.selectableModes(
-            enabledOptionalModes: enabledOptionalModes
+            enabledOptionalModes: enabledOptionalModes,
+            printerSupported: lastInfo?.printer.supported ?? false
         )
         configureModeControl()
-        configureSweepTimer()
     }
 
     private func configureModeControl() {
-        let selectedMode = lastInfo?.mode
+        let selectedMode = lastInfo.map { DisplayModeDescriptor.normalizedMode($0.mode) }
         modeControl.segmentCount = selectableModes.count
         let preferredWidth = selectableModes.reduce(0.0) { total, mode in
             total + (DisplayModeDescriptor.descriptor(for: mode)?.preferredWidth ?? 36)
@@ -662,6 +538,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+                refreshDeviceControl()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             startTimers()
             tick()
@@ -679,72 +556,56 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
 
     private func stopTimers() {
         pollTimer?.invalidate()
-        animTimer?.invalidate()
-        sweepTimer?.invalidate()
+        weatherAnimationTimer?.invalidate()
         pollTimer = nil
-        animTimer = nil
-        sweepTimer = nil
+        weatherAnimationTimer = nil
     }
 
     private func startTimers() {
         pollTimer?.invalidate()
-        animTimer?.invalidate()
-        sweepTimer?.invalidate()
+        weatherAnimationTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
-        // same cadence as the firmware's ANIM_INTERVAL_MS
-        animTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
-            self?.animTick()
+        weatherAnimationTimer = Timer.scheduledTimer(
+            withTimeInterval: Double(WeatherMonitor.astronautFrameIntervalMilliseconds) / 1000,
+            repeats: true
+        ) { [weak self] _ in
+            guard let self, self.popover.isShown, self.mirror.weatherMode else { return }
+            self.mirror.weatherImage = self.weatherMonitor.screenImage()
+            self.mirror.needsDisplay = true
         }
-        configureSweepTimer()
-    }
-
-    private func configureSweepTimer() {
-        sweepTimer?.invalidate()
-        sweepTimer = nil
-        guard popover.isShown, selectableModes.contains("net") else { return }
-        sweepTimer = Timer.scheduledTimer(withTimeInterval: NetSpeedMonitor.sampleInterval,
-                                          repeats: true) { [weak self] _ in
-            self?.sweepTick()
-        }
-    }
-
-    /// One sweep step: push the newest 4Hz sample, refresh the DL/UL readout.
-    private func sweepTick() {
-        guard mirror.netMode, popover.isShown else { return }
-        let cur = netMonitor.current
-        let smoothed = netMonitor.currentSmoothed
-        mirror.netHeaderDL = MirrorView.deviceSpeedText(smoothed.rx)
-        mirror.netHeaderUL = MirrorView.deviceSpeedText(smoothed.tx)
-        let stats = SystemStatsMonitor.shared.snapshot() // internally 1s-cached
-        mirror.netCPU = stats.cpu
-        mirror.netMem = stats.mem
-        mirror.pushNetSample(rx: cur.rx, tx: cur.tx)
     }
 
     private func tick() {
+        refreshDeviceControl()
+        let requestedAddress = DeviceClient.host
         DeviceClient.fetchInfo { [weak self] result in
-            guard let self = self, self.popover.isShown else { return }
+            guard let self = self, self.popover.isShown,
+                  requestedAddress == DeviceClient.host else { return }
             switch result {
             case let .success(info):
+                let changedPrinterSupport = self.lastInfo?.printer.supported != info.printer.supported
                 self.lastInfo = info
+                if changedPrinterSupport { self.updateEnabledFeatures(self.enabledModes) }
                 self.mirror.deviceOK = true
                 self.applyScene(info)
-                self.ensureSprite(info)
                 self.syncBrightness(info)
-                self.modeControl.selectedSegment = self.selectableModes.firstIndex(of: info.mode) ?? 0
-                let modeText = info.mode == "auto" ? "自动切换"
-                    : info.mode == "net" ? "网速曲线"
-                    : info.mode == "music" ? "音乐播放"
+                let selectedMode = DisplayModeDescriptor.normalizedMode(info.mode)
+                self.modeControl.selectedSegment =
+                    self.selectableModes.firstIndex(of: selectedMode) ?? 0
+                let modeText = info.mode == "music" ? "音乐播放"
                     : info.mode == "stock" ? "股票行情"
-                    : info.mode == "pomodoro" ? "番茄时钟" : "固定显示"
+                    : info.mode == "weather"
+                        ? "\u{5929}\u{6C14}\u{65F6}\u{949F}"
+                    : info.mode == "printer" ? "打印机状态"
+                    : info.mode == "salary" ? "工资进账" : "固定显示"
                 self.statusLabel.stringValue = "\(info.ip) · \(modeText) · 数据 \(info.bridge)"
             case .failure:
                 self.mirror.deviceOK = false
                 self.mirror.needsDisplay = true
-                self.statusLabel.stringValue = DeviceClient.host.isEmpty
-                    ? "未设置设备地址（右键菜单 → 设置设备地址）" : "无法连接 \(DeviceClient.host)"
+                self.statusLabel.stringValue = requestedAddress.isEmpty
+                    ? "未设置设备地址（右键菜单 → 添加设备地址）" : "无法连接 \(requestedAddress)"
             }
         }
     }
@@ -758,32 +619,32 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         brightnessValueLabel.stringValue = "\(info.brightness)%"
     }
 
-    /// Quota lines & ring exactly as the firmware computes them from /status.
+    /// Mirrors the effective device page from the same host snapshot.
     private func applyScene(_ info: DeviceInfo) {
-        // mirror what's actually on the device screen (effective), so an
-        // AUTO device that auto-switched to music shows music here too
-        let enteringNet = info.effective == "net" && !mirror.netMode
-        mirror.netMode = info.effective == "net"
+        mirror.printerMode = info.effective == "printer"
+        mirror.printerStatus = info.printer
+        // Mirror what is actually on the device screen; the default weather
+        // page can still be temporarily promoted to music by the heartbeat.
         mirror.musicMode = info.effective == "music"
         mirror.stockMode = info.effective == "stock"
-        mirror.pomodoroMode = info.effective == "pomodoro"
-        if mirror.pomodoroMode {
-            mirror.pomodoroPhase = info.pomodoroPhase
-            mirror.pomodoroRunning = info.pomodoroRunning
-            mirror.pomodoroRemainingS = info.pomodoroRemainingS
-            mirror.pomodoroDurationS = info.pomodoroDurationS
-            mirror.pomodoroCompleted = info.pomodoroCompleted
-            mirror.needsInput = false
+        mirror.weatherMode = info.effective == "weather"
+        mirror.salaryMode = info.effective == "salary"
+        if mirror.weatherMode {
+            mirror.weatherImage = weatherMonitor.screenImage()
+            mirror.needsDisplay = true
+            return
+        }
+        if mirror.salaryMode {
+            mirror.salaryEarnedYuan = info.salaryEarnedYuan
+            mirror.salaryRateYuanPerSecond = info.salaryRateYuanPerSecond
+            mirror.salaryDailyWorkS = info.salaryDailyWorkS
+            mirror.salaryElapsedS = info.salaryElapsedS
+            mirror.salaryStatus = info.salaryStatus
             mirror.needsDisplay = true
             return
         }
         if mirror.stockMode {
             mirror.stockRows = stockMonitor.snapshot
-            mirror.needsDisplay = true
-            return
-        }
-        if mirror.netMode {
-            if enteringNet { mirror.resetNetSweep() } // fresh sweep, like the device's chrome reset
             mirror.needsDisplay = true
             return
         }
@@ -798,101 +659,41 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.needsDisplay = true
             return
         }
-        let snap = service.snapshot()
-        mirror.showingClaude = info.showing != "codex"
-        if mirror.showingClaude {
-            let pct = snap.claude.fiveHourPct
-                ?? (snap.claude.sessionWindowMin > 0
-                    ? 100.0 * Double(snap.claude.sessionMin) / Double(snap.claude.sessionWindowMin) : 0)
-            mirror.ringPct = pct
-            mirror.line1 = "5H " + Self.pctText(pct)
-            mirror.line2 = "\u{5468} " + Self.pctText(snap.claude.sevenDayPct)
-            mirror.needsInput = snap.claude.needsInput
-        } else {
-            // Codex may only have a weekly window now (5h limit dropped):
-            // ring + single line follow whatever windows actually exist.
-            mirror.ringPct = snap.codex.primaryPct ?? snap.codex.weeklyPct ?? 0
-            if snap.codex.primaryPct == nil, snap.codex.weeklyPct != nil {
-                mirror.line1 = "\u{5468} " + Self.pctText(snap.codex.weeklyPct)
-                mirror.line2 = ""
-            } else {
-                mirror.line1 = "5H " + Self.pctText(snap.codex.primaryPct)
-                mirror.line2 = "\u{5468} " + Self.pctText(snap.codex.weeklyPct)
-            }
-            mirror.needsInput = snap.codex.needsInput
-        }
-        mirror.needsDisplay = true
-    }
-
-    private static func pctText(_ pct: Double?) -> String {
-        guard let p = pct, p >= 0 else { return "-" }
-        return "\(Int(p))%"
-    }
-
-    private func ensureSprite(_ info: DeviceInfo) {
-        guard !["net", "music", "stock", "pomodoro"].contains(info.effective) else { return }
-        let slot = info.showing == "codex" ? "codex" : "claude"
-        let w = slot == "claude" ? info.claudeW : info.codexW
-        let h = slot == "claude" ? info.claudeH : info.codexH
-        if let cached = spriteCache[slot], cached.rev == info.spriteRev {
-            mirror.frames = cached.frames
-            mirror.spriteW = cached.w
-            mirror.spriteH = cached.h
-            return
-        }
-        guard fetchingSlot != slot else { return }
-        fetchingSlot = slot
-        DeviceClient.fetchSpriteRaw(slot: slot) { [weak self] result in
-            guard let self = self else { return }
-            self.fetchingSlot = nil
-            if case let .success(data) = result {
-                let frames = decodeSpriteFrames(data, w: w, h: h)
-                guard !frames.isEmpty else { return }
-                self.spriteCache[slot] = (info.spriteRev, frames, w, h)
-                if (self.lastInfo?.showing == "codex" ? "codex" : "claude") == slot {
-                    self.mirror.frames = frames
-                    self.mirror.spriteW = w
-                    self.mirror.spriteH = h
-                    self.mirror.needsDisplay = true
-                }
-            }
-        }
-    }
-
-    private var flashCounter = 0
-
-    private func animTick() {
-        guard let info = lastInfo, !mirror.netMode, !mirror.musicMode,
-              !mirror.stockMode, !mirror.pomodoroMode else { return }
-
-        // ~400ms red-border flash while an approval is pending (device cadence)
-        if mirror.needsInput {
-            flashCounter += 1
-            if flashCounter >= 3 { // 3 * 0.12s ≈ 0.36s
-                flashCounter = 0
-                mirror.flashOn.toggle()
-                mirror.needsDisplay = true
-            }
-        } else if mirror.flashOn {
-            mirror.flashOn = false
-            mirror.needsDisplay = true
-        }
-
-        guard !mirror.frames.isEmpty else { return }
-        let snap = service.snapshot()
-        let working = info.showing == "codex"
-            ? snap.codex.status == "working" : snap.claude.status == "working"
-        if working {
-            mirror.frameIdx = (mirror.frameIdx + 1) % mirror.frames.count
-        } else if mirror.frameIdx != 0 {
-            mirror.frameIdx = 0
-        }
+        mirror.weatherMode = true
+        mirror.weatherImage = weatherMonitor.screenImage()
         mirror.needsDisplay = true
     }
 
     @objc private func modeChanged() {
         guard selectableModes.indices.contains(modeControl.selectedSegment) else { return }
         let mode = selectableModes[modeControl.selectedSegment]
-        DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
+        statusLabel.stringValue = "正在切换…"
+        DeviceClient.setDisplayMode(mode) { [weak self] error in
+            guard let self else { return }
+            if error != nil {
+                let confirmedMode = self.lastInfo.map {
+                    DisplayModeDescriptor.normalizedMode($0.mode)
+                } ?? "weather"
+                self.modeControl.selectedSegment =
+                    self.selectableModes.firstIndex(of: confirmedMode) ?? 0
+                self.mirror.deviceOK = false
+                self.mirror.needsDisplay = true
+                self.statusLabel.stringValue = DeviceClient.host.isEmpty
+                    ? "切换失败：未设置设备地址"
+                    : "切换失败：无法连接 \(DeviceClient.host)"
+                return
+            }
+            self.tick()
+        }
+    }
+
+    @objc private func deviceChanged() {
+        guard deviceAddresses.indices.contains(deviceControl.selectedSegment) else { return }
+        DeviceClient.selectDevice(deviceAddresses[deviceControl.selectedSegment])
+        lastInfo = nil
+        pendingBrightness = nil
+        mirror.deviceOK = false
+        statusLabel.stringValue = "连接 \(DeviceClient.host)…"
+        tick()
     }
 }

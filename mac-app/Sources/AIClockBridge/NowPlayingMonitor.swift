@@ -211,7 +211,7 @@ final class NowPlayingMonitor {
     // quits, playbackRate included. Since elapsed is extrapolated from that
     // snapshot (elapsed += now - timestamp), a stale rate > 0 walks elapsed all
     // the way to duration, where the clamp pins it forever: playing stays true,
-    // the clock parks on the music page, and the quota page never comes back.
+    // the clock parks on the music page until playback stops.
     //
     // A player that is genuinely playing does not sit at the last second - it
     // rolls into the next track and the snapshot moves. So elapsed sitting on
